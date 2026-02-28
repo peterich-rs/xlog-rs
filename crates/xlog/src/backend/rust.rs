@@ -1,14 +1,18 @@
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use chrono::{Duration, Local};
+use chrono::Local;
+use mars_xlog_core::buffer::{PersistentBuffer, DEFAULT_BUFFER_BLOCK_LEN};
 use mars_xlog_core::compress::{StreamCompressor, ZlibStreamCompressor, ZstdChunkCompressor};
 use mars_xlog_core::crypto::EcdhTeaCipher;
+use mars_xlog_core::file_manager::FileManager;
 use mars_xlog_core::formatter::format_record;
+use mars_xlog_core::oneshot::{
+    oneshot_flush as core_oneshot_flush, FileIoAction as CoreFileIoAction,
+};
 use mars_xlog_core::protocol::{
     select_magic, AppendMode, CompressionKind, LogHeader, SeqGenerator, MAGIC_END,
 };
@@ -32,6 +36,11 @@ pub(super) fn provider() -> &'static dyn XlogBackendProvider {
 
 struct RustBackendProvider;
 
+struct BackendRuntime {
+    file_manager: FileManager,
+    buffer: PersistentBuffer,
+}
+
 struct RustBackend {
     id: usize,
     config: XlogConfig,
@@ -42,7 +51,7 @@ struct RustBackend {
     max_alive_time: AtomicI64,
     seq: SeqGenerator,
     cipher: EcdhTeaCipher,
-    write_lock: Mutex<()>,
+    runtime: Mutex<BackendRuntime>,
 }
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -70,6 +79,17 @@ impl RustBackend {
             _ => EcdhTeaCipher::disabled(),
         };
 
+        let file_manager = FileManager::new(
+            PathBuf::from(&config.log_dir),
+            config.cache_dir.as_ref().map(PathBuf::from),
+            config.name_prefix.clone(),
+            config.cache_days,
+        )
+        .map_err(|_| XlogError::InitFailed)?;
+        let mmap_path = file_manager.mmap_path();
+        let buffer = PersistentBuffer::open_with_capacity(mmap_path, DEFAULT_BUFFER_BLOCK_LEN)
+            .map_err(|_| XlogError::InitFailed)?;
+
         Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             max_file_size: AtomicI64::new(0),
@@ -80,129 +100,22 @@ impl RustBackend {
             config,
             seq: SeqGenerator::default(),
             cipher,
-            write_lock: Mutex::new(()),
+            runtime: Mutex::new(BackendRuntime {
+                file_manager,
+                buffer,
+            }),
         })
     }
 
-    fn make_date_prefix(&self, days_offset: i32, prefix: &str) -> String {
-        let dt = Local::now() - Duration::days(days_offset as i64);
-        format!(
-            "{}_{:04}{:02}{:02}",
-            prefix,
-            dt.year(),
-            dt.month(),
-            dt.day()
-        )
+    fn max_file_size_u64(&self) -> u64 {
+        self.max_file_size.load(Ordering::Relaxed).max(0) as u64
     }
 
-    fn log_dir_path(&self) -> PathBuf {
-        PathBuf::from(&self.config.log_dir)
+    fn max_alive_time_i64(&self) -> i64 {
+        self.max_alive_time.load(Ordering::Relaxed)
     }
 
-    fn cache_dir_path(&self) -> Option<PathBuf> {
-        self.config.cache_dir.as_ref().map(PathBuf::from)
-    }
-
-    fn select_target_file(&self, days_offset: i32, prefix: &str) -> std::io::Result<PathBuf> {
-        let dir = self.log_dir_path();
-        fs::create_dir_all(&dir)?;
-
-        let base = self.make_date_prefix(days_offset, prefix);
-        let max_size = self.max_file_size.load(Ordering::Relaxed);
-        if max_size <= 0 {
-            return Ok(dir.join(format!("{}.xlog", base)));
-        }
-
-        let mut idx = 0i64;
-        loop {
-            let candidate = if idx == 0 {
-                dir.join(format!("{}.xlog", base))
-            } else {
-                dir.join(format!("{}_{}.xlog", base, idx))
-            };
-            match fs::metadata(&candidate) {
-                Ok(meta) if meta.len() as i64 > max_size => {
-                    idx += 1;
-                }
-                _ => return Ok(candidate),
-            }
-        }
-    }
-
-    fn append_block(&self, block: &[u8], prefix: &str) -> std::io::Result<()> {
-        let target = self.select_target_file(0, prefix)?;
-        let mut f = OpenOptions::new().create(true).append(true).open(&target)?;
-        f.write_all(block)
-    }
-
-    fn list_existing_files(&self, dir: &Path, prefix: &str, days_offset: i32) -> Vec<String> {
-        let mut out = Vec::new();
-        let date_prefix = self.make_date_prefix(days_offset, prefix);
-        let Ok(rd) = fs::read_dir(dir) else {
-            return out;
-        };
-
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if name.starts_with(&date_prefix) && name.ends_with(".xlog") {
-                out.push(path.to_string_lossy().to_string());
-            }
-        }
-        out.sort();
-        out
-    }
-
-    fn make_logfile_name_impl(&self, timespan: i32, prefix: &str) -> Vec<String> {
-        let p = if prefix.is_empty() {
-            &self.config.name_prefix
-        } else {
-            prefix
-        };
-
-        let mut out = Vec::new();
-        let log_dir = self.log_dir_path();
-        let candidate = log_dir.join(format!("{}.xlog", self.make_date_prefix(timespan, p)));
-
-        if let Some(cache_dir) = self.cache_dir_path() {
-            let cache_candidate =
-                cache_dir.join(format!("{}.xlog", self.make_date_prefix(timespan, p)));
-            if candidate.exists() {
-                out.push(candidate.to_string_lossy().to_string());
-            }
-            if cache_candidate.exists() {
-                out.push(cache_candidate.to_string_lossy().to_string());
-            }
-            if out.is_empty() {
-                out.push(candidate.to_string_lossy().to_string());
-            }
-            return out;
-        }
-
-        out.push(candidate.to_string_lossy().to_string());
-        out
-    }
-
-    fn filepaths_from_timespan_impl(&self, timespan: i32, prefix: &str) -> Vec<String> {
-        let p = if prefix.is_empty() {
-            &self.config.name_prefix
-        } else {
-            prefix
-        };
-
-        let mut out = self.list_existing_files(&self.log_dir_path(), p, timespan);
-        if let Some(cache_dir) = self.cache_dir_path() {
-            out.extend(self.list_existing_files(&cache_dir, p, timespan));
-        }
-        out
-    }
-
-    fn write_impl(
+    fn build_block(
         &self,
         level: LogLevel,
         tag: &str,
@@ -210,9 +123,7 @@ impl RustBackend {
         func: &str,
         line: u32,
         msg: &str,
-    ) -> Result<(), std::io::Error> {
-        let _guard = self.write_lock.lock().expect("write lock poisoned");
-
+    ) -> Vec<u8> {
         let mode = i32_to_mode(self.appender_mode.load(Ordering::Relaxed));
         let compress = self.config.compress_mode;
 
@@ -239,8 +150,7 @@ impl RustBackend {
                 CompressMode::Zlib => {
                     let mut c = ZlibStreamCompressor::default();
                     let mut out = Vec::new();
-                    let input = line.as_bytes();
-                    let _ = c.compress_chunk(input, &mut out);
+                    let _ = c.compress_chunk(line.as_bytes(), &mut out);
                     let _ = c.flush(&mut out);
                     out
                 }
@@ -276,8 +186,8 @@ impl RustBackend {
                 AppenderMode::Sync => SeqGenerator::sync_seq(),
                 AppenderMode::Async => self.seq.next_async(),
             },
-            begin_hour: now.hour() as u8,
-            end_hour: now.hour() as u8,
+            begin_hour: chrono::Timelike::hour(&now) as u8,
+            end_hour: chrono::Timelike::hour(&now) as u8,
             len: payload.len() as u32,
             client_pubkey: self.cipher.client_pubkey(),
         };
@@ -286,8 +196,104 @@ impl RustBackend {
         block.extend_from_slice(&header.encode());
         block.extend_from_slice(&payload);
         block.push(MAGIC_END);
+        block
+    }
 
-        self.append_block(&block, &self.config.name_prefix)
+    fn flush_pending_locked(
+        &self,
+        runtime: &mut BackendRuntime,
+        move_file: bool,
+    ) -> Result<(), io::Error> {
+        let pending = runtime
+            .buffer
+            .take_all()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        runtime
+            .file_manager
+            .append_log_bytes(&pending, self.max_file_size_u64(), move_file)
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    fn housekeeping_locked(&self, runtime: &BackendRuntime) -> Result<(), io::Error> {
+        runtime
+            .file_manager
+            .move_old_cache_files(self.max_file_size_u64())
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        runtime
+            .file_manager
+            .delete_expired_files(self.max_alive_time_i64())
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    fn make_logfile_name_impl(&self, timespan: i32, prefix: &str) -> Vec<String> {
+        let Ok(runtime) = self.runtime.lock() else {
+            return Vec::new();
+        };
+        runtime
+            .file_manager
+            .make_logfile_name(timespan, prefix, self.max_file_size_u64())
+    }
+
+    fn filepaths_from_timespan_impl(&self, timespan: i32, prefix: &str) -> Vec<String> {
+        let Ok(runtime) = self.runtime.lock() else {
+            return Vec::new();
+        };
+        runtime
+            .file_manager
+            .filepaths_from_timespan(timespan, prefix)
+    }
+
+    fn write_impl(
+        &self,
+        level: LogLevel,
+        tag: &str,
+        file: &str,
+        func: &str,
+        line: u32,
+        msg: &str,
+    ) -> Result<(), io::Error> {
+        let block = self.build_block(level, tag, file, func, line, msg);
+        let mode = i32_to_mode(self.appender_mode.load(Ordering::Relaxed));
+
+        let mut runtime = self.runtime.lock().expect("runtime lock poisoned");
+        match mode {
+            AppenderMode::Sync => {
+                runtime
+                    .file_manager
+                    .append_log_bytes(&block, self.max_file_size_u64(), false)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+            }
+            AppenderMode::Async => {
+                let appended = runtime
+                    .buffer
+                    .append_block(&block)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+
+                if !appended {
+                    self.flush_pending_locked(&mut runtime, true)?;
+                    let appended_after_flush = runtime
+                        .buffer
+                        .append_block(&block)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    if !appended_after_flush {
+                        runtime
+                            .file_manager
+                            .append_log_bytes(&block, self.max_file_size_u64(), true)
+                            .map_err(|e| io::Error::other(e.to_string()))?;
+                    }
+                }
+
+                let threshold = runtime.buffer.capacity() / 3;
+                if runtime.buffer.len() >= threshold || level == LogLevel::Fatal {
+                    self.flush_pending_locked(&mut runtime, true)?;
+                }
+            }
+        }
+
+        self.housekeeping_locked(&runtime)
     }
 }
 
@@ -390,8 +396,36 @@ impl XlogBackendProvider for RustBackendProvider {
             .unwrap_or_default()
     }
 
-    fn oneshot_flush(&self, _config: &XlogConfig) -> Result<FileIoAction, XlogError> {
-        Ok(FileIoAction::Unnecessary)
+    fn oneshot_flush(&self, config: &XlogConfig) -> Result<FileIoAction, XlogError> {
+        if config.log_dir.is_empty() || config.name_prefix.is_empty() {
+            return Err(XlogError::InvalidConfig);
+        }
+
+        let file_manager = FileManager::new(
+            PathBuf::from(&config.log_dir),
+            config.cache_dir.as_ref().map(PathBuf::from),
+            config.name_prefix.clone(),
+            config.cache_days,
+        )
+        .map_err(|_| XlogError::InitFailed)?;
+
+        let max_file_size = default_backend()
+            .lock()
+            .ok()
+            .and_then(|d| d.as_ref().map(|b| b.max_file_size_u64()))
+            .unwrap_or(0);
+
+        let action = core_oneshot_flush(&file_manager, DEFAULT_BUFFER_BLOCK_LEN, max_file_size);
+        Ok(match action {
+            CoreFileIoAction::None => FileIoAction::None,
+            CoreFileIoAction::Success => FileIoAction::Success,
+            CoreFileIoAction::Unnecessary => FileIoAction::Unnecessary,
+            CoreFileIoAction::OpenFailed => FileIoAction::OpenFailed,
+            CoreFileIoAction::ReadFailed => FileIoAction::ReadFailed,
+            CoreFileIoAction::WriteFailed => FileIoAction::WriteFailed,
+            CoreFileIoAction::CloseFailed => FileIoAction::CloseFailed,
+            CoreFileIoAction::RemoveFailed => FileIoAction::RemoveFailed,
+        })
     }
 
     fn dump(&self, buffer: &[u8]) -> String {
@@ -426,7 +460,12 @@ impl XlogBackend for RustBackend {
     }
 
     fn flush(&self, _sync: bool) {
-        // Current Phase 2 backend appends each block directly to file.
+        let mut runtime = match self.runtime.lock() {
+            Ok(rt) => rt,
+            Err(_) => return,
+        };
+        let _ = self.flush_pending_locked(&mut runtime, true);
+        let _ = self.housekeeping_locked(&runtime);
     }
 
     fn set_console_log_open(&self, open: bool) {
@@ -577,31 +616,6 @@ fn memory_dump_impl(buffer: &[u8]) -> String {
     out
 }
 
-trait DateParts {
-    fn year(&self) -> i32;
-    fn month(&self) -> u32;
-    fn day(&self) -> u32;
-    fn hour(&self) -> u32;
-}
-
-impl DateParts for chrono::DateTime<Local> {
-    fn year(&self) -> i32 {
-        chrono::Datelike::year(self)
-    }
-
-    fn month(&self) -> u32 {
-        chrono::Datelike::month(self)
-    }
-
-    fn day(&self) -> u32 {
-        chrono::Datelike::day(self)
-    }
-
-    fn hour(&self) -> u32 {
-        chrono::Timelike::hour(self)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -620,6 +634,7 @@ mod tests {
         let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
 
         backend.write_with_meta(LogLevel::Info, "demo", "main.rs", "f", 1, "hello");
+        backend.flush(true);
 
         let mut found = false;
         for entry in fs::read_dir(&root).unwrap().flatten() {

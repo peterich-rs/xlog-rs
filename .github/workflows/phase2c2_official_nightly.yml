@@ -1,0 +1,59 @@
+name: phase2c2-official-nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *'
+
+jobs:
+  phase2c2:
+    runs-on: macos-14
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Run Phase 2C-2 official regression
+        id: phase2c2
+        shell: bash
+        run: |
+          set +e
+          mkdir -p artifacts/phase2c2
+          out_dir="$PWD/artifacts/phase2c2/fixtures"
+
+          scripts/xlog/run_phase2c2_official.sh \
+            --out-dir "$out_dir" \
+            --backend both \
+            --count 32 \
+            2>&1 | tee artifacts/phase2c2/run_phase2c2_official.log
+
+          exit_code=${PIPESTATUS[0]}
+          echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
+          if [[ "$exit_code" -eq 0 ]]; then
+            echo "phase2c2 official regression: success" > artifacts/phase2c2/status.txt
+          else
+            echo "phase2c2 official regression: failed" > artifacts/phase2c2/status.txt
+          fi
+
+      - name: Upload regression artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase2c2-official-${{ github.run_id }}
+          path: |
+            artifacts/phase2c2
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Fail workflow when regression failed
+        if: steps.phase2c2.outputs.exit_code != '0'
+        run: |
+          echo "Phase 2C-2 official regression failed"
+          exit 1

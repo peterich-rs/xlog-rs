@@ -15,6 +15,9 @@ zstd = "0.13"
 k256 = { version = "0.13", features = ["ecdh"] }
 rand_core = "0.6"
 hex = "0.4"
+memmap2 = "0.9"
+fs2 = "0.4"
 
 [dev-dependencies]
 hex = "0.4"
+tempfile = "3"
