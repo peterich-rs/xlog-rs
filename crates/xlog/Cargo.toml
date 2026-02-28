@@ -15,6 +15,11 @@ tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"], optional = true }
 
 [features]
+default = ["ffi-backend"]
+# 当前默认后端：FFI（C++ Mars）
+ffi-backend = []
+# Rust 后端在后续 phase 落地；暂时复用 ffi-backend 以保持行为不变
+rust-backend = ["ffi-backend"]
 # 控制是否启用 Rust 侧便捷宏
 macros = []
 tracing = ["dep:tracing", "dep:tracing-subscriber"]
