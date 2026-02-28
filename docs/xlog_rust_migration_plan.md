@@ -16,12 +16,19 @@
 - Phase 1：已完成（commit: `643900d`）。
   - 已落地后端抽象：`crates/xlog/src/backend/{mod.rs,ffi.rs,rust.rs}`。
   - `xlog` API 已通过 backend trait 间接调用，实现 FFI/Rust 并行架构。
-- Phase 2：进行中（commit: `c1b6e10` + 当前增量）。
+- Phase 2：已完成（commit: `3558c76`，含 2A/2B/2C 全部收口）。
   - 已完成 2A：`xlog-core` 协议/压缩/加密基础模块。
   - 已完成 2B：`xlog` Rust backend 最小写入链路接入（可生成 `.xlog` block）。
   - 已完成 2C-1：fixture 生成与 no-crypt 解码对比脚本。
   - 已完成 2C-2：crypt 用例在 Python2 官方解码环境下的回归固化（`scripts/xlog/setup_py2_decoder_env.sh` + `scripts/xlog/run_phase2c2_official.sh`）。
-- Phase 3~6：未开始。
+- Phase 3：已完成（commit: `3558c76`）。
+- Phase 4：已完成（commit: `2586d81`）。
+- Phase 5：进行中（当前增量）。
+  - `xlog` 默认 feature 已切换到 `rust-backend`，并保留 `ffi-backend` 紧急回退。
+  - JNI/UniFFI/NAPI 绑定层均改为可切换 `rust-backend` / `ffi-backend`。
+  - 新增 `scripts/xlog/run_phase5_regression.sh` + `crates/xlog/examples/bench_backend.rs` 统一执行回归与性能对比。
+  - 已具备性能比值产物与可选门槛校验，门槛达标优化持续中。
+- Phase 6：未开始。
 
 ---
 
@@ -291,7 +298,7 @@ DoD：
 实现要点：
 
 - `Inner` 从裸 `instance: usize` 提升为 `Arc<dyn XlogBackend>`（或等价 enum 后端）。
-- 默认 feature 使用 FFI 后端，新增 `rust-backend` feature 占位。
+- Phase 1 落地时默认 feature 仍为 FFI；已在 Phase 5 切换为 Rust 默认。
 
 DoD：
 
@@ -443,6 +450,8 @@ DoD：
 
 目标：在仓库内把默认实现切到 Rust，保留 FFI 作为紧急回退。
 
+当前状态：进行中（默认后端切换与回归脚本已落地，性能优化继续推进）。
+
 任务：
 
 1. `xlog` 默认 feature 切到 Rust backend。
@@ -452,12 +461,24 @@ DoD：
 涉及文件：
 
 - 修改 `crates/xlog/Cargo.toml`
-- 可能修改 `crates/xlog/src/lib.rs`
-- 新增 `scripts/xlog/stress_test.rs`（或 bench）
+- 修改 `crates/xlog-uniffi/Cargo.toml`
+- 修改 `crates/xlog-android-jni/Cargo.toml`
+- 修改 `crates/mars-xlog-harmony-napi/Cargo.toml`
+- 新增 `crates/xlog/examples/bench_backend.rs`
+- 新增 `scripts/xlog/run_phase5_regression.sh`
+
+实现要点：
+
+- 默认 feature 切换：`mars-xlog` 默认启用 `rust-backend`。
+- 绑定层默认禁用 `mars-xlog` 的 default-features，并以各自 feature 显式转发 `rust-backend` / `ffi-backend`。
+- `run_phase5_regression.sh` 一次性执行：
+  - `run_phase2c2_official.sh` 官方解码回归（可选跳过）
+  - JNI/UniFFI/NAPI 在 Rust/FFI 双后端下的 `cargo check`
+  - `bench_backend.rs` 产出 Rust/FFI 吞吐与延迟 JSON 指标；支持可选门槛判定（90% 吞吐/110% p99）
 
 DoD：
 
-- 回归与性能指标达标。
+- 回归与性能指标可脚本化复跑并产出 artifacts。
 - 保留 `ffi-backend` feature 可一键回退。
 
 ---

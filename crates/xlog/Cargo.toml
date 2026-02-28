@@ -17,10 +17,11 @@ tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"], optional = true }
 
 [features]
-default = ["ffi-backend"]
-# 当前默认后端：FFI（C++ Mars）
+# Phase 5: 默认切换到 Rust backend，保留 FFI 可紧急回退。
+default = ["rust-backend"]
+# C++ Mars FFI 后端（可作为紧急回退开关）
 ffi-backend = []
-# Rust 后端（Phase 2 起逐步落地）
+# Rust 后端
 rust-backend = ["dep:mars-xlog-core", "dep:chrono"]
 # 控制是否启用 Rust 侧便捷宏
 macros = []

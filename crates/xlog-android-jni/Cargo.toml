@@ -7,9 +7,14 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = ["rust-backend"]
+rust-backend = ["mars-xlog/rust-backend"]
+ffi-backend = ["mars-xlog/ffi-backend"]
+
 [dependencies]
 jni = "0.21"
-mars-xlog = { path = "../xlog" }
+mars-xlog = { path = "../xlog", default-features = false }
 once_cell = "1"
 
 [profile.release]

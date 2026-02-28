@@ -8,8 +8,13 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = ["rust-backend"]
+rust-backend = ["mars-xlog/rust-backend"]
+ffi-backend = ["mars-xlog/ffi-backend"]
+
 [dependencies]
-mars-xlog = { path = "../xlog", features = ["tracing"] }
+mars-xlog = { path = "../xlog", default-features = false, features = ["tracing"] }
 napi-ohos = { version = "1.0", default-features = false, features = [
     "napi8",
     "async",
