@@ -90,6 +90,65 @@ impl StreamCompressor for ZstdChunkCompressor {
     }
 }
 
+/// Streaming zstd compressor compatible with Mars async path.
+///
+/// Uses one compression stream with `windowLog=16`, flushing each chunk and
+/// emitting the final frame epilogue in `flush()`.
+pub struct ZstdStreamCompressor {
+    inner: Option<zstd::stream::write::Encoder<'static, Vec<u8>>>,
+    emitted: usize,
+}
+
+impl ZstdStreamCompressor {
+    pub fn new(level: i32) -> Result<Self, CompressError> {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), level)
+            .map_err(|e| CompressError::Zstd(e.to_string()))?;
+        encoder
+            .window_log(16)
+            .map_err(|e| CompressError::Zstd(e.to_string()))?;
+        Ok(Self {
+            inner: Some(encoder),
+            emitted: 0,
+        })
+    }
+}
+
+impl StreamCompressor for ZstdStreamCompressor {
+    fn compress_chunk(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), CompressError> {
+        let Some(encoder) = self.inner.as_mut() else {
+            return Err(CompressError::Zstd(
+                "zstd stream compressor already finished".to_string(),
+            ));
+        };
+        encoder
+            .write_all(input)
+            .map_err(|e| CompressError::Zstd(e.to_string()))?;
+        encoder
+            .flush()
+            .map_err(|e| CompressError::Zstd(e.to_string()))?;
+        let encoded = encoder.get_ref();
+        if encoded.len() > self.emitted {
+            output.extend_from_slice(&encoded[self.emitted..]);
+            self.emitted = encoded.len();
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, output: &mut Vec<u8>) -> Result<(), CompressError> {
+        let Some(encoder) = self.inner.take() else {
+            return Ok(());
+        };
+        let encoded = encoder
+            .finish()
+            .map_err(|e| CompressError::Zstd(e.to_string()))?;
+        if encoded.len() > self.emitted {
+            output.extend_from_slice(&encoded[self.emitted..]);
+            self.emitted = encoded.len();
+        }
+        Ok(())
+    }
+}
+
 pub fn decompress_raw_zlib(input: &[u8]) -> Result<Vec<u8>, CompressError> {
     let mut decoder = flate2::read::DeflateDecoder::new(input);
     let mut out = Vec::new();

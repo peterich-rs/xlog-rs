@@ -21,13 +21,14 @@
   - 已完成 2B：`xlog` Rust backend 最小写入链路接入（可生成 `.xlog` block）。
   - 已完成 2C-1：fixture 生成与 no-crypt 解码对比脚本。
   - 已完成 2C-2：crypt 用例在 Python2 官方解码环境下的回归固化（`scripts/xlog/setup_py2_decoder_env.sh` + `scripts/xlog/run_phase2c2_official.sh`）。
+  - 已完成 2D：`run_phase2c2_official.sh` 已接入 nightly CI，并固化失败日志与产物上传（`.github/workflows/phase2c2_official_nightly.yml`）。
 - Phase 3：已完成（commit: `3558c76`）。
 - Phase 4：基本完成（主体已落地，仍有少量行为/接口对齐项待收口）。
 - Phase 5：进行中（当前增量）。
   - `xlog` 默认 feature 已切换到 `rust-backend`，并保留 `ffi-backend` 紧急回退。
   - JNI/UniFFI/NAPI 绑定层均改为可切换 `rust-backend` / `ffi-backend`。
   - 新增 `scripts/xlog/run_phase5_regression.sh` + `crates/xlog/examples/bench_backend.rs` 统一执行回归与性能对比。
-  - 已具备性能比值产物与可选门槛校验；兼容性剩余项集中在 async block 模型与接口覆盖。
+  - 已具备性能比值产物与可选门槛校验；兼容性剩余项主要集中在接口覆盖。
 - Phase 6：未开始。
 
 ### 0.2 Review 收口清单（截至 2026-03-02）
@@ -41,13 +42,13 @@
 5. `platform_console.rs` + `backend/rust.rs`：console 输出补齐 metadata，Android tag 改为逐条 tag，Apple `set_console_fun` 已接入。
 6. `oneshot.rs`：改为 exact-size mmap 读取语义（截断返回 `ReadFailed`）。
 7. `backend/rust.rs`：非法 pubkey 降级 no-crypt；async seq 改为全局；`dump` 语义改为无默认 appender 返回空串；default appender open 幂等。
+8. `backend/rust.rs` + `appender_engine.rs`：async 路径已对齐为“单 pending block + 流式增量压缩/加密 + flush 封尾”。
+9. `compress.rs`：zstd async 改为流式并显式 `windowLog=16`。
 
 仍待收口（详见 `docs/rust_migration_review.md`）：
 
-1. async block 仍非 C++ 的“单 pending block 流式模型”。
-2. zstd 流式参数（含 `windowLog=16`）未完全复刻。
-3. `traceLog` 与 `XloggerWrite(instance_ptr==0)` 等 raw info 入口尚未完整暴露。
-4. UniFFI/NAPI 绑定覆盖仍小于 C++ 接口面。
+1. `traceLog` 与 `XloggerWrite(instance_ptr==0)` 等 raw info 入口尚未完整暴露。
+2. UniFFI/NAPI 绑定覆盖仍小于 C++ 接口面。
 
 ---
 
@@ -344,6 +345,7 @@ DoD：
 3. **Phase 2C（已完成）**：官方解码兼容夹具与回归脚本。
    - 2C-1（已完成）：`gen_fixtures.sh + decode_compare.sh` no-crypt 回归。
    - 2C-2（已完成）：Python2 官方 crypt 解码环境固化与回归脚本接入。
+4. **Phase 2D（已完成）**：nightly CI 接入与失败产物保留。
 
 涉及文件：
 
@@ -363,6 +365,7 @@ DoD：
 - 新增 `scripts/xlog/decode_mars_nocrypt_py3.py`
 - 新增 `scripts/xlog/setup_py2_decoder_env.sh`
 - 新增 `scripts/xlog/run_phase2c2_official.sh`
+- 新增 `.github/workflows/phase2c2_official_nightly.yml`
 
 实现要点：
 
@@ -386,6 +389,9 @@ DoD：
   - `decode_compare.sh` 调用官方 Python2 解码脚本（可用时）或 Python3 no-crypt 兼容解码器进行结果对比，并校验 Rust/FFI 载荷一致性。
   - `setup_py2_decoder_env.sh` 负责 Python2 + `pyelliptic` + `zstandard` 一键安装与兼容补丁。
   - `run_phase2c2_official.sh` 固化“生成 crypt fixtures + official decoder 对比”的收口入口。
+- Phase 2D CI 护栏：
+  - `phase2c2_official_nightly.yml` 每日定时执行 `run_phase2c2_official.sh`。
+  - 失败日志 (`run_phase2c2_official.log`) 与 fixtures/status 作为 artifact 上传，防止 crypt 回归滞后发现。
 
 DoD：
 
@@ -456,7 +462,7 @@ DoD：
 
 实现要点：
 
-- 异步阈值：1/3 唤醒与 4/5 高水位告警注入均已落地。
+- 异步阈值：1/3 唤醒已对齐；4/5 高水位当前保留阈值检测与告警 latch（避免破坏 pending tail-less block）。
 - 后台线程周期对齐：15 分钟。
 - `flush(sync=true)` 需要阻塞等待后台实际刷盘完成。
 - `dump/memory_dump` 输出格式对齐现有实现（包括截断策略）。

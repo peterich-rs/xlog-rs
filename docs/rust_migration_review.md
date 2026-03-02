@@ -10,8 +10,8 @@
 
 当前状态：
 
-- 已修复：**18 项**（含多项高风险）
-- 仍待收敛：**5 项**（以架构/接口覆盖差异为主）
+- 已修复：**20 项**（含多项高风险）
+- 仍待收敛：**3 项**（以接口覆盖差异为主）
 
 ---
 
@@ -64,6 +64,12 @@
     - `crates/xlog-core/src/file_manager.rs`
 18. `oneshot_flush` 改为 exact-size mmap 读取语义（与 C++ 一致，截断返回 `ReadFailed`）。
     - `crates/xlog-core/src/oneshot.rs`
+19. async 路径改为“单 pending block + 流式增量压缩/加密 + flush 封尾”模型（与 C++ 主行为对齐）。
+    - `crates/xlog/src/backend/rust.rs`
+    - `crates/xlog-core/src/appender_engine.rs`
+20. zstd async 压缩改为流式并显式设置 `windowLog=16`，按 chunk flush、block 结束时 end。
+    - `crates/xlog-core/src/compress.rs`
+    - `crates/xlog/src/backend/rust.rs`
 
 ---
 
@@ -79,22 +85,21 @@
   - 截断 mmap 改为 `ReadFailed`
 - `crates/xlog/src/backend/rust.rs`
   - sync + pubkey 单测改为校验 crypt magic/client_pubkey
+  - 新增 async zlib/zstd 多条日志合流单 block 回归
+- `crates/xlog-core/tests/compress_roundtrip.rs`
+  - zstd 回归改为流式 compressor
 
 ---
 
 ## 4. 仍待对齐项（本轮未完全收口）
 
-1. **Async block 模型仍有架构差异**：Rust 仍按“单条日志独立 block”写入；C++ 为“共享 pending block + 流式增量压缩/加密 + flush 封尾”。
-2. **Zstd 参数/流式行为未完全等价**：当前 Rust 路径仍未覆盖 C++ `windowLog=16` + `compressStream2(..., ZSTD_e_flush)` 语义。
-3. **`traceLog` 旁路 console 语义未接入**：Rust 目前无完整 `XLoggerInfo.traceLog` 等价入口。
-4. **`XloggerWrite(instance_ptr==0)` 原语义未完全暴露**：Rust API 仍以 handle 写入为主，缺少完整 raw metadata 写路径。
-5. **绑定层覆盖面仍小于 C++ 接口面**：UniFFI/NAPI 仍缺少部分控制/检索/维护能力。
+1. **`traceLog` 旁路 console 语义未接入**：Rust 目前无完整 `XLoggerInfo.traceLog` 等价入口。
+2. **`XloggerWrite(instance_ptr==0)` 原语义未完全暴露**：Rust API 仍以 handle 写入为主，缺少完整 raw metadata 写路径。
+3. **绑定层覆盖面仍小于 C++ 接口面**：UniFFI/NAPI 仍缺少部分控制/检索/维护能力。
 
 ---
 
 ## 5. 建议下一步
 
-1. 优先处理 async 流式 pending block（这是剩余最大兼容差异）。
-2. 完成 zstd 流式参数对齐与 official decoder 回归。
-3. 在 API 层补齐 raw info/default instance 写入与 traceLog 语义。
-4. 同步扩展 UniFFI/NAPI 覆盖，保持跨绑定行为一致。
+1. 在 API 层补齐 raw info/default instance 写入与 traceLog 语义。
+2. 同步扩展 UniFFI/NAPI 覆盖，保持跨绑定行为一致。

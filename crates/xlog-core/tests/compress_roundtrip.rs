@@ -1,6 +1,6 @@
 use mars_xlog_core::compress::{
     decompress_raw_zlib, decompress_zstd_frames, StreamCompressor, ZlibStreamCompressor,
-    ZstdChunkCompressor,
+    ZstdStreamCompressor,
 };
 
 #[test]
@@ -18,7 +18,7 @@ fn zlib_stream_roundtrip() {
 
 #[test]
 fn zstd_frames_roundtrip() {
-    let mut compressor = ZstdChunkCompressor::new(3);
+    let mut compressor = ZstdStreamCompressor::new(3).unwrap();
     let mut out = Vec::new();
 
     compressor.compress_chunk(b"mars", &mut out).unwrap();

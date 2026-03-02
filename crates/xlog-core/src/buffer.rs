@@ -108,6 +108,28 @@ impl PersistentBuffer {
         Ok(true)
     }
 
+    pub fn replace_bytes(&mut self, bytes: &[u8]) -> Result<(), BufferError> {
+        if bytes.len() > self.capacity() {
+            return Err(BufferError::BlockTooLarge {
+                block_len: bytes.len(),
+                capacity: self.capacity(),
+            });
+        }
+
+        {
+            let data = self.store.as_mut_slice();
+            if !bytes.is_empty() {
+                data[..bytes.len()].copy_from_slice(bytes);
+            }
+            if bytes.len() < data.len() {
+                data[bytes.len()..].fill(0);
+            }
+            self.len = bytes.len();
+        }
+        self.store.flush()?;
+        Ok(())
+    }
+
     pub fn take_all(&mut self) -> Result<Vec<u8>, BufferError> {
         let out = self.store.as_slice()[..self.len].to_vec();
         self.clear()?;

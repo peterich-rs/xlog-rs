@@ -1,10 +1,10 @@
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::Local;
 use mars_xlog_core::appender_engine::{AppenderEngine, EngineMode};
 use mars_xlog_core::buffer::{PersistentBuffer, DEFAULT_BUFFER_BLOCK_LEN};
-use mars_xlog_core::compress::{StreamCompressor, ZlibStreamCompressor, ZstdChunkCompressor};
+use mars_xlog_core::compress::{StreamCompressor, ZlibStreamCompressor, ZstdStreamCompressor};
 use mars_xlog_core::crypto::EcdhTeaCipher;
 use mars_xlog_core::dump::{dump_to_file, memory_dump};
 use mars_xlog_core::file_manager::FileManager;
@@ -52,6 +52,98 @@ struct RustBackend {
     async_high_watermark_warned: AtomicBool,
     cipher: EcdhTeaCipher,
     engine: AppenderEngine,
+    async_state: Mutex<Option<AsyncPendingState>>,
+}
+
+enum AsyncCompressor {
+    Zlib(ZlibStreamCompressor),
+    Zstd(ZstdStreamCompressor),
+}
+
+impl AsyncCompressor {
+    fn compress_chunk(&mut self, input: &[u8], out: &mut Vec<u8>) -> bool {
+        match self {
+            AsyncCompressor::Zlib(c) => c.compress_chunk(input, out).is_ok(),
+            AsyncCompressor::Zstd(c) => c.compress_chunk(input, out).is_ok(),
+        }
+    }
+
+    fn finish(&mut self, out: &mut Vec<u8>) -> bool {
+        match self {
+            AsyncCompressor::Zlib(c) => c.flush(out).is_ok(),
+            AsyncCompressor::Zstd(c) => c.flush(out).is_ok(),
+        }
+    }
+}
+
+struct AsyncPendingState {
+    header: LogHeader,
+    payload: Vec<u8>,
+    compressor: AsyncCompressor,
+    crypt_tail: Vec<u8>,
+    flush_epoch: u64,
+}
+
+impl AsyncPendingState {
+    fn pending_bytes_without_tailer(&self) -> Option<Vec<u8>> {
+        let mut header = self.header;
+        header.len = u32::try_from(self.payload.len()).ok()?;
+        let mut out = Vec::with_capacity(header.encode().len() + self.payload.len());
+        out.extend_from_slice(&header.encode());
+        out.extend_from_slice(&self.payload);
+        Some(out)
+    }
+
+    fn append_chunk(&mut self, chunk: &[u8], cipher: &EcdhTeaCipher) -> bool {
+        let mut compressed = Vec::new();
+        if !self.compressor.compress_chunk(chunk, &mut compressed) {
+            return false;
+        }
+        self.append_encrypted(&compressed, cipher)
+    }
+
+    fn finalize(mut self, cipher: &EcdhTeaCipher) -> Option<Vec<u8>> {
+        let mut tail = Vec::new();
+        if !self.compressor.finish(&mut tail) {
+            return None;
+        }
+        if !self.append_encrypted(&tail, cipher) {
+            return None;
+        }
+        let mut header = self.header;
+        header.end_hour = chrono::Timelike::hour(&Local::now()) as u8;
+        header.len = u32::try_from(self.payload.len()).ok()?;
+        let mut out = Vec::with_capacity(header.encode().len() + self.payload.len() + 1);
+        out.extend_from_slice(&header.encode());
+        out.extend_from_slice(&self.payload);
+        out.push(MAGIC_END);
+        Some(out)
+    }
+
+    fn append_encrypted(&mut self, input: &[u8], cipher: &EcdhTeaCipher) -> bool {
+        if !cipher.enabled() {
+            self.payload.extend_from_slice(input);
+            return true;
+        }
+        if !self.crypt_tail.is_empty() {
+            let trim = self.crypt_tail.len().min(self.payload.len());
+            self.payload.truncate(self.payload.len() - trim);
+        }
+
+        let mut merged = Vec::with_capacity(self.crypt_tail.len() + input.len());
+        merged.extend_from_slice(&self.crypt_tail);
+        merged.extend_from_slice(input);
+        let full_len = merged.len() / 8 * 8;
+        if full_len > 0 {
+            let encrypted = cipher.encrypt_async(&merged[..full_len]);
+            self.payload.extend_from_slice(&encrypted);
+        }
+
+        self.crypt_tail.clear();
+        self.crypt_tail.extend_from_slice(&merged[full_len..]);
+        self.payload.extend_from_slice(&self.crypt_tail);
+        true
+    }
 }
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -61,9 +153,6 @@ static GLOBAL_CONSOLE_OPEN: AtomicBool = AtomicBool::new(false);
 
 const ASYNC_WARNING_THRESHOLD_NUM: usize = 4;
 const ASYNC_WARNING_THRESHOLD_DEN: usize = 5;
-const ASYNC_WARNING_TAG: &str = "mars::xlog";
-const ASYNC_WARNING_FILE: &str = "appender.cc";
-const ASYNC_WARNING_FUNC: &str = "__WriteAsync";
 
 fn registry() -> &'static InstanceRegistry<RustBackend> {
     static REGISTRY: OnceLock<InstanceRegistry<RustBackend>> = OnceLock::new();
@@ -118,6 +207,7 @@ impl RustBackend {
             config,
             cipher,
             engine,
+            async_state: Mutex::new(None),
         })
     }
 
@@ -163,7 +253,7 @@ impl RustBackend {
                     out
                 }
                 CompressMode::Zstd => {
-                    let mut c = ZstdChunkCompressor::new(self.config.compress_level);
+                    let mut c = ZstdStreamCompressor::new(self.config.compress_level).ok()?;
                     let mut out = Vec::new();
                     c.compress_chunk(line.as_bytes(), &mut out).ok()?;
                     c.flush(&mut out).ok()?;
@@ -211,6 +301,120 @@ impl RustBackend {
         Some(block)
     }
 
+    fn format_record_line(
+        &self,
+        level: LogLevel,
+        tag: &str,
+        file: &str,
+        func: &str,
+        line: u32,
+        msg: &str,
+    ) -> String {
+        let record = LogRecord {
+            level: to_core_level(level),
+            tag: tag.to_string(),
+            filename: file.to_string(),
+            func_name: func.to_string(),
+            line: line as i32,
+            timestamp: std::time::SystemTime::now(),
+            pid: std::process::id() as i64,
+            tid: current_tid(),
+            maintid: main_tid(),
+        };
+        mars_xlog_core::formatter::format_record(&record, msg)
+    }
+
+    fn new_async_pending_state(&self, hour: u8, flush_epoch: u64) -> Option<AsyncPendingState> {
+        let compression_kind = match self.config.compress_mode {
+            CompressMode::Zlib => CompressionKind::Zlib,
+            CompressMode::Zstd => CompressionKind::Zstd,
+        };
+        let compressor = match self.config.compress_mode {
+            CompressMode::Zlib => AsyncCompressor::Zlib(ZlibStreamCompressor::default()),
+            CompressMode::Zstd => {
+                AsyncCompressor::Zstd(ZstdStreamCompressor::new(self.config.compress_level).ok()?)
+            }
+        };
+        Some(AsyncPendingState {
+            header: LogHeader {
+                magic: select_magic(compression_kind, AppendMode::Async, self.cipher.enabled()),
+                seq: global_async_seq().next_async(),
+                begin_hour: hour,
+                end_hour: hour,
+                len: 0,
+                client_pubkey: if self.cipher.enabled() {
+                    self.cipher.client_pubkey()
+                } else {
+                    [0; 64]
+                },
+            },
+            payload: Vec::new(),
+            compressor,
+            crypt_tail: Vec::new(),
+            flush_epoch,
+        })
+    }
+
+    fn write_async_line(
+        &self,
+        level: LogLevel,
+        tag: &str,
+        file: &str,
+        func: &str,
+        line: u32,
+        msg: &str,
+    ) {
+        let line = self.format_record_line(level, tag, file, func, line, msg);
+        let now_hour = chrono::Timelike::hour(&Local::now()) as u8;
+        let engine_epoch = self.engine.async_flush_epoch();
+
+        let mut state_guard = self.async_state.lock().expect("async state lock poisoned");
+        let stale = state_guard
+            .as_ref()
+            .map(|s| s.flush_epoch != engine_epoch)
+            .unwrap_or(false);
+        if stale {
+            *state_guard = None;
+        }
+        if state_guard.is_none() {
+            *state_guard = self.new_async_pending_state(now_hour, engine_epoch);
+        }
+        let Some(state) = state_guard.as_mut() else {
+            return;
+        };
+
+        state.header.end_hour = now_hour;
+        if !state.append_chunk(line.as_bytes(), &self.cipher) {
+            *state_guard = None;
+            return;
+        }
+        let Some(pending) = state.pending_bytes_without_tailer() else {
+            *state_guard = None;
+            return;
+        };
+
+        if self
+            .engine
+            .write_async_pending(&pending, level == LogLevel::Fatal)
+            .is_err()
+        {
+            if let Some(block) = state_guard.take().and_then(|s| s.finalize(&self.cipher)) {
+                let _ = self.engine.write_async_pending(&block, false);
+                let _ = self.engine.flush(true);
+            }
+        }
+    }
+
+    fn finalize_async_pending(&self) {
+        let pending_block = {
+            let mut state_guard = self.async_state.lock().expect("async state lock poisoned");
+            state_guard.take().and_then(|s| s.finalize(&self.cipher))
+        };
+        if let Some(block) = pending_block {
+            let _ = self.engine.write_async_pending(&block, false);
+        }
+    }
+
     fn maybe_emit_async_high_watermark_warning(&self) {
         let Some((len, capacity)) = self.engine.async_buffer_stats() else {
             self.async_high_watermark_warned
@@ -238,20 +442,8 @@ impl RustBackend {
             return;
         }
 
-        let warning = format!(
-            "sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len:{len}, capacity:{capacity}"
-        );
-        let Some(block) = self.build_block(
-            LogLevel::Fatal,
-            ASYNC_WARNING_TAG,
-            ASYNC_WARNING_FILE,
-            ASYNC_WARNING_FUNC,
-            0,
-            &warning,
-        ) else {
-            return;
-        };
-        let _ = self.engine.write_block(&block, true);
+        // Keep the warning latch behavior, but avoid injecting an out-of-band block while
+        // async pending block is tail-less in mmap.
     }
 
     fn make_logfile_name_impl(&self, timespan: i32, prefix: &str) -> Vec<String> {
@@ -421,6 +613,9 @@ impl XlogBackend for RustBackend {
     }
 
     fn set_appender_mode(&self, mode: AppenderMode) {
+        if mode == AppenderMode::Sync && self.engine.mode() == EngineMode::Async {
+            self.finalize_async_pending();
+        }
         let _ = self.engine.set_mode(appender_to_engine_mode(mode));
         if mode == AppenderMode::Sync {
             self.async_high_watermark_warned
@@ -429,6 +624,9 @@ impl XlogBackend for RustBackend {
     }
 
     fn flush(&self, sync: bool) {
+        if self.engine.mode() == EngineMode::Async {
+            self.finalize_async_pending();
+        }
         let _ = self.engine.flush(sync);
     }
 
@@ -463,6 +661,12 @@ impl XlogBackend for RustBackend {
 
         if self.console_open.load(Ordering::Relaxed) {
             write_console_line(to_console_level(level), tag, file, func, line, msg);
+        }
+
+        if self.engine.mode() == EngineMode::Async {
+            self.write_async_line(level, tag, file, func, line, msg);
+            self.maybe_emit_async_high_watermark_warning();
+            return;
         }
 
         let Some(block) = self.build_block(level, tag, file, func, line, msg) else {
@@ -539,6 +743,7 @@ fn to_console_level(level: LogLevel) -> ConsoleLevel {
 mod tests {
     use std::fs;
 
+    use mars_xlog_core::compress::{decompress_raw_zlib, decompress_zstd_frames};
     use mars_xlog_core::protocol::{LogHeader, HEADER_LEN, MAGIC_SYNC_ZLIB_START, TAILER_LEN};
 
     use super::RustBackend;
@@ -632,6 +837,69 @@ mod tests {
         } else {
             assert!(!line.contains('*'));
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn async_mode_streams_multiple_lines_into_one_zlib_block() {
+        let root = std::env::temp_dir().join(format!(
+            "xlog-rust-backend-async-stream-zlib-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-async");
+        let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
+        backend.write_with_meta(LogLevel::Info, "tag", "f1.rs", "f1", 1, "one");
+        backend.write_with_meta(LogLevel::Info, "tag", "f2.rs", "f2", 2, "two");
+        backend.flush(true);
+
+        let xlog = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|x| x.to_str()) == Some("xlog"))
+            .unwrap();
+        let bytes = fs::read(xlog).unwrap();
+        let (header, payload) = parse_block_payload(&bytes);
+        assert!(header.len > 0);
+        let plain = decompress_raw_zlib(payload).unwrap();
+        let text = std::str::from_utf8(&plain).unwrap();
+        assert!(text.contains("one"));
+        assert!(text.contains("two"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn async_mode_streams_multiple_lines_into_one_zstd_block() {
+        let root = std::env::temp_dir().join(format!(
+            "xlog-rust-backend-async-stream-zstd-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-async-zstd")
+            .compress_mode(crate::CompressMode::Zstd);
+        let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
+        backend.write_with_meta(LogLevel::Info, "tag", "f1.rs", "f1", 1, "alpha");
+        backend.write_with_meta(LogLevel::Info, "tag", "f2.rs", "f2", 2, "beta");
+        backend.flush(true);
+
+        let xlog = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|x| x.to_str()) == Some("xlog"))
+            .unwrap();
+        let bytes = fs::read(xlog).unwrap();
+        let (header, payload) = parse_block_payload(&bytes);
+        assert!(header.len > 0);
+        let plain = decompress_zstd_frames(payload).unwrap();
+        let text = std::str::from_utf8(&plain).unwrap();
+        assert!(text.contains("alpha"));
+        assert!(text.contains("beta"));
         let _ = fs::remove_dir_all(&root);
     }
 }
