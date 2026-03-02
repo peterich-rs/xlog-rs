@@ -49,7 +49,6 @@ struct RustBackend {
     config: XlogConfig,
     level: AtomicI32,
     console_open: AtomicBool,
-    async_high_watermark_warned: AtomicBool,
     cipher: EcdhTeaCipher,
     engine: AppenderEngine,
     async_state: Mutex<Option<AsyncPendingState>>,
@@ -153,9 +152,6 @@ static GLOBAL_CONSOLE_OPEN: AtomicBool = AtomicBool::new(false);
 
 const ASYNC_WARNING_THRESHOLD_NUM: usize = 4;
 const ASYNC_WARNING_THRESHOLD_DEN: usize = 5;
-const ASYNC_WARNING_TAG: &str = "mars::xlog";
-const ASYNC_WARNING_FILE: &str = "appender.cc";
-const ASYNC_WARNING_FUNC: &str = "__WriteAsync";
 
 fn registry() -> &'static InstanceRegistry<RustBackend> {
     static REGISTRY: OnceLock<InstanceRegistry<RustBackend>> = OnceLock::new();
@@ -205,7 +201,6 @@ impl RustBackend {
         Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             console_open: AtomicBool::new(false),
-            async_high_watermark_warned: AtomicBool::new(false),
             level: AtomicI32::new(level_to_i32(level)),
             config,
             cipher,
@@ -370,6 +365,11 @@ impl RustBackend {
         let line = self.format_record_line(level, tag, file, func, line, msg);
         let now_hour = chrono::Timelike::hour(&Local::now()) as u8;
         let engine_epoch = self.engine.async_flush_epoch();
+        let capacity = self
+            .engine
+            .async_buffer_stats()
+            .map(|(_, cap)| cap)
+            .unwrap_or(DEFAULT_BUFFER_BLOCK_LEN);
 
         let mut state_guard = self.async_state.lock().expect("async state lock poisoned");
         let stale = state_guard
@@ -386,8 +386,18 @@ impl RustBackend {
             return;
         };
 
+        let threshold =
+            capacity.saturating_mul(ASYNC_WARNING_THRESHOLD_NUM) / ASYNC_WARNING_THRESHOLD_DEN;
+        let current_len = HEADER_LEN + state.payload.len();
+        let input = if current_len >= threshold {
+            format!("[F][ sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len: {current_len}\n")
+                .into_bytes()
+        } else {
+            line.into_bytes()
+        };
+
         state.header.end_hour = now_hour;
-        if !state.append_chunk(line.as_bytes(), &self.cipher) {
+        if !state.append_chunk(&input, &self.cipher) {
             *state_guard = None;
             return;
         }
@@ -432,66 +442,6 @@ impl RustBackend {
                 }
             }
         }
-    }
-
-    fn maybe_emit_async_high_watermark_warning(&self, level: LogLevel) {
-        let Some((len, capacity)) = self.async_pending_usage() else {
-            self.async_high_watermark_warned
-                .store(false, Ordering::Relaxed);
-            return;
-        };
-        if capacity == 0 {
-            self.async_high_watermark_warned
-                .store(false, Ordering::Relaxed);
-            return;
-        }
-
-        let threshold =
-            capacity.saturating_mul(ASYNC_WARNING_THRESHOLD_NUM) / ASYNC_WARNING_THRESHOLD_DEN;
-        if len < threshold {
-            self.async_high_watermark_warned
-                .store(false, Ordering::Relaxed);
-            return;
-        }
-
-        if self
-            .async_high_watermark_warned
-            .swap(true, Ordering::Relaxed)
-        {
-            return;
-        }
-
-        let warning =
-            format!("[F][ sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len: {len}\n");
-        self.write_async_line(
-            level,
-            ASYNC_WARNING_TAG,
-            ASYNC_WARNING_FILE,
-            ASYNC_WARNING_FUNC,
-            0,
-            &warning,
-        );
-    }
-
-    fn async_pending_usage(&self) -> Option<(usize, usize)> {
-        if self.engine.mode() != EngineMode::Async {
-            return None;
-        }
-
-        let capacity = self
-            .engine
-            .async_buffer_stats()
-            .map(|(_, cap)| cap)
-            .unwrap_or(DEFAULT_BUFFER_BLOCK_LEN);
-
-        let pending_len = self
-            .async_state
-            .lock()
-            .ok()
-            .and_then(|s| s.as_ref().map(|state| HEADER_LEN + state.payload.len()))
-            .unwrap_or(0);
-
-        Some((pending_len, capacity))
     }
 
     fn make_logfile_name_impl(&self, timespan: i32, prefix: &str) -> Vec<String> {
@@ -665,10 +615,6 @@ impl XlogBackend for RustBackend {
             self.finalize_async_pending();
         }
         let _ = self.engine.set_mode(appender_to_engine_mode(mode));
-        if mode == AppenderMode::Sync {
-            self.async_high_watermark_warned
-                .store(false, Ordering::Relaxed);
-        }
     }
 
     fn flush(&self, sync: bool) {
@@ -713,7 +659,6 @@ impl XlogBackend for RustBackend {
 
         if self.engine.mode() == EngineMode::Async {
             self.write_async_line(level, tag, file, func, line, msg);
-            self.maybe_emit_async_high_watermark_warning(level);
             return;
         }
 
@@ -721,7 +666,6 @@ impl XlogBackend for RustBackend {
             return;
         };
         let _ = self.engine.write_block(&block, level == LogLevel::Fatal);
-        self.maybe_emit_async_high_watermark_warning(level);
     }
 }
 
@@ -1157,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn async_high_watermark_writes_warning_line() {
+    fn async_high_watermark_replaces_current_line_with_warning() {
         let root = std::env::temp_dir().join(format!(
             "xlog-rust-backend-high-watermark-{}",
             std::process::id()
@@ -1168,7 +1112,7 @@ mod tests {
         let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-watermark");
         let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
 
-        let seed_len = DEFAULT_BUFFER_BLOCK_LEN * 4 / 5;
+        let threshold = DEFAULT_BUFFER_BLOCK_LEN * 4 / 5;
         let engine_epoch = backend.engine.async_flush_epoch();
         {
             let mut guard = backend
@@ -1176,23 +1120,37 @@ mod tests {
                 .lock()
                 .expect("async state lock poisoned");
             let mut state = backend.new_async_pending_state(1, engine_epoch).unwrap();
-            state.payload.resize(seed_len, b'x');
+            while HEADER_LEN + state.payload.len() < threshold {
+                assert!(state.append_chunk(b"fill", &backend.cipher));
+            }
             *guard = Some(state);
         }
 
-        backend.maybe_emit_async_high_watermark_warning(LogLevel::Info);
+        backend.write_async_line(
+            LogLevel::Info,
+            "tag",
+            "watermark.rs",
+            "f",
+            10,
+            "ORIGINAL-LINE-SHOULD-BE-DROPPED",
+        );
 
-        let payload_len_after = {
+        let pending = {
             let guard = backend
                 .async_state
                 .lock()
                 .expect("async state lock poisoned");
-            guard.as_ref().map(|s| s.payload.len()).unwrap_or(0)
+            guard
+                .as_ref()
+                .and_then(|s| s.pending_bytes_without_tailer())
+                .unwrap()
         };
-        assert!(payload_len_after > seed_len);
-        assert!(backend
-            .async_high_watermark_warned
-            .load(std::sync::atomic::Ordering::Relaxed));
+        let header = LogHeader::decode(&pending[..HEADER_LEN]).unwrap();
+        let payload = &pending[HEADER_LEN..];
+        let plain = decode_block_payload(&header, payload);
+        let text = std::str::from_utf8(&plain).unwrap();
+        assert!(text.contains("sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5"));
+        assert!(!text.contains("ORIGINAL-LINE-SHOULD-BE-DROPPED"));
         let _ = fs::remove_dir_all(&root);
     }
 }

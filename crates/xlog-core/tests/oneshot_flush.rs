@@ -3,7 +3,9 @@ use std::fs;
 use mars_xlog_core::buffer::DEFAULT_BUFFER_BLOCK_LEN;
 use mars_xlog_core::file_manager::FileManager;
 use mars_xlog_core::oneshot::{oneshot_flush, FileIoAction};
-use mars_xlog_core::protocol::{select_magic, AppendMode, CompressionKind, LogHeader, MAGIC_END};
+use mars_xlog_core::protocol::{
+    select_magic, AppendMode, CompressionKind, LogHeader, HEADER_LEN, MAGIC_END,
+};
 
 fn make_block(payload: &[u8]) -> Vec<u8> {
     let header = LogHeader {
@@ -17,6 +19,27 @@ fn make_block(payload: &[u8]) -> Vec<u8> {
     let mut out = header.encode().to_vec();
     out.extend_from_slice(payload);
     out.push(MAGIC_END);
+    out
+}
+
+fn parse_payloads(buf: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while offset + HEADER_LEN + 1 <= buf.len() {
+        let Ok(header) = LogHeader::decode(&buf[offset..offset + HEADER_LEN]) else {
+            break;
+        };
+        let payload_len = header.len as usize;
+        let payload_begin = offset + HEADER_LEN;
+        let payload_end = payload_begin + payload_len;
+        if payload_end >= buf.len() || buf[payload_end] != MAGIC_END {
+            break;
+        }
+        if let Ok(s) = std::str::from_utf8(&buf[payload_begin..payload_end]) {
+            out.push(s.to_string());
+        }
+        offset = payload_end + 1;
+    }
     out
 }
 
@@ -50,7 +73,14 @@ fn oneshot_flush_writes_recovered_bytes_once() {
     assert_eq!(files.len(), 1);
 
     let bytes = fs::read(&files[0]).unwrap();
-    assert_eq!(bytes, block);
+    let payloads = parse_payloads(&bytes);
+    assert_eq!(payloads.len(), 3);
+    assert_eq!(
+        payloads[0],
+        "~~~~~ begin of mmap from other process ~~~~~\n"
+    );
+    assert_eq!(payloads[1], "oneshot-regression".to_string());
+    assert!(payloads[2].starts_with("~~~~~ end of mmap from other process ~~~~~["));
 }
 
 #[test]

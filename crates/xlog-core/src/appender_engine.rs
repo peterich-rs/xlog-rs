@@ -3,11 +3,19 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use chrono::{Local, Timelike};
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use thiserror::Error;
 
 use crate::buffer::{recover_blocks, validate_block, BufferError, PersistentBuffer};
 use crate::file_manager::{FileManager, FileManagerError};
+use crate::platform_tid::current_tid;
+use crate::protocol::{
+    select_magic, AppendMode, CompressionKind, LogHeader, HEADER_LEN,
+    MAGIC_ASYNC_NO_CRYPT_ZLIB_START, MAGIC_ASYNC_NO_CRYPT_ZSTD_START, MAGIC_ASYNC_ZLIB_START,
+    MAGIC_ASYNC_ZSTD_START, MAGIC_END, MAGIC_SYNC_NO_CRYPT_ZLIB_START,
+    MAGIC_SYNC_NO_CRYPT_ZSTD_START, MAGIC_SYNC_ZLIB_START, MAGIC_SYNC_ZSTD_START,
+};
 
 const DEFAULT_ASYNC_FLUSH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES: u32 = 8;
@@ -94,7 +102,7 @@ impl AppenderEngine {
         if let Ok(mut state_guard) = state.lock() {
             // Keep parity with C++ appender startup behavior: drain recovered mmap data
             // into logfile immediately instead of waiting for next write/flush.
-            let _ = flush_pending_locked(&mut state_guard, false);
+            let _ = flush_pending_locked(&mut state_guard, false, true);
         }
         let (tx, rx) = unbounded();
         let pending_async_flush = Arc::new(AtomicBool::new(false));
@@ -208,7 +216,7 @@ impl AppenderEngine {
                     let appended = state.buffer.append_block(block)?;
 
                     if !appended {
-                        let _ = flush_pending_locked(&mut state, true)?;
+                        let _ = flush_pending_locked(&mut state, true, false)?;
                         let appended_after_flush = state.buffer.append_block(block)?;
                         if !appended_after_flush {
                             state.file_manager.append_log_bytes(
@@ -284,7 +292,7 @@ impl AppenderEngine {
             housekeep_locked(&mut state)?;
             return Ok(());
         }
-        self.request_flush(sync, true)
+        self.request_flush(sync, !sync)
     }
 
     fn request_flush(&self, sync: bool, move_file: bool) -> Result<(), AppenderEngineError> {
@@ -344,7 +352,9 @@ fn run_worker_loop(
                 let flushed = state
                     .lock()
                     .map_err(|_| ())
-                    .and_then(|mut s| flush_pending_locked(&mut s, move_file).map_err(|_| ()))
+                    .and_then(|mut s| {
+                        flush_pending_locked(&mut s, move_file, false).map_err(|_| ())
+                    })
                     .unwrap_or(false);
                 if flushed {
                     async_flush_epoch.fetch_add(1, Ordering::AcqRel);
@@ -358,7 +368,7 @@ fn run_worker_loop(
                 let flushed = state
                     .lock()
                     .map_err(|_| ())
-                    .and_then(|mut s| flush_pending_locked(&mut s, true).map_err(|_| ()))
+                    .and_then(|mut s| flush_pending_locked(&mut s, true, false).map_err(|_| ()))
                     .unwrap_or(false);
                 if flushed {
                     async_flush_epoch.fetch_add(1, Ordering::AcqRel);
@@ -370,7 +380,7 @@ fn run_worker_loop(
                 let flushed = state
                     .lock()
                     .map_err(|_| ())
-                    .and_then(|mut s| flush_pending_locked(&mut s, true).map_err(|_| ()))
+                    .and_then(|mut s| flush_pending_locked(&mut s, true, false).map_err(|_| ()))
                     .unwrap_or(false);
                 if flushed {
                     async_flush_epoch.fetch_add(1, Ordering::AcqRel);
@@ -384,6 +394,7 @@ fn run_worker_loop(
 fn flush_pending_locked(
     state: &mut EngineState,
     move_file: bool,
+    write_startup_mmap_tips: bool,
 ) -> Result<bool, AppenderEngineError> {
     let pending = state.buffer.take_all()?;
     state.async_pending_updates_since_persist = 0;
@@ -393,9 +404,30 @@ fn flush_pending_locked(
         if recovered.bytes.is_empty() {
             return housekeep_locked(state).map(|_| false);
         }
+        let sample_header = if recovered.bytes.len() >= HEADER_LEN {
+            LogHeader::decode(&recovered.bytes[..HEADER_LEN]).ok()
+        } else {
+            None
+        };
+        if write_startup_mmap_tips {
+            if let Some(begin) = build_sync_tip_block(sample_header, "~~~~~ begin of mmap ~~~~~\n")
+            {
+                state
+                    .file_manager
+                    .append_log_bytes(&begin, state.max_file_size, false)?;
+            }
+        }
         state
             .file_manager
             .append_log_bytes(&recovered.bytes, state.max_file_size, move_file)?;
+        if write_startup_mmap_tips {
+            let end = format!("~~~~~ end of mmap ~~~~~{}\n", current_mark_info());
+            if let Some(end_block) = build_sync_tip_block(sample_header, &end) {
+                state
+                    .file_manager
+                    .append_log_bytes(&end_block, state.max_file_size, false)?;
+            }
+        }
         flushed = true;
     }
     housekeep_locked(state)?;
@@ -425,4 +457,48 @@ fn i32_to_mode(v: i32) -> EngineMode {
     } else {
         EngineMode::Async
     }
+}
+
+fn magic_profile(magic: u8) -> Option<(CompressionKind, bool)> {
+    match magic {
+        MAGIC_SYNC_ZLIB_START | MAGIC_ASYNC_ZLIB_START => Some((CompressionKind::Zlib, true)),
+        MAGIC_SYNC_NO_CRYPT_ZLIB_START | MAGIC_ASYNC_NO_CRYPT_ZLIB_START => {
+            Some((CompressionKind::Zlib, false))
+        }
+        MAGIC_SYNC_ZSTD_START | MAGIC_ASYNC_ZSTD_START => Some((CompressionKind::Zstd, true)),
+        MAGIC_SYNC_NO_CRYPT_ZSTD_START | MAGIC_ASYNC_NO_CRYPT_ZSTD_START => {
+            Some((CompressionKind::Zstd, false))
+        }
+        _ => None,
+    }
+}
+
+fn build_sync_tip_block(sample_header: Option<LogHeader>, tip: &str) -> Option<Vec<u8>> {
+    let sample = sample_header?;
+    let (compression, crypt) = magic_profile(sample.magic)?;
+    let payload = tip.as_bytes();
+    let now_hour = Local::now().hour() as u8;
+    let header = LogHeader {
+        magic: select_magic(compression, AppendMode::Sync, crypt),
+        seq: 0,
+        begin_hour: now_hour,
+        end_hour: now_hour,
+        len: u32::try_from(payload.len()).ok()?,
+        client_pubkey: if crypt { sample.client_pubkey } else { [0; 64] },
+    };
+    let mut out = Vec::with_capacity(HEADER_LEN + payload.len() + 1);
+    out.extend_from_slice(&header.encode());
+    out.extend_from_slice(payload);
+    out.push(MAGIC_END);
+    Some(out)
+}
+
+fn current_mark_info() -> String {
+    let now = Local::now();
+    format!(
+        "[{},{}][{}]",
+        std::process::id(),
+        current_tid(),
+        now.format("%Y-%m-%d %z %H:%M:%S")
+    )
 }

@@ -109,7 +109,6 @@ impl FileManager {
         if let Some(cache_dir) = &self.cache_dir {
             out.extend(self.list_existing_files(cache_dir, &file_prefix));
         }
-        out.sort();
         out
     }
 
@@ -549,4 +548,39 @@ fn file_mtime(path: &Path) -> Result<SystemTime, FileManagerError> {
     let meta = fs::metadata(path).map_err(|e| FileManagerError::Metadata(path.to_path_buf(), e))?;
     meta.modified()
         .map_err(|e| FileManagerError::Metadata(path.to_path_buf(), e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FileManager;
+    use chrono::{Datelike, Local};
+
+    #[test]
+    fn filepaths_from_timespan_keeps_log_then_cache_order() {
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("log");
+        let cache_dir = root.path().join("cache");
+        let manager = FileManager::new(
+            log_dir.clone(),
+            Some(cache_dir.clone()),
+            "demo".to_string(),
+            1,
+        )
+        .unwrap();
+
+        let now = Local::now();
+        let file_name = format!(
+            "demo_{:04}{:02}{:02}.xlog",
+            now.year(),
+            now.month(),
+            now.day()
+        );
+        std::fs::write(log_dir.join(&file_name), b"log").unwrap();
+        std::fs::write(cache_dir.join(&file_name), b"cache").unwrap();
+
+        let paths = manager.filepaths_from_timespan(0, "demo");
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].starts_with(log_dir.to_string_lossy().as_ref()));
+        assert!(paths[1].starts_with(cache_dir.to_string_lossy().as_ref()));
+    }
 }

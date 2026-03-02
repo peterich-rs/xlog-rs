@@ -1,4 +1,10 @@
-#[cfg(target_os = "android")]
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos"
+))]
 use std::ffi::CString;
 #[cfg(any(
     target_os = "ios",
@@ -101,11 +107,24 @@ pub fn write_console_line(
         {
             let mode = APPLE_CONSOLE_FUN.load(Ordering::Relaxed);
             if mode == AppleConsoleFun::OsLog as u8 {
-                eprintln!("[{file_name}:{line}, {func_name}][{msg}");
+                let c_tag = to_console_cstring(tag);
+                let c_file = to_console_cstring(file_name);
+                let c_func = to_console_cstring(func_name);
+                let c_msg = to_console_cstring(msg);
+                unsafe {
+                    xlog_core_apple_console_oslog(
+                        apple_level(level),
+                        c_tag.as_ptr(),
+                        c_file.as_ptr(),
+                        line as i32,
+                        c_func.as_ptr(),
+                        c_msg.as_ptr(),
+                    );
+                }
                 return;
             }
             if mode == AppleConsoleFun::NsLog as u8 {
-                eprintln!(
+                let text = format!(
                     "[{}][{}][{}:{}, {}][{}",
                     level_short(level),
                     tag,
@@ -114,6 +133,10 @@ pub fn write_console_line(
                     func_name,
                     msg
                 );
+                let c_line = to_console_cstring(&text);
+                unsafe {
+                    xlog_core_apple_console_nslog(c_line.as_ptr());
+                }
                 return;
             }
             let now = Local::now();
@@ -121,7 +144,7 @@ pub fn write_console_line(
             let tid = current_tid();
             let maintid = main_tid();
             let tid_suffix = if tid == maintid { "*" } else { "" };
-            eprintln!(
+            let text = format!(
                 "[{}][{}][{}, {}{}][{}][{}:{}, {}][{}",
                 level_short(level),
                 now.format("%Y-%m-%d %z %H:%M:%S%.3f"),
@@ -134,6 +157,10 @@ pub fn write_console_line(
                 func_name,
                 msg
             );
+            let c_line = to_console_cstring(&text);
+            unsafe {
+                xlog_core_apple_console_printf(c_line.as_ptr());
+            }
             return;
         }
 
@@ -166,6 +193,39 @@ fn level_short(level: ConsoleLevel) -> &'static str {
         ConsoleLevel::Error => "E",
         ConsoleLevel::Fatal => "F",
         ConsoleLevel::None => "N",
+    }
+}
+
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos"
+))]
+fn to_console_cstring(s: &str) -> CString {
+    let clean = if s.as_bytes().contains(&0) {
+        s.replace('\0', " ")
+    } else {
+        s.to_string()
+    };
+    CString::new(clean).expect("console string must not contain nul")
+}
+
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos"
+))]
+fn apple_level(level: ConsoleLevel) -> i32 {
+    match level {
+        ConsoleLevel::Verbose => 0,
+        ConsoleLevel::Debug => 1,
+        ConsoleLevel::Info => 2,
+        ConsoleLevel::Warn => 3,
+        ConsoleLevel::Error => 4,
+        ConsoleLevel::Fatal => 5,
+        ConsoleLevel::None => 6,
     }
 }
 
@@ -207,4 +267,23 @@ fn android_priority(level: ConsoleLevel) -> i32 {
 #[cfg(target_os = "android")]
 unsafe extern "C" {
     fn __android_log_write(prio: i32, tag: *const libc::c_char, text: *const libc::c_char) -> i32;
+}
+
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos"
+))]
+unsafe extern "C" {
+    fn xlog_core_apple_console_printf(text: *const libc::c_char);
+    fn xlog_core_apple_console_nslog(text: *const libc::c_char);
+    fn xlog_core_apple_console_oslog(
+        level: i32,
+        tag: *const libc::c_char,
+        file: *const libc::c_char,
+        line: i32,
+        func: *const libc::c_char,
+        msg: *const libc::c_char,
+    );
 }

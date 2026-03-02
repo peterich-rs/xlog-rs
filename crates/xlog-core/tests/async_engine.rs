@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use chrono::{Datelike, Local};
 use mars_xlog_core::appender_engine::{AppenderEngine, EngineMode};
 use mars_xlog_core::buffer::{PersistentBuffer, DEFAULT_BUFFER_BLOCK_LEN};
 use mars_xlog_core::file_manager::FileManager;
@@ -101,7 +102,10 @@ fn startup_drains_recovered_mmap_bytes_to_logfile() {
     paths.sort();
     assert_eq!(paths.len(), 1);
     let payloads = parse_payloads(&fs::read(&paths[0]).unwrap());
-    assert_eq!(payloads, vec!["RECOVERED".to_string()]);
+    assert_eq!(payloads.len(), 3);
+    assert_eq!(payloads[0], "~~~~~ begin of mmap ~~~~~\n");
+    assert_eq!(payloads[1], "RECOVERED".to_string());
+    assert!(payloads[2].starts_with("~~~~~ end of mmap ~~~~~["));
 }
 
 #[test]
@@ -223,7 +227,51 @@ fn startup_recovers_pending_block_without_tailer() {
     paths.sort();
     assert_eq!(paths.len(), 1);
     let payloads = parse_payloads(&fs::read(&paths[0]).unwrap());
+    assert!(payloads.iter().any(|s| s == "~~~~~ begin of mmap ~~~~~\n"));
     assert!(payloads
         .iter()
         .any(|s| s.contains("PENDING-WITHOUT-TAILER")));
+    assert!(payloads
+        .iter()
+        .any(|s| s.starts_with("~~~~~ end of mmap ~~~~~[")));
+}
+
+#[test]
+fn flush_sync_keeps_cache_file_without_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_dir = dir.path().join("log");
+    let cache_dir = dir.path().join("cache");
+    let manager = FileManager::new(
+        log_dir.clone(),
+        Some(cache_dir.clone()),
+        "flushsync".to_string(),
+        1,
+    )
+    .unwrap();
+    let mmap_path = manager.mmap_path();
+
+    let now = Local::now();
+    let file_name = format!(
+        "flushsync_{:04}{:02}{:02}.xlog",
+        now.year(),
+        now.month(),
+        now.day()
+    );
+    let log_path = log_dir.join(&file_name);
+    let cache_path = cache_dir.join(&file_name);
+    fs::write(&log_path, b"log-base").unwrap();
+    fs::write(&cache_path, b"cache-base").unwrap();
+
+    let buffer =
+        PersistentBuffer::open_with_capacity(&mmap_path, DEFAULT_BUFFER_BLOCK_LEN).unwrap();
+    let engine = AppenderEngine::new(manager, buffer, EngineMode::Async, 0, 10 * 24 * 60 * 60);
+    let block = make_block(11, "SYNC-FLUSH");
+    engine.write_block(&block, false).unwrap();
+    engine.flush(true).unwrap();
+
+    assert!(cache_path.exists());
+    assert_eq!(fs::read(&log_path).unwrap(), b"log-base".to_vec());
+    let cache_bytes = fs::read(&cache_path).unwrap();
+    assert!(cache_bytes.starts_with(b"cache-base"));
+    assert!(cache_bytes.ends_with(&block));
 }

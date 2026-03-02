@@ -682,6 +682,7 @@ dependencies = [
 name = "mars-xlog-core"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "chrono",
  "crossbeam-channel",
  "flate2",

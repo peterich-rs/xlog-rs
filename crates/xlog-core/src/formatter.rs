@@ -4,6 +4,8 @@ use crate::record::LogRecord;
 
 /// Keep parity with Mars formatter's body cap behavior.
 const MAX_LOG_BODY_BYTES: usize = 0xFFFF;
+const LEGACY_STACK_BUFFER_BYTES: usize = 16 * 1024;
+const LEGACY_BODY_RESERVED_BYTES: usize = 130;
 
 pub fn extract_file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
@@ -45,7 +47,6 @@ fn format_time(ts: std::time::SystemTime) -> String {
 /// Reproduce C++ `formater.cc` output layout as one text line.
 pub fn format_record(record: &LogRecord, body: &str) -> String {
     let filename = extract_file_name(&record.filename);
-    let body = truncate_utf8_to_max_bytes(body, MAX_LOG_BODY_BYTES);
     let tid_suffix = if record.tid == record.maintid {
         "*"
     } else {
@@ -56,8 +57,7 @@ pub fn format_record(record: &LogRecord, body: &str) -> String {
     } else {
         &record.func_name
     };
-    let mut out = String::with_capacity(256 + body.len());
-    out.push_str(&format!(
+    let prefix = format!(
         "[{}][{}][{}, {}{}][{}][{}:{}, {}][",
         record.level.short(),
         format_time(record.timestamp),
@@ -68,10 +68,20 @@ pub fn format_record(record: &LogRecord, body: &str) -> String {
         filename,
         record.line,
         func_name
-    ));
+    );
+    let body_cap = LEGACY_STACK_BUFFER_BYTES
+        .saturating_sub(prefix.len())
+        .saturating_sub(LEGACY_BODY_RESERVED_BYTES)
+        .min(MAX_LOG_BODY_BYTES);
+    let body = truncate_utf8_to_max_bytes(body, body_cap);
+    let mut out = String::with_capacity(prefix.len() + body.len() + 1);
+    out.push_str(&prefix);
     out.push_str(body);
-    if !out.ends_with('\n') {
+    if !out.ends_with('\n') && out.len() < LEGACY_STACK_BUFFER_BYTES {
         out.push('\n');
+    }
+    if out.len() > LEGACY_STACK_BUFFER_BYTES {
+        out = truncate_utf8_to_max_bytes(&out, LEGACY_STACK_BUFFER_BYTES).to_string();
     }
     out
 }
@@ -111,12 +121,7 @@ mod tests {
         let body = "好".repeat(40_000); // 120_000 bytes, exceeds cap
 
         let line = format_record(&record, &body);
-        assert!(line.ends_with('\n'));
-
-        let payload = line.strip_suffix('\n').unwrap();
-        let open = payload.rfind('[').unwrap();
-        let body_out = &payload[open + 1..];
-        assert!(body_out.len() <= super::MAX_LOG_BODY_BYTES);
-        assert!(std::str::from_utf8(body_out.as_bytes()).is_ok());
+        assert!(line.len() <= super::LEGACY_STACK_BUFFER_BYTES);
+        assert!(std::str::from_utf8(line.as_bytes()).is_ok());
     }
 }

@@ -79,6 +79,20 @@
     - `crates/xlog-core/src/buffer.rs`
 24. 后台线程 flush timeout 行为可配置（默认保持 15 分钟），便于稳定回归测试 timeout flush 语义。
     - `crates/xlog-core/src/appender_engine.rs`
+25. formatter 截断语义改为对齐 C++ 16KB 栈缓冲路径（保留 130 bytes 安全余量），不再按 64KB body 上限直接截断。
+    - `crates/xlog-core/src/formatter.rs`
+26. `flush(sync=true)` 在 async 模式下改为 `move_file=false`，对齐 C++ `FlushSync` 的 cache->log 迁移行为。
+    - `crates/xlog-core/src/appender_engine.rs`
+27. async 4/5 高水位场景改为“替换当前待写日志为告警行”，不再追加额外告警块。
+    - `crates/xlog/src/backend/rust.rs`
+28. `filepaths_from_timespan` 移除额外排序，恢复 log_dir -> cache_dir 的遍历顺序语义。
+    - `crates/xlog-core/src/file_manager.rs`
+29. 启动 mmap 恢复与 oneshot 恢复补齐 begin/end tip 行，文案与 C++ 一致（含 mark info）。
+    - `crates/xlog-core/src/appender_engine.rs`
+    - `crates/xlog-core/src/oneshot.rs`
+30. Apple console 输出从 `eprintln!` 收敛为原生后端调用（OSLog/NSLog/printf shim）。
+    - `crates/xlog-core/src/platform_console.rs`
+    - `crates/xlog-core/src/apple_console_shim.mm`
 
 ---
 
@@ -90,6 +104,7 @@
   - `startup_drains_recovered_mmap_bytes_to_logfile`
   - `async_timeout_flushes_pending_block_without_explicit_flush`
   - `startup_recovers_pending_block_without_tailer`
+  - `flush_sync_keeps_cache_file_without_move`
 - `crates/xlog-core/tests/mmap_recovery.rs`
   - 调整为 tailer torn 场景可恢复
 - `crates/xlog-core/tests/oneshot_flush.rs`
@@ -98,8 +113,11 @@
   - sync + pubkey 单测改为校验 crypt magic/client_pubkey
   - 新增 async zlib/zstd 多条日志合流单 block 回归
   - 新增 async crypt(zlib/zstd) 可解码、Async->Sync 不丢日志、高水位告警注入回归
+  - 高水位回归调整为“替换当前日志为告警行”
 - `crates/xlog-core/tests/compress_roundtrip.rs`
   - zstd 回归改为流式 compressor
+- `crates/xlog-core/src/file_manager.rs`
+  - 新增 `filepaths_from_timespan_keeps_log_then_cache_order` 顺序回归
 
 ---
 

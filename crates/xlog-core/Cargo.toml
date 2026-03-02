@@ -23,3 +23,6 @@ crossbeam-channel = "0.5"
 [dev-dependencies]
 hex = "0.4"
 tempfile = "3"
+
+[build-dependencies]
+cc = "1"

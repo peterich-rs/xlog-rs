@@ -47,6 +47,12 @@
 10. `backend/rust.rs`：4/5 高水位告警已恢复为实际日志注入（同一 pending stream）。
 11. `backend/rust.rs` + `appender_engine.rs`：`Async -> Sync` 并发切换下补齐 `InvalidMode` 落盘兜底，避免尾块丢失。
 12. `appender_engine.rs` + `buffer.rs`：async pending mmap 改为批量刷盘（保留强制刷盘触发）。
+13. `formatter.rs`：日志截断语义改为对齐 C++ 16KB 栈缓冲路径（保留 130 bytes 余量）。
+14. `appender_engine.rs`：`flush(sync=true)` 改为 `move_file=false`，对齐 C++ `FlushSync`。
+15. `backend/rust.rs`：4/5 高水位改为“替换当前日志为告警行”，不再追加额外告警写入。
+16. `file_manager.rs`：`filepaths_from_timespan` 恢复 log_dir -> cache_dir 顺序，不做额外排序。
+17. `appender_engine.rs` + `oneshot.rs`：补齐 mmap 恢复 begin/end tip 行（含 mark info）。
+18. `platform_console.rs`：Apple console 改为原生 OSLog/NSLog/printf shim 输出。
 
 仍待收口（详见 `docs/rust_migration_review.md`）：
 
