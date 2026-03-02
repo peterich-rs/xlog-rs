@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::Local;
-use mars_xlog_core::appender_engine::{AppenderEngine, EngineMode};
+use mars_xlog_core::appender_engine::{AppenderEngine, AppenderEngineError, EngineMode};
 use mars_xlog_core::buffer::{PersistentBuffer, DEFAULT_BUFFER_BLOCK_LEN};
 use mars_xlog_core::compress::{StreamCompressor, ZlibStreamCompressor, ZstdStreamCompressor};
 use mars_xlog_core::crypto::EcdhTeaCipher;
@@ -21,7 +21,7 @@ use mars_xlog_core::platform_console::{set_apple_console_fun, AppleConsoleFun};
 use mars_xlog_core::platform_console::{write_console_line, ConsoleLevel};
 use mars_xlog_core::platform_tid::{current_tid, main_tid};
 use mars_xlog_core::protocol::{
-    select_magic, AppendMode, CompressionKind, LogHeader, SeqGenerator, MAGIC_END,
+    select_magic, AppendMode, CompressionKind, LogHeader, SeqGenerator, HEADER_LEN, MAGIC_END,
 };
 use mars_xlog_core::record::{LogLevel as CoreLogLevel, LogRecord};
 use mars_xlog_core::registry::InstanceRegistry;
@@ -153,6 +153,9 @@ static GLOBAL_CONSOLE_OPEN: AtomicBool = AtomicBool::new(false);
 
 const ASYNC_WARNING_THRESHOLD_NUM: usize = 4;
 const ASYNC_WARNING_THRESHOLD_DEN: usize = 5;
+const ASYNC_WARNING_TAG: &str = "mars::xlog";
+const ASYNC_WARNING_FILE: &str = "appender.cc";
+const ASYNC_WARNING_FUNC: &str = "__WriteAsync";
 
 fn registry() -> &'static InstanceRegistry<RustBackend> {
     static REGISTRY: OnceLock<InstanceRegistry<RustBackend>> = OnceLock::new();
@@ -399,7 +402,7 @@ impl RustBackend {
             .is_err()
         {
             if let Some(block) = state_guard.take().and_then(|s| s.finalize(&self.cipher)) {
-                let _ = self.engine.write_async_pending(&block, false);
+                self.persist_finalized_async_block(&block, level == LogLevel::Fatal);
                 let _ = self.engine.flush(true);
             }
         }
@@ -411,12 +414,28 @@ impl RustBackend {
             state_guard.take().and_then(|s| s.finalize(&self.cipher))
         };
         if let Some(block) = pending_block {
-            let _ = self.engine.write_async_pending(&block, false);
+            self.persist_finalized_async_block(&block, false);
         }
     }
 
-    fn maybe_emit_async_high_watermark_warning(&self) {
-        let Some((len, capacity)) = self.engine.async_buffer_stats() else {
+    fn persist_finalized_async_block(&self, block: &[u8], force_flush: bool) {
+        match self.engine.write_async_pending(block, force_flush) {
+            Ok(()) => {}
+            Err(AppenderEngineError::InvalidMode) => {
+                if self.engine.write_block(block, force_flush).is_err() {
+                    let _ = self.engine.flush(true);
+                }
+            }
+            Err(_) => {
+                if self.engine.write_block(block, force_flush).is_err() {
+                    let _ = self.engine.flush(true);
+                }
+            }
+        }
+    }
+
+    fn maybe_emit_async_high_watermark_warning(&self, level: LogLevel) {
+        let Some((len, capacity)) = self.async_pending_usage() else {
             self.async_high_watermark_warned
                 .store(false, Ordering::Relaxed);
             return;
@@ -442,8 +461,37 @@ impl RustBackend {
             return;
         }
 
-        // Keep the warning latch behavior, but avoid injecting an out-of-band block while
-        // async pending block is tail-less in mmap.
+        let warning =
+            format!("[F][ sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len: {len}\n");
+        self.write_async_line(
+            level,
+            ASYNC_WARNING_TAG,
+            ASYNC_WARNING_FILE,
+            ASYNC_WARNING_FUNC,
+            0,
+            &warning,
+        );
+    }
+
+    fn async_pending_usage(&self) -> Option<(usize, usize)> {
+        if self.engine.mode() != EngineMode::Async {
+            return None;
+        }
+
+        let capacity = self
+            .engine
+            .async_buffer_stats()
+            .map(|(_, cap)| cap)
+            .unwrap_or(DEFAULT_BUFFER_BLOCK_LEN);
+
+        let pending_len = self
+            .async_state
+            .lock()
+            .ok()
+            .and_then(|s| s.as_ref().map(|state| HEADER_LEN + state.payload.len()))
+            .unwrap_or(0);
+
+        Some((pending_len, capacity))
     }
 
     fn make_logfile_name_impl(&self, timespan: i32, prefix: &str) -> Vec<String> {
@@ -665,7 +713,7 @@ impl XlogBackend for RustBackend {
 
         if self.engine.mode() == EngineMode::Async {
             self.write_async_line(level, tag, file, func, line, msg);
-            self.maybe_emit_async_high_watermark_warning();
+            self.maybe_emit_async_high_watermark_warning(level);
             return;
         }
 
@@ -673,7 +721,7 @@ impl XlogBackend for RustBackend {
             return;
         };
         let _ = self.engine.write_block(&block, level == LogLevel::Fatal);
-        self.maybe_emit_async_high_watermark_warning();
+        self.maybe_emit_async_high_watermark_warning(level);
     }
 }
 
@@ -742,9 +790,15 @@ fn to_console_level(level: LogLevel) -> ConsoleLevel {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
+    use mars_xlog_core::buffer::DEFAULT_BUFFER_BLOCK_LEN;
     use mars_xlog_core::compress::{decompress_raw_zlib, decompress_zstd_frames};
-    use mars_xlog_core::protocol::{LogHeader, HEADER_LEN, MAGIC_SYNC_ZLIB_START, TAILER_LEN};
+    use mars_xlog_core::crypto::{tea_decrypt_in_place, EcdhTeaCipher};
+    use mars_xlog_core::protocol::{
+        LogHeader, HEADER_LEN, MAGIC_ASYNC_ZLIB_START, MAGIC_ASYNC_ZSTD_START, MAGIC_END,
+        MAGIC_SYNC_ZLIB_START, TAILER_LEN,
+    };
 
     use super::RustBackend;
     use crate::backend::XlogBackend;
@@ -754,6 +808,95 @@ mod tests {
         "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
         "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8"
     );
+    const TEST_SERVER_PRIVKEY_ONE: [u8; 32] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 1,
+    ];
+
+    fn bytes_to_hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        out
+    }
+
+    fn decrypt_async_payload(header: &LogHeader, payload: &[u8]) -> Vec<u8> {
+        if header.client_pubkey == [0; 64] {
+            return payload.to_vec();
+        }
+        let client_pub_hex = bytes_to_hex(&header.client_pubkey);
+        let cipher =
+            EcdhTeaCipher::new_with_private_key(&client_pub_hex, TEST_SERVER_PRIVKEY_ONE).unwrap();
+
+        let mut out = payload.to_vec();
+        let block_end = out.len() / 8 * 8;
+        tea_decrypt_in_place(&mut out[..block_end], &cipher.tea_key_words());
+        out
+    }
+
+    fn parse_blocks(bytes: &[u8]) -> Vec<(LogHeader, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        while offset + HEADER_LEN + TAILER_LEN <= bytes.len() {
+            let Ok(header) = LogHeader::decode(&bytes[offset..offset + HEADER_LEN]) else {
+                break;
+            };
+            let payload_len = header.len as usize;
+            let payload_start = offset + HEADER_LEN;
+            let payload_end = payload_start + payload_len;
+            if payload_end + TAILER_LEN > bytes.len() {
+                break;
+            }
+            if bytes[payload_end] != MAGIC_END {
+                break;
+            }
+            out.push((header, bytes[payload_start..payload_end].to_vec()));
+            offset = payload_end + TAILER_LEN;
+        }
+        out
+    }
+
+    fn decode_block_payload(header: &LogHeader, payload: &[u8]) -> Vec<u8> {
+        let is_async = matches!(header.magic, 0x07 | 0x09 | 0x0C | 0x0D);
+        if !is_async {
+            return payload.to_vec();
+        }
+
+        let raw = if matches!(header.magic, 0x07 | 0x0C) {
+            decrypt_async_payload(header, payload)
+        } else {
+            payload.to_vec()
+        };
+
+        match header.magic {
+            0x07 | 0x09 => decompress_raw_zlib(&raw).unwrap(),
+            0x0C | 0x0D => decompress_zstd_frames(&raw).unwrap(),
+            _ => raw,
+        }
+    }
+
+    fn collect_decoded_text(root: &Path) -> String {
+        let mut files: Vec<_> = fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("xlog"))
+            .collect();
+        files.sort();
+
+        let mut merged = String::new();
+        for file in files {
+            let bytes = fs::read(file).unwrap();
+            for (header, payload) in parse_blocks(&bytes) {
+                let plain = decode_block_payload(&header, &payload);
+                merged.push_str(std::str::from_utf8(&plain).unwrap());
+            }
+        }
+        merged
+    }
 
     fn parse_block_payload(block: &[u8]) -> (LogHeader, &[u8]) {
         let header = LogHeader::decode(&block[..HEADER_LEN]).unwrap();
@@ -900,6 +1043,156 @@ mod tests {
         let text = std::str::from_utf8(&plain).unwrap();
         assert!(text.contains("alpha"));
         assert!(text.contains("beta"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn async_mode_crypt_zlib_is_decodable() {
+        let root = std::env::temp_dir().join(format!(
+            "xlog-rust-backend-async-crypt-zlib-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-async-crypt-zlib")
+            .pub_key(TEST_SERVER_PUBKEY_HEX);
+        let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
+        backend.write_with_meta(LogLevel::Info, "tag", "f1.rs", "f1", 1, "gamma");
+        backend.write_with_meta(LogLevel::Info, "tag", "f2.rs", "f2", 2, "delta");
+        backend.flush(true);
+
+        let xlog = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|x| x.to_str()) == Some("xlog"))
+            .unwrap();
+        let bytes = fs::read(xlog).unwrap();
+        let (header, payload) = parse_block_payload(&bytes);
+        assert_eq!(header.magic, MAGIC_ASYNC_ZLIB_START);
+        let decrypted = decrypt_async_payload(&header, payload);
+        let plain = decompress_raw_zlib(&decrypted).unwrap();
+        let text = std::str::from_utf8(&plain).unwrap();
+        assert!(text.contains("gamma"));
+        assert!(text.contains("delta"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn async_mode_crypt_zstd_is_decodable() {
+        let root = std::env::temp_dir().join(format!(
+            "xlog-rust-backend-async-crypt-zstd-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-async-crypt-zstd")
+            .compress_mode(crate::CompressMode::Zstd)
+            .pub_key(TEST_SERVER_PUBKEY_HEX);
+        let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
+        backend.write_with_meta(LogLevel::Info, "tag", "f1.rs", "f1", 1, "theta");
+        backend.write_with_meta(LogLevel::Info, "tag", "f2.rs", "f2", 2, "lambda");
+        backend.flush(true);
+
+        let xlog = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|x| x.to_str()) == Some("xlog"))
+            .unwrap();
+        let bytes = fs::read(xlog).unwrap();
+        let (header, payload) = parse_block_payload(&bytes);
+        assert_eq!(header.magic, MAGIC_ASYNC_ZSTD_START);
+        let decrypted = decrypt_async_payload(&header, payload);
+        let plain = decompress_zstd_frames(&decrypted).unwrap();
+        let text = std::str::from_utf8(&plain).unwrap();
+        assert!(text.contains("theta"));
+        assert!(text.contains("lambda"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn async_to_sync_switch_keeps_pending_logs() {
+        let root = std::env::temp_dir().join(format!(
+            "xlog-rust-backend-async-to-sync-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-switch");
+        let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
+        backend.write_with_meta(
+            LogLevel::Info,
+            "tag",
+            "switch.rs",
+            "before",
+            10,
+            "before-switch",
+        );
+        backend.set_appender_mode(AppenderMode::Sync);
+        backend.write_with_meta(
+            LogLevel::Info,
+            "tag",
+            "switch.rs",
+            "after",
+            11,
+            "after-switch",
+        );
+        backend.flush(true);
+
+        let mut merged = String::new();
+        for _ in 0..20 {
+            merged = collect_decoded_text(&root);
+            if merged.contains("before-switch") && merged.contains("after-switch") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(merged.contains("before-switch"));
+        assert!(merged.contains("after-switch"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn async_high_watermark_writes_warning_line() {
+        let root = std::env::temp_dir().join(format!(
+            "xlog-rust-backend-high-watermark-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-watermark");
+        let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
+
+        let seed_len = DEFAULT_BUFFER_BLOCK_LEN * 4 / 5;
+        let engine_epoch = backend.engine.async_flush_epoch();
+        {
+            let mut guard = backend
+                .async_state
+                .lock()
+                .expect("async state lock poisoned");
+            let mut state = backend.new_async_pending_state(1, engine_epoch).unwrap();
+            state.payload.resize(seed_len, b'x');
+            *guard = Some(state);
+        }
+
+        backend.maybe_emit_async_high_watermark_warning(LogLevel::Info);
+
+        let payload_len_after = {
+            let guard = backend
+                .async_state
+                .lock()
+                .expect("async state lock poisoned");
+            guard.as_ref().map(|s| s.payload.len()).unwrap_or(0)
+        };
+        assert!(payload_len_after > seed_len);
+        assert!(backend
+            .async_high_watermark_warned
+            .load(std::sync::atomic::Ordering::Relaxed));
         let _ = fs::remove_dir_all(&root);
     }
 }

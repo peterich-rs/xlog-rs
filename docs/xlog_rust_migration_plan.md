@@ -44,6 +44,9 @@
 7. `backend/rust.rs`：非法 pubkey 降级 no-crypt；async seq 改为全局；`dump` 语义改为无默认 appender 返回空串；default appender open 幂等。
 8. `backend/rust.rs` + `appender_engine.rs`：async 路径已对齐为“单 pending block + 流式增量压缩/加密 + flush 封尾”。
 9. `compress.rs`：zstd async 改为流式并显式 `windowLog=16`。
+10. `backend/rust.rs`：4/5 高水位告警已恢复为实际日志注入（同一 pending stream）。
+11. `backend/rust.rs` + `appender_engine.rs`：`Async -> Sync` 并发切换下补齐 `InvalidMode` 落盘兜底，避免尾块丢失。
+12. `appender_engine.rs` + `buffer.rs`：async pending mmap 改为批量刷盘（保留强制刷盘触发）。
 
 仍待收口（详见 `docs/rust_migration_review.md`）：
 
@@ -462,7 +465,7 @@ DoD：
 
 实现要点：
 
-- 异步阈值：1/3 唤醒已对齐；4/5 高水位当前保留阈值检测与告警 latch（避免破坏 pending tail-less block）。
+- 异步阈值：1/3 唤醒已对齐；4/5 高水位已恢复同 pending stream 告警注入。
 - 后台线程周期对齐：15 分钟。
 - `flush(sync=true)` 需要阻塞等待后台实际刷盘完成。
 - `dump/memory_dump` 输出格式对齐现有实现（包括截断策略）。

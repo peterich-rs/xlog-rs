@@ -9,7 +9,8 @@ use thiserror::Error;
 use crate::buffer::{recover_blocks, validate_block, BufferError, PersistentBuffer};
 use crate::file_manager::{FileManager, FileManagerError};
 
-const ASYNC_FLUSH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_ASYNC_FLUSH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES: u32 = 8;
 const MIN_LOG_ALIVE_SECONDS: i64 = 24 * 60 * 60;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -35,6 +36,7 @@ struct EngineState {
     buffer: PersistentBuffer,
     max_file_size: u64,
     max_alive_time: i64,
+    async_pending_updates_since_persist: u32,
 }
 
 enum EngineCommand {
@@ -64,11 +66,30 @@ impl AppenderEngine {
         max_file_size: u64,
         max_alive_time: i64,
     ) -> Self {
+        Self::new_with_flush_timeout(
+            file_manager,
+            buffer,
+            mode,
+            max_file_size,
+            max_alive_time,
+            DEFAULT_ASYNC_FLUSH_TIMEOUT,
+        )
+    }
+
+    pub fn new_with_flush_timeout(
+        file_manager: FileManager,
+        buffer: PersistentBuffer,
+        mode: EngineMode,
+        max_file_size: u64,
+        max_alive_time: i64,
+        flush_timeout: Duration,
+    ) -> Self {
         let state = Arc::new(Mutex::new(EngineState {
             file_manager,
             buffer,
             max_file_size,
             max_alive_time: max_alive_time.max(MIN_LOG_ALIVE_SECONDS),
+            async_pending_updates_since_persist: 0,
         }));
         if let Ok(mut state_guard) = state.lock() {
             // Keep parity with C++ appender startup behavior: drain recovered mmap data
@@ -84,7 +105,13 @@ impl AppenderEngine {
         let worker = thread::Builder::new()
             .name("xlog-appender-engine".to_string())
             .spawn(move || {
-                run_worker_loop(worker_state, rx, worker_pending_flag, worker_flush_epoch)
+                run_worker_loop(
+                    worker_state,
+                    rx,
+                    worker_pending_flag,
+                    worker_flush_epoch,
+                    flush_timeout,
+                )
             })
             .expect("spawn appender engine thread");
 
@@ -228,9 +255,21 @@ impl AppenderEngine {
         }
         let should_flush = {
             let mut state = self.state.lock().expect("state lock poisoned");
-            state.buffer.replace_bytes(pending_bytes)?;
             let threshold = state.buffer.capacity() / 3;
-            force_flush || state.buffer.len() >= threshold
+            let should_flush = force_flush || pending_bytes.len() >= threshold;
+
+            state.async_pending_updates_since_persist =
+                state.async_pending_updates_since_persist.saturating_add(1);
+            let should_persist_mmap = should_flush
+                || state.async_pending_updates_since_persist
+                    >= ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES;
+            state
+                .buffer
+                .replace_bytes_with_flush(pending_bytes, should_persist_mmap)?;
+            if should_persist_mmap {
+                state.async_pending_updates_since_persist = 0;
+            }
+            should_flush
         };
 
         if should_flush {
@@ -296,9 +335,10 @@ fn run_worker_loop(
     rx: Receiver<EngineCommand>,
     pending_async_flush: Arc<AtomicBool>,
     async_flush_epoch: Arc<AtomicU64>,
+    flush_timeout: Duration,
 ) {
     loop {
-        match rx.recv_timeout(ASYNC_FLUSH_TIMEOUT) {
+        match rx.recv_timeout(flush_timeout) {
             Ok(EngineCommand::Flush { move_file, ack }) => {
                 pending_async_flush.store(false, Ordering::Release);
                 let flushed = state
@@ -346,6 +386,7 @@ fn flush_pending_locked(
     move_file: bool,
 ) -> Result<bool, AppenderEngineError> {
     let pending = state.buffer.take_all()?;
+    state.async_pending_updates_since_persist = 0;
     let mut flushed = false;
     if !pending.is_empty() {
         let recovered = recover_blocks(&pending);

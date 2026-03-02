@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use mars_xlog_core::appender_engine::{AppenderEngine, EngineMode};
 use mars_xlog_core::buffer::{PersistentBuffer, DEFAULT_BUFFER_BLOCK_LEN};
@@ -151,4 +152,78 @@ fn concurrent_async_writes_keep_all_messages() {
     assert_eq!(got.len(), (threads as usize) * (per_thread as usize));
     assert!(got.contains("T00-000"));
     assert!(got.contains("T05-079"));
+}
+
+#[test]
+fn async_timeout_flushes_pending_block_without_explicit_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager =
+        FileManager::new(dir.path().to_path_buf(), None, "timeout".to_string(), 0).unwrap();
+    let buffer =
+        PersistentBuffer::open_with_capacity(manager.mmap_path(), DEFAULT_BUFFER_BLOCK_LEN)
+            .unwrap();
+    let engine = AppenderEngine::new_with_flush_timeout(
+        manager,
+        buffer,
+        EngineMode::Async,
+        0,
+        10 * 24 * 60 * 60,
+        Duration::from_millis(120),
+    );
+
+    let block = make_block(1, "TIMEOUT-FLUSH");
+    let pending_without_tailer = &block[..block.len() - 1];
+    engine
+        .write_async_pending(pending_without_tailer, false)
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(360));
+    drop(engine);
+
+    let mut paths: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("xlog"))
+        .collect();
+    paths.sort();
+    assert_eq!(paths.len(), 1);
+    let payloads = parse_payloads(&fs::read(&paths[0]).unwrap());
+    assert!(payloads.iter().any(|s| s.contains("TIMEOUT-FLUSH")));
+}
+
+#[test]
+fn startup_recovers_pending_block_without_tailer() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager =
+        FileManager::new(dir.path().to_path_buf(), None, "restart".to_string(), 0).unwrap();
+    let mmap_path = manager.mmap_path();
+
+    {
+        let mut buffer =
+            PersistentBuffer::open_with_capacity(&mmap_path, DEFAULT_BUFFER_BLOCK_LEN).unwrap();
+        let block = make_block(7, "PENDING-WITHOUT-TAILER");
+        let pending_without_tailer = &block[..block.len() - 1];
+        buffer
+            .replace_bytes_with_flush(pending_without_tailer, true)
+            .unwrap();
+    }
+
+    let buffer =
+        PersistentBuffer::open_with_capacity(&mmap_path, DEFAULT_BUFFER_BLOCK_LEN).unwrap();
+    let engine = AppenderEngine::new(manager, buffer, EngineMode::Async, 0, 10 * 24 * 60 * 60);
+    engine.flush(true).unwrap();
+
+    let mut paths: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("xlog"))
+        .collect();
+    paths.sort();
+    assert_eq!(paths.len(), 1);
+    let payloads = parse_payloads(&fs::read(&paths[0]).unwrap());
+    assert!(payloads
+        .iter()
+        .any(|s| s.contains("PENDING-WITHOUT-TAILER")));
 }

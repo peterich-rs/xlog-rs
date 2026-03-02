@@ -10,7 +10,7 @@
 
 当前状态：
 
-- 已修复：**20 项**（含多项高风险）
+- 已修复：**24 项**（含多项高风险）
 - 仍待收敛：**3 项**（以接口覆盖差异为主）
 
 ---
@@ -70,6 +70,15 @@
 20. zstd async 压缩改为流式并显式设置 `windowLog=16`，按 chunk flush、block 结束时 end。
     - `crates/xlog-core/src/compress.rs`
     - `crates/xlog/src/backend/rust.rs`
+21. async 高水位（4/5）告警恢复为实际写入日志内容，并保持在同一 pending stream 内。
+    - `crates/xlog/src/backend/rust.rs`
+22. `write_async_pending` 在 `Async -> Sync` 并发切换下新增 `InvalidMode` 兜底直写，避免最后一块丢失。
+    - `crates/xlog/src/backend/rust.rs`
+23. async pending mmap 持久化改为批量刷盘（每 N 次或强制条件刷盘），降低每条写入 `msync` 开销。
+    - `crates/xlog-core/src/appender_engine.rs`
+    - `crates/xlog-core/src/buffer.rs`
+24. 后台线程 flush timeout 行为可配置（默认保持 15 分钟），便于稳定回归测试 timeout flush 语义。
+    - `crates/xlog-core/src/appender_engine.rs`
 
 ---
 
@@ -79,6 +88,8 @@
   - `recover_pending_block_even_with_dirty_tail_bytes`
 - `crates/xlog-core/tests/async_engine.rs`
   - `startup_drains_recovered_mmap_bytes_to_logfile`
+  - `async_timeout_flushes_pending_block_without_explicit_flush`
+  - `startup_recovers_pending_block_without_tailer`
 - `crates/xlog-core/tests/mmap_recovery.rs`
   - 调整为 tailer torn 场景可恢复
 - `crates/xlog-core/tests/oneshot_flush.rs`
@@ -86,6 +97,7 @@
 - `crates/xlog/src/backend/rust.rs`
   - sync + pubkey 单测改为校验 crypt magic/client_pubkey
   - 新增 async zlib/zstd 多条日志合流单 block 回归
+  - 新增 async crypt(zlib/zstd) 可解码、Async->Sync 不丢日志、高水位告警注入回归
 - `crates/xlog-core/tests/compress_roundtrip.rs`
   - zstd 回归改为流式 compressor
 

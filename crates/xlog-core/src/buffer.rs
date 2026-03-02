@@ -109,6 +109,14 @@ impl PersistentBuffer {
     }
 
     pub fn replace_bytes(&mut self, bytes: &[u8]) -> Result<(), BufferError> {
+        self.replace_bytes_with_flush(bytes, true)
+    }
+
+    pub fn replace_bytes_with_flush(
+        &mut self,
+        bytes: &[u8],
+        flush: bool,
+    ) -> Result<(), BufferError> {
         if bytes.len() > self.capacity() {
             return Err(BufferError::BlockTooLarge {
                 block_len: bytes.len(),
@@ -126,7 +134,9 @@ impl PersistentBuffer {
             }
             self.len = bytes.len();
         }
-        self.store.flush()?;
+        if flush {
+            self.store.flush()?;
+        }
         Ok(())
     }
 
