@@ -2,6 +2,11 @@
 
 This workspace provides a Rust-native implementation of Tencent Mars `xlog`, with optional legacy C/C++ FFI support kept for compatibility/testing.
 
+## Migration status
+- Default runtime path is Rust (`mars-xlog-core` + `mars-xlog`); C++ build is no longer part of default workspace build.
+- UniFFI/JNI/Harmony wrappers are wired to the Rust backend by default.
+- `mars-xlog-sys` remains as a legacy crate for compatibility verification and reference.
+
 ## Crates
 - `mars-xlog-core`: Rust runtime core (protocol/compress/crypto/mmap/appender).
 - `mars-xlog`: safe Rust wrapper API (default Rust backend).
