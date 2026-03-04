@@ -17,11 +17,10 @@
 //! # Feature flags
 //! - `macros`: `xlog!` and level helpers that capture file/module/line.
 //! - `tracing`: `XlogLayer` for `tracing-subscriber`.
-use libc::{c_char, c_int, gettimeofday, timeval};
-use mars_xlog_sys as sys;
-use std::ffi::{CStr, CString};
-use std::ptr;
+use libc::c_int;
 use std::sync::Arc;
+
+mod backend;
 
 #[cfg(feature = "tracing")]
 mod tracing_layer;
@@ -41,20 +40,6 @@ pub enum LogLevel {
     None,
 }
 
-impl LogLevel {
-    fn as_sys(self) -> sys::TLogLevel {
-        match self {
-            LogLevel::Verbose => sys::TLogLevel::kLevelVerbose,
-            LogLevel::Debug => sys::TLogLevel::kLevelDebug,
-            LogLevel::Info => sys::TLogLevel::kLevelInfo,
-            LogLevel::Warn => sys::TLogLevel::kLevelWarn,
-            LogLevel::Error => sys::TLogLevel::kLevelError,
-            LogLevel::Fatal => sys::TLogLevel::kLevelFatal,
-            LogLevel::None => sys::TLogLevel::kLevelNone,
-        }
-    }
-}
-
 /// Controls whether logs are appended asynchronously or synchronously.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum AppenderMode {
@@ -62,29 +47,11 @@ pub enum AppenderMode {
     Sync,
 }
 
-impl AppenderMode {
-    fn as_sys(self) -> sys::TAppenderMode {
-        match self {
-            AppenderMode::Async => sys::TAppenderMode::kAppenderAsync,
-            AppenderMode::Sync => sys::TAppenderMode::kAppenderSync,
-        }
-    }
-}
-
 /// Compression algorithm used for log buffers/files.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum CompressMode {
     Zlib,
     Zstd,
-}
-
-impl CompressMode {
-    fn as_sys(self) -> sys::TCompressMode {
-        match self {
-            CompressMode::Zlib => sys::TCompressMode::kZlib,
-            CompressMode::Zstd => sys::TCompressMode::kZstd,
-        }
-    }
 }
 
 /// Result code returned by `Xlog::oneshot_flush`.
@@ -112,6 +79,48 @@ impl From<c_int> for FileIoAction {
             7 => FileIoAction::RemoveFailed,
             _ => FileIoAction::None,
         }
+    }
+}
+
+/// Raw metadata carried by low-level wrappers (JNI/FFI parity path).
+///
+/// Semantics match Mars `XLoggerInfo`:
+/// - `pid/tid/maintid = -1` means "let backend fill runtime value".
+/// - `trace_log = true` enables Android console bypass behavior.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct RawLogMeta {
+    pub pid: i64,
+    pub tid: i64,
+    pub maintid: i64,
+    pub trace_log: bool,
+}
+
+impl Default for RawLogMeta {
+    fn default() -> Self {
+        Self {
+            pid: -1,
+            tid: -1,
+            maintid: -1,
+            trace_log: false,
+        }
+    }
+}
+
+impl RawLogMeta {
+    /// Build explicit pid/tid/maintid metadata.
+    pub const fn new(pid: i64, tid: i64, maintid: i64) -> Self {
+        Self {
+            pid,
+            tid,
+            maintid,
+            trace_log: false,
+        }
+    }
+
+    /// Enable Android `traceLog` console bypass for this entry.
+    pub const fn with_trace_log(mut self, trace_log: bool) -> Self {
+        self.trace_log = trace_log;
+        self
     }
 }
 
@@ -195,34 +204,6 @@ impl XlogConfig {
         self.compress_level = level;
         self
     }
-
-    fn to_sys(&self) -> (sys::MarsXlogConfig, Vec<CString>) {
-        let mut cstrings = Vec::new();
-        let log_dir = to_cstring(&self.log_dir, &mut cstrings);
-        let name_prefix = to_cstring(&self.name_prefix, &mut cstrings);
-        let pub_key = self
-            .pub_key
-            .as_deref()
-            .map(|s| to_cstring(s, &mut cstrings))
-            .unwrap_or(ptr::null());
-        let cache_dir = self
-            .cache_dir
-            .as_deref()
-            .map(|s| to_cstring(s, &mut cstrings))
-            .unwrap_or(ptr::null());
-
-        let cfg = sys::MarsXlogConfig {
-            mode: self.mode.as_sys() as c_int,
-            logdir: log_dir,
-            nameprefix: name_prefix,
-            pub_key,
-            compress_mode: self.compress_mode.as_sys() as c_int,
-            compress_level: self.compress_level as c_int,
-            cache_dir,
-            cache_days: self.cache_days as c_int,
-        };
-        (cfg, cstrings)
-    }
 }
 
 /// Handle to a Mars Xlog instance.
@@ -235,18 +216,8 @@ pub struct Xlog {
 }
 
 struct Inner {
-    instance: usize,
+    backend: Arc<dyn backend::XlogBackend>,
     name_prefix: String,
-}
-
-impl Drop for Inner {
-    fn drop(&mut self) {
-        let name = CString::new(self.name_prefix.clone())
-            .unwrap_or_else(|_| CString::new("xlog").unwrap());
-        unsafe {
-            sys::mars_xlog_release_instance(name.as_ptr());
-        }
-    }
 }
 
 impl Xlog {
@@ -257,17 +228,10 @@ impl Xlog {
 
     #[doc(hidden)]
     pub fn new(config: XlogConfig, level: LogLevel) -> Result<Self, XlogError> {
-        if config.log_dir.is_empty() || config.name_prefix.is_empty() {
-            return Err(XlogError::InvalidConfig);
-        }
-        let (cfg, _cstr) = config.to_sys();
-        let instance = unsafe { sys::mars_xlog_new_instance(&cfg, level.as_sys() as c_int) };
-        if instance == 0 {
-            return Err(XlogError::InitFailed);
-        }
+        let backend = backend::provider().new_instance(&config, level)?;
         Ok(Self {
             inner: Arc::new(Inner {
-                instance,
+                backend,
                 name_prefix: config.name_prefix,
             }),
         })
@@ -275,14 +239,10 @@ impl Xlog {
 
     /// Look up an existing instance by name prefix.
     pub fn get(name_prefix: &str) -> Option<Self> {
-        let name = CString::new(name_prefix).ok()?;
-        let instance = unsafe { sys::mars_xlog_get_instance(name.as_ptr()) };
-        if instance == 0 {
-            return None;
-        }
+        let backend = backend::provider().get_instance(name_prefix)?;
         Some(Self {
             inner: Arc::new(Inner {
-                instance,
+                backend,
                 name_prefix: name_prefix.to_string(),
             }),
         })
@@ -290,28 +250,17 @@ impl Xlog {
 
     #[doc(hidden)]
     pub fn appender_open(config: XlogConfig, level: LogLevel) -> Result<(), XlogError> {
-        if config.log_dir.is_empty() || config.name_prefix.is_empty() {
-            return Err(XlogError::InvalidConfig);
-        }
-        let (cfg, _cstr) = config.to_sys();
-        unsafe {
-            sys::mars_xlog_appender_open(&cfg, level.as_sys() as c_int);
-        }
-        Ok(())
+        backend::provider().appender_open(&config, level)
     }
 
     #[doc(hidden)]
     pub fn appender_close() {
-        unsafe {
-            sys::mars_xlog_appender_close();
-        }
+        backend::provider().appender_close();
     }
 
     #[doc(hidden)]
     pub fn flush_all(sync: bool) {
-        unsafe {
-            sys::mars_xlog_flush_all(if sync { 1 } else { 0 });
-        }
+        backend::provider().flush_all(sync);
     }
 
     #[cfg(any(
@@ -322,74 +271,52 @@ impl Xlog {
     ))]
     #[doc(hidden)]
     pub fn set_console_fun(fun: ConsoleFun) {
-        unsafe {
-            sys::mars_xlog_set_console_fun(fun as c_int);
-        }
+        backend::provider().set_console_fun(fun);
     }
 
     /// Returns the raw instance handle used by the underlying C++ library.
     pub fn instance(&self) -> usize {
-        self.inner.instance
+        self.inner.backend.instance()
     }
 
     /// Returns `true` if logs at `level` are enabled for this instance.
     pub fn is_enabled(&self, level: LogLevel) -> bool {
-        unsafe { sys::mars_xlog_is_enabled(self.inner.instance, level.as_sys() as c_int) != 0 }
+        self.inner.backend.is_enabled(level)
     }
 
     /// Get the current log level for this instance.
     pub fn level(&self) -> LogLevel {
-        match unsafe { sys::mars_xlog_get_level(self.inner.instance) } {
-            0 => LogLevel::Verbose,
-            1 => LogLevel::Debug,
-            2 => LogLevel::Info,
-            3 => LogLevel::Warn,
-            4 => LogLevel::Error,
-            5 => LogLevel::Fatal,
-            _ => LogLevel::None,
-        }
+        self.inner.backend.level()
     }
 
     /// Set the minimum log level for this instance.
     pub fn set_level(&self, level: LogLevel) {
-        unsafe {
-            sys::mars_xlog_set_level(self.inner.instance, level.as_sys() as c_int);
-        }
+        self.inner.backend.set_level(level);
     }
 
     /// Switch between async and sync appender modes.
     pub fn set_appender_mode(&self, mode: AppenderMode) {
-        unsafe {
-            sys::mars_xlog_set_appender_mode(self.inner.instance, mode.as_sys() as c_int);
-        }
+        self.inner.backend.set_appender_mode(mode);
     }
 
     /// Flush buffered logs for this instance.
     pub fn flush(&self, sync: bool) {
-        unsafe {
-            sys::mars_xlog_flush(self.inner.instance, if sync { 1 } else { 0 });
-        }
+        self.inner.backend.flush(sync);
     }
 
     /// Enable or disable console logging (platform dependent).
     pub fn set_console_log_open(&self, open: bool) {
-        unsafe {
-            sys::mars_xlog_set_console_log_open(self.inner.instance, if open { 1 } else { 0 });
-        }
+        self.inner.backend.set_console_log_open(open);
     }
 
     /// Set the max log file size in bytes (0 disables splitting).
     pub fn set_max_file_size(&self, max_bytes: i64) {
-        unsafe {
-            sys::mars_xlog_set_max_file_size(self.inner.instance, max_bytes as _);
-        }
+        self.inner.backend.set_max_file_size(max_bytes);
     }
 
     /// Set the max log file age in seconds before deletion/rotation.
     pub fn set_max_alive_time(&self, alive_seconds: i64) {
-        unsafe {
-            sys::mars_xlog_set_max_alive_time(self.inner.instance, alive_seconds as _);
-        }
+        self.inner.backend.set_max_alive_time(alive_seconds);
     }
 
     /// Log a message with caller file/line captured via `#[track_caller]`.
@@ -426,103 +353,97 @@ impl Xlog {
         line: u32,
         msg: &str,
     ) {
+        self.write_with_meta_raw(level, tag, file, func, line, msg, RawLogMeta::default());
+    }
+
+    /// Log with explicit metadata and raw pid/tid/trace flags.
+    ///
+    /// This is mainly for low-level platform wrappers that already own thread
+    /// metadata (for example JNI side thread ids).
+    pub fn write_with_meta_raw(
+        &self,
+        level: LogLevel,
+        tag: Option<&str>,
+        file: &str,
+        func: &str,
+        line: u32,
+        msg: &str,
+        raw_meta: RawLogMeta,
+    ) {
         if !self.is_enabled(level) {
             return;
         }
+        self.inner.backend.write_with_meta(
+            level,
+            tag.unwrap_or(&self.inner.name_prefix),
+            file,
+            func,
+            line,
+            msg,
+            raw_meta,
+        );
+    }
 
-        let mut cstrings = Vec::new();
-        let tag_ptr = tag.unwrap_or(&self.inner.name_prefix).to_string();
-        let tag_c = to_cstring(&tag_ptr, &mut cstrings);
-        let file_c = to_cstring(file, &mut cstrings);
-        let func_c = to_cstring(func, &mut cstrings);
-        let msg_c = to_cstring(msg, &mut cstrings);
-
-        let mut tv: timeval = unsafe { std::mem::zeroed() };
-        unsafe {
-            gettimeofday(&mut tv, ptr::null_mut());
+    /// Write via the global/default appender with raw metadata.
+    ///
+    /// This mirrors the C++ `XloggerWrite(instance_ptr == 0, ...)` path.
+    #[doc(hidden)]
+    pub fn appender_write_with_meta_raw(
+        level: LogLevel,
+        tag: Option<&str>,
+        file: &str,
+        func: &str,
+        line: u32,
+        msg: &str,
+        raw_meta: RawLogMeta,
+    ) {
+        if !backend::provider().global_is_enabled(level) {
+            return;
         }
-
-        let info = sys::XLoggerInfo {
-            level: level.as_sys(),
-            tag: tag_c,
-            filename: file_c,
-            func_name: func_c,
-            line: line as c_int,
-            timeval: tv,
-            pid: -1,
-            tid: -1,
-            maintid: -1,
-            traceLog: 0,
-        };
-
-        unsafe {
-            sys::mars_xlog_write(self.inner.instance, &info, msg_c);
-        }
+        backend::provider().write_global_with_meta(
+            level,
+            tag.unwrap_or(""),
+            file,
+            func,
+            line,
+            msg,
+            raw_meta,
+        );
     }
 
     #[doc(hidden)]
     pub fn current_log_path() -> Option<String> {
-        read_path(|buf, len| unsafe { sys::mars_xlog_get_current_log_path(buf, len) })
+        backend::provider().current_log_path()
     }
 
     #[doc(hidden)]
     pub fn current_log_cache_path() -> Option<String> {
-        read_path(|buf, len| unsafe { sys::mars_xlog_get_current_log_cache_path(buf, len) })
+        backend::provider().current_log_cache_path()
     }
 
     #[doc(hidden)]
     pub fn filepaths_from_timespan(timespan: i32, prefix: &str) -> Vec<String> {
-        read_joined(|buf, len| unsafe {
-            sys::mars_xlog_get_filepath_from_timespan(
-                timespan,
-                cstr_or_null(prefix).as_ptr(),
-                buf,
-                len,
-            )
-        })
+        backend::provider().filepaths_from_timespan(timespan, prefix)
     }
 
     #[doc(hidden)]
     pub fn make_logfile_name(timespan: i32, prefix: &str) -> Vec<String> {
-        read_joined(|buf, len| unsafe {
-            sys::mars_xlog_make_logfile_name(timespan, cstr_or_null(prefix).as_ptr(), buf, len)
-        })
+        backend::provider().make_logfile_name(timespan, prefix)
     }
 
     #[doc(hidden)]
     pub fn oneshot_flush(config: XlogConfig) -> Result<FileIoAction, XlogError> {
-        if config.log_dir.is_empty() || config.name_prefix.is_empty() {
-            return Err(XlogError::InvalidConfig);
-        }
-        let (cfg, _cstr) = config.to_sys();
-        let mut action: c_int = 0;
-        let ok = unsafe { sys::mars_xlog_oneshot_flush(&cfg, &mut action as *mut c_int) };
-        if ok == 0 {
-            return Err(XlogError::InitFailed);
-        }
-        Ok(FileIoAction::from(action))
+        backend::provider().oneshot_flush(&config)
     }
 
     #[doc(hidden)]
     pub fn dump(buffer: &[u8]) -> String {
-        if buffer.is_empty() {
-            return String::new();
-        }
-        unsafe {
-            let ptr = sys::mars_xlog_dump(buffer.as_ptr().cast(), buffer.len());
-            cstr_to_string(ptr)
-        }
+        backend::provider().dump(buffer)
     }
 
     #[doc(hidden)]
     pub fn memory_dump(buffer: &[u8]) -> String {
-        if buffer.is_empty() {
-            return String::new();
-        }
-        unsafe {
-            let ptr = sys::mars_xlog_memory_dump(buffer.as_ptr().cast(), buffer.len());
-            cstr_to_string(ptr)
-        }
+        backend::provider().memory_dump(buffer)
     }
 }
 
@@ -538,80 +459,6 @@ pub enum ConsoleFun {
     Printf = 0,
     NSLog = 1,
     OSLog = 2,
-}
-
-fn read_path<F>(f: F) -> Option<String>
-where
-    F: Fn(*mut c_char, u32) -> i32,
-{
-    let mut buf = vec![0 as c_char; 4096];
-    let ok = f(buf.as_mut_ptr(), buf.len() as u32);
-    if ok == 0 {
-        return None;
-    }
-    let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
-    cstr.to_str().ok().map(|s| s.to_string())
-}
-
-fn read_joined<F>(f: F) -> Vec<String>
-where
-    F: Fn(*mut c_char, usize) -> usize,
-{
-    let mut buf = vec![0 as c_char; 4096];
-    let required = f(buf.as_mut_ptr(), buf.len());
-    if required > buf.len() {
-        buf.resize(required, 0);
-        let _ = f(buf.as_mut_ptr(), buf.len());
-    }
-    let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
-    let s = cstr.to_string_lossy();
-    if s.is_empty() {
-        return Vec::new();
-    }
-    s.split('\n').map(|v| v.to_string()).collect()
-}
-
-fn to_cstring(s: &str, storage: &mut Vec<CString>) -> *const c_char {
-    let clean = if s.as_bytes().contains(&0) {
-        s.replace('\0', "")
-    } else {
-        s.to_string()
-    };
-    let c = CString::new(clean).unwrap_or_else(|_| CString::new("<invalid>").unwrap());
-    let ptr = c.as_ptr();
-    storage.push(c);
-    ptr
-}
-
-fn cstr_or_null(s: &str) -> CStringHolder {
-    CStringHolder::new(s)
-}
-
-fn cstr_to_string(ptr: *const c_char) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    unsafe { CStr::from_ptr(ptr).to_string_lossy().to_string() }
-}
-
-struct CStringHolder {
-    cstr: CString,
-}
-
-impl CStringHolder {
-    fn new(s: &str) -> Self {
-        let clean = if s.as_bytes().contains(&0) {
-            s.replace('\0', "")
-        } else {
-            s.to_string()
-        };
-        let cstr = CString::new(clean).unwrap_or_else(|_| CString::new("").unwrap());
-        Self { cstr }
-    }
-
-    fn as_ptr(&self) -> *const c_char {
-        self.cstr.as_ptr()
-    }
 }
 
 /// Log with explicit metadata captured by the macro call site.

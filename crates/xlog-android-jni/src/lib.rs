@@ -6,7 +6,7 @@
 use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{jboolean, jbyteArray, jint, jlong, jobjectArray, jstring};
 use jni::JNIEnv;
-use mars_xlog::{AppenderMode, CompressMode, FileIoAction, LogLevel, Xlog, XlogConfig};
+use mars_xlog::{AppenderMode, CompressMode, FileIoAction, LogLevel, RawLogMeta, Xlog, XlogConfig};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::ptr;
@@ -418,6 +418,75 @@ pub extern "system" fn Java_com_tencent_mars_xlog_example_XlogBridge_nativeWrite
             &message,
         );
     }
+}
+
+#[no_mangle]
+/// Write a log message with explicit metadata and raw pid/tid/trace flags.
+pub extern "system" fn Java_com_tencent_mars_xlog_example_XlogBridge_nativeWriteWithRawMeta(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    level: jint,
+    tag: JString,
+    file: JString,
+    func: JString,
+    line: jint,
+    pid: jlong,
+    tid: jlong,
+    maintid: jlong,
+    trace_log: jboolean,
+    message: JString,
+) {
+    if let Some(logger) = get_logger(handle as i64) {
+        let tag = opt_string(&mut env, tag);
+        let file = req_string(&mut env, file);
+        let func = req_string(&mut env, func);
+        let message = req_string(&mut env, message);
+        let raw_meta = RawLogMeta::new(pid as i64, tid as i64, maintid as i64)
+            .with_trace_log(to_bool(trace_log));
+        logger.write_with_meta_raw(
+            to_log_level(level),
+            tag.as_deref(),
+            &file,
+            &func,
+            line as u32,
+            &message,
+            raw_meta,
+        );
+    }
+}
+
+#[no_mangle]
+/// Write to the global/default appender with raw metadata.
+pub extern "system" fn Java_com_tencent_mars_xlog_example_XlogBridge_nativeAppenderWriteWithRawMeta(
+    mut env: JNIEnv,
+    _class: JClass,
+    level: jint,
+    tag: JString,
+    file: JString,
+    func: JString,
+    line: jint,
+    pid: jlong,
+    tid: jlong,
+    maintid: jlong,
+    trace_log: jboolean,
+    message: JString,
+) {
+    let tag = opt_string(&mut env, tag);
+    let file = req_string(&mut env, file);
+    let func = req_string(&mut env, func);
+    let message = req_string(&mut env, message);
+    let raw_meta =
+        RawLogMeta::new(pid as i64, tid as i64, maintid as i64).with_trace_log(to_bool(trace_log));
+    Xlog::appender_write_with_meta_raw(
+        to_log_level(level),
+        tag.as_deref(),
+        &file,
+        &func,
+        line as u32,
+        &message,
+        raw_meta,
+    );
 }
 
 #[no_mangle]

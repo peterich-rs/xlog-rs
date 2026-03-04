@@ -3,6 +3,14 @@ resolver = "2"
 members = [
     "crates/xlog-sys",
     "crates/xlog",
+    "crates/xlog-core",
+    "crates/xlog-uniffi",
+    "crates/xlog-android-jni",
+    "crates/mars-xlog-harmony-napi"
+]
+default-members = [
+    "crates/xlog",
+    "crates/xlog-core",
     "crates/xlog-uniffi",
     "crates/xlog-android-jni",
     "crates/mars-xlog-harmony-napi"
