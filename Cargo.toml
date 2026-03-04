@@ -8,6 +8,13 @@ members = [
     "crates/xlog-android-jni",
     "crates/mars-xlog-harmony-napi"
 ]
+default-members = [
+    "crates/xlog",
+    "crates/xlog-core",
+    "crates/xlog-uniffi",
+    "crates/xlog-android-jni",
+    "crates/mars-xlog-harmony-napi"
+]
 
 [workspace.package]
 edition = "2021"

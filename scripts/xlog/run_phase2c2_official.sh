@@ -6,11 +6,11 @@ usage() {
 Run Phase 2C-2 official crypt decoder regression end-to-end.
 
 Usage:
-  scripts/xlog/run_phase2c2_official.sh [--out-dir <dir>] [--backend rust|ffi|both] [--count <n>] [--skip-setup]
+  scripts/xlog/run_phase2c2_official.sh [--out-dir <dir>] [--backend rust] [--count <n>] [--skip-setup]
 
 Options:
   --out-dir <dir>      Fixture output directory (default: artifacts/xlog-fixtures/<timestamp>-phase2c2)
-  --backend <value>    rust / ffi / both (default: both)
+  --backend <value>    rust (default: rust)
   --count <n>          Records per case (default: 16)
   --skip-setup         Skip decoder env setup step
   -h, --help           Show this help text
@@ -24,7 +24,7 @@ gen_script="${repo_root}/scripts/xlog/gen_fixtures.sh"
 decode_script="${repo_root}/scripts/xlog/decode_compare.sh"
 
 out_dir=""
-backend="both"
+backend="rust"
 count=16
 skip_setup=0
 
@@ -57,6 +57,11 @@ while (($# > 0)); do
       ;;
   esac
 done
+
+if [[ "$backend" != "rust" ]]; then
+  echo "--backend must be: rust" >&2
+  exit 2
+fi
 
 if [[ -z "$out_dir" ]]; then
   ts="$(date +%Y%m%d-%H%M%S)"

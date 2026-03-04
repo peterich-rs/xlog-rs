@@ -6,11 +6,11 @@ usage() {
 Generate Mars xlog migration fixtures (Phase 2C).
 
 Usage:
-  scripts/xlog/gen_fixtures.sh [--out-dir <dir>] [--backend rust|ffi|both] [--count <n>] [--include-crypt]
+  scripts/xlog/gen_fixtures.sh [--out-dir <dir>] [--backend rust] [--count <n>] [--include-crypt]
 
 Options:
   --out-dir <dir>     Output root directory (default: artifacts/xlog-fixtures/<timestamp>)
-  --backend <value>   rust / ffi / both (default: both)
+  --backend <value>   rust (default: rust)
   --count <n>         Number of emitted records per case (default: 16)
   --include-crypt     Also generate crypt cases (requires decoder env with py2 + pyelliptic)
   -h, --help          Show this help text
@@ -21,7 +21,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
 
 out_dir=""
-backend="both"
+backend="rust"
 count=16
 include_crypt=0
 
@@ -65,13 +65,10 @@ if ! [[ "$count" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
-case "$backend" in
-  rust|ffi|both) ;;
-  *)
-    echo "--backend must be one of: rust / ffi / both" >&2
-    exit 2
-    ;;
-esac
+if [[ "$backend" != "rust" ]]; then
+  echo "--backend must be: rust" >&2
+  exit 2
+fi
 
 mkdir -p "$out_dir"
 manifest="${out_dir}/manifest.tsv"
@@ -89,17 +86,10 @@ run_case() {
   local case_dir="${out_dir}/${selected_backend}/${prefix}"
   mkdir -p "$case_dir"
 
-  local features=""
-  if [[ "$selected_backend" == "rust" ]]; then
-    features="rust-backend"
-  else
-    features="ffi-backend"
-  fi
-
   local cmd=(
     cargo run -p mars-xlog --example gen_fixture
     --no-default-features
-    --features "$features"
+    --features "rust-backend"
     --
     --out-dir "$case_dir"
     --prefix "$prefix"
@@ -134,12 +124,7 @@ run_backend_matrix() {
   fi
 }
 
-if [[ "$backend" == "both" ]]; then
-  run_backend_matrix "rust"
-  run_backend_matrix "ffi"
-else
-  run_backend_matrix "$backend"
-fi
+run_backend_matrix "$backend"
 
 echo
 echo "fixture root: $out_dir"

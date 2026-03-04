@@ -17,10 +17,7 @@
 //! # Feature flags
 //! - `macros`: `xlog!` and level helpers that capture file/module/line.
 //! - `tracing`: `XlogLayer` for `tracing-subscriber`.
-use libc::{c_char, c_int};
-use mars_xlog_sys as sys;
-use std::ffi::{CStr, CString};
-use std::ptr;
+use libc::c_int;
 use std::sync::Arc;
 
 mod backend;
@@ -43,20 +40,6 @@ pub enum LogLevel {
     None,
 }
 
-impl LogLevel {
-    fn as_sys(self) -> sys::TLogLevel {
-        match self {
-            LogLevel::Verbose => sys::TLogLevel::kLevelVerbose,
-            LogLevel::Debug => sys::TLogLevel::kLevelDebug,
-            LogLevel::Info => sys::TLogLevel::kLevelInfo,
-            LogLevel::Warn => sys::TLogLevel::kLevelWarn,
-            LogLevel::Error => sys::TLogLevel::kLevelError,
-            LogLevel::Fatal => sys::TLogLevel::kLevelFatal,
-            LogLevel::None => sys::TLogLevel::kLevelNone,
-        }
-    }
-}
-
 /// Controls whether logs are appended asynchronously or synchronously.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum AppenderMode {
@@ -64,29 +47,11 @@ pub enum AppenderMode {
     Sync,
 }
 
-impl AppenderMode {
-    fn as_sys(self) -> sys::TAppenderMode {
-        match self {
-            AppenderMode::Async => sys::TAppenderMode::kAppenderAsync,
-            AppenderMode::Sync => sys::TAppenderMode::kAppenderSync,
-        }
-    }
-}
-
 /// Compression algorithm used for log buffers/files.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum CompressMode {
     Zlib,
     Zstd,
-}
-
-impl CompressMode {
-    fn as_sys(self) -> sys::TCompressMode {
-        match self {
-            CompressMode::Zlib => sys::TCompressMode::kZlib,
-            CompressMode::Zstd => sys::TCompressMode::kZstd,
-        }
-    }
 }
 
 /// Result code returned by `Xlog::oneshot_flush`.
@@ -238,34 +203,6 @@ impl XlogConfig {
     pub fn compress_level(mut self, level: i32) -> Self {
         self.compress_level = level;
         self
-    }
-
-    fn to_sys(&self) -> (sys::MarsXlogConfig, Vec<CString>) {
-        let mut cstrings = Vec::new();
-        let log_dir = to_cstring(&self.log_dir, &mut cstrings);
-        let name_prefix = to_cstring(&self.name_prefix, &mut cstrings);
-        let pub_key = self
-            .pub_key
-            .as_deref()
-            .map(|s| to_cstring(s, &mut cstrings))
-            .unwrap_or(ptr::null());
-        let cache_dir = self
-            .cache_dir
-            .as_deref()
-            .map(|s| to_cstring(s, &mut cstrings))
-            .unwrap_or(ptr::null());
-
-        let cfg = sys::MarsXlogConfig {
-            mode: self.mode.as_sys() as c_int,
-            logdir: log_dir,
-            nameprefix: name_prefix,
-            pub_key,
-            compress_mode: self.compress_mode.as_sys() as c_int,
-            compress_level: self.compress_level as c_int,
-            cache_dir,
-            cache_days: self.cache_days as c_int,
-        };
-        (cfg, cstrings)
     }
 }
 
@@ -522,80 +459,6 @@ pub enum ConsoleFun {
     Printf = 0,
     NSLog = 1,
     OSLog = 2,
-}
-
-fn read_path<F>(f: F) -> Option<String>
-where
-    F: Fn(*mut c_char, u32) -> i32,
-{
-    let mut buf = vec![0 as c_char; 4096];
-    let ok = f(buf.as_mut_ptr(), buf.len() as u32);
-    if ok == 0 {
-        return None;
-    }
-    let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
-    cstr.to_str().ok().map(|s| s.to_string())
-}
-
-fn read_joined<F>(f: F) -> Vec<String>
-where
-    F: Fn(*mut c_char, usize) -> usize,
-{
-    let mut buf = vec![0 as c_char; 4096];
-    let required = f(buf.as_mut_ptr(), buf.len());
-    if required > buf.len() {
-        buf.resize(required, 0);
-        let _ = f(buf.as_mut_ptr(), buf.len());
-    }
-    let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
-    let s = cstr.to_string_lossy();
-    if s.is_empty() {
-        return Vec::new();
-    }
-    s.split('\n').map(|v| v.to_string()).collect()
-}
-
-fn to_cstring(s: &str, storage: &mut Vec<CString>) -> *const c_char {
-    let clean = if s.as_bytes().contains(&0) {
-        s.replace('\0', "")
-    } else {
-        s.to_string()
-    };
-    let c = CString::new(clean).unwrap_or_else(|_| CString::new("<invalid>").unwrap());
-    let ptr = c.as_ptr();
-    storage.push(c);
-    ptr
-}
-
-fn cstr_or_null(s: &str) -> CStringHolder {
-    CStringHolder::new(s)
-}
-
-fn cstr_to_string(ptr: *const c_char) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    unsafe { CStr::from_ptr(ptr).to_string_lossy().to_string() }
-}
-
-struct CStringHolder {
-    cstr: CString,
-}
-
-impl CStringHolder {
-    fn new(s: &str) -> Self {
-        let clean = if s.as_bytes().contains(&0) {
-            s.replace('\0', "")
-        } else {
-            s.to_string()
-        };
-        let cstr = CString::new(clean).unwrap_or_else(|_| CString::new("").unwrap());
-        Self { cstr }
-    }
-
-    fn as_ptr(&self) -> *const c_char {
-        self.cstr.as_ptr()
-    }
 }
 
 /// Log with explicit metadata captured by the macro call site.

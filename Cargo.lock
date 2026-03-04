@@ -663,7 +663,6 @@ dependencies = [
  "chrono",
  "libc",
  "mars-xlog-core",
- "mars-xlog-sys",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",

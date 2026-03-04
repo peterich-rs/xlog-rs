@@ -188,23 +188,5 @@ fn percentile(sorted: &[u64], p: usize) -> u64 {
 }
 
 fn backend_name() -> &'static str {
-    #[cfg(all(feature = "rust-backend", not(feature = "ffi-backend")))]
-    {
-        return "rust";
-    }
-
-    #[cfg(all(feature = "ffi-backend", not(feature = "rust-backend")))]
-    {
-        return "ffi";
-    }
-
-    #[cfg(all(feature = "rust-backend", feature = "ffi-backend"))]
-    {
-        return "rust+ffi";
-    }
-
-    #[cfg(not(any(feature = "rust-backend", feature = "ffi-backend")))]
-    {
-        return "none";
-    }
+    "rust"
 }

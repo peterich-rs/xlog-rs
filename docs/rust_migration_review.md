@@ -19,7 +19,7 @@
 
 ## 3. 本轮收口结果（已完成）
 
-针对上一版中遗留的 2 项 Wrapper 级差异，已在当前分支完成收口：
+针对上一版中遗留的 Wrapper 级差异，已在当前分支完成收口：
 
 1. **`traceLog` Android 旁路语义已补齐**
    - 在 `xlog` 新增 `RawLogMeta { trace_log }` 传递通道。
@@ -30,5 +30,17 @@
      - `instance_ptr != 0`（Category 路径）：仅在三者全为 `-1` 时批量回填。
      - `instance_ptr == 0`（Global 路径）：逐字段按 `-1` 回填。
    - 由此避免 Java/JNI 侧传入线程元数据被 Rust 层强制覆写的问题。
+3. **UniFFI / Harmony NAPI 接口覆盖已补齐**
+   - 补齐实例控制面：`is_enabled/level/set_level/set_appender_mode/flush/set_console_log_open/set_max_file_size/set_max_alive_time`。
+   - 补齐写入面：`log_with_meta/log_with_raw_meta` 与全局 `appender_write_with_raw_meta`。
+   - 补齐工具面：`open_appender/close_appender/flush_all/current_log_path/current_log_cache_path/filepaths_from_timespan/make_logfile_name/oneshot_flush/dump/memory_dump`。
+   - 绑定层当前能力面已对齐 `mars-xlog` Rust API。
 
-上述两项修复后，本轮 review 中定义的 Rust 重构语义差异已全部收口。
+上述修复后，本轮 review 中定义的 Rust 重构语义差异已全部收口。
+
+## 4. 发布就绪度（截至 2026-03-04）
+
+- `mars-xlog-core`：`cargo publish --dry-run` 通过。
+- `mars-xlog`：依赖 `mars-xlog-core` 先发布到 crates.io（当前 dry-run 因索引无该包失败）。
+- `mars-xlog-uniffi` / `oh-xlog`：依赖 `mars-xlog` 先发布到 crates.io（当前 dry-run 因索引无该包失败）。
+- `mars-xlog-sys`：legacy FFI crate 的打包验证仍依赖仓库外路径（`third_party/mars`），需单独整改；不阻塞 Rust 主链路发布。

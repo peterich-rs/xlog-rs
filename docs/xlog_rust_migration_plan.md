@@ -10,12 +10,12 @@
 2. `formater.cc` 负责的是**日志文本行格式化**，xlog 的“二进制文件协议”实际在 `log_crypt.cc + log_base_buffer.cc + log_zlib/zstd_buffer.cc`。
 3. 兼容性验收不能只做“字节完全一致”，应以**官方解码结果一致**为主（压缩流字节可不同但可解码）。
 
-### 0.1 执行状态（截至 2026-03-02，分支 `codex/rust-migration-phase1`）
+### 0.1 执行状态（截至 2026-03-04，分支 `codex/rust-migration-phase1`）
 
-- Phase 0：未开始。
+- Phase 0：已完成（fixture/decoder 基线与 nightly 回归已固化）。
 - Phase 1：已完成（commit: `643900d`）。
-  - 已落地后端抽象：`crates/xlog/src/backend/{mod.rs,ffi.rs,rust.rs}`。
-  - `xlog` API 已通过 backend trait 间接调用，实现 FFI/Rust 并行架构。
+  - 已落地后端抽象：`crates/xlog/src/backend/{mod.rs,rust.rs}`（`ffi.rs` 为历史阶段文件，Phase 6 起不再参与默认路径）。
+  - `xlog` API 已通过 backend trait 间接调用，完成 Rust 运行时接管。
 - Phase 2：已完成（commit: `3558c76`，含 2A/2B/2C 全部收口）。
   - 已完成 2A：`xlog-core` 协议/压缩/加密基础模块。
   - 已完成 2B：`xlog` Rust backend 最小写入链路接入（可生成 `.xlog` block）。
@@ -23,15 +23,14 @@
   - 已完成 2C-2：crypt 用例在 Python2 官方解码环境下的回归固化（`scripts/xlog/setup_py2_decoder_env.sh` + `scripts/xlog/run_phase2c2_official.sh`）。
   - 已完成 2D：`run_phase2c2_official.sh` 已接入 nightly CI，并固化失败日志与产物上传（`.github/workflows/phase2c2_official_nightly.yml`）。
 - Phase 3：已完成（commit: `3558c76`）。
-- Phase 4：基本完成（主体已落地，仍有少量行为/接口对齐项待收口）。
-- Phase 5：进行中（当前增量）。
-  - `xlog` 默认 feature 已切换到 `rust-backend`，并保留 `ffi-backend` 紧急回退。
-  - JNI/UniFFI/NAPI 绑定层均改为可切换 `rust-backend` / `ffi-backend`。
-  - 新增 `scripts/xlog/run_phase5_regression.sh` + `crates/xlog/examples/bench_backend.rs` 统一执行回归与性能对比。
-  - 已具备性能比值产物与可选门槛校验；兼容性剩余项主要集中在接口覆盖。
-- Phase 6：未开始。
+- Phase 4：已完成（主功能 + review 阻断项收口完成）。
+- Phase 5：已完成。
+  - `xlog` 默认后端稳定为 `rust-backend`。
+  - JNI/UniFFI/NAPI 绑定覆盖补齐 `mars-xlog` 公开能力面（含 raw metadata 与全局 appender 路径）。
+  - `scripts/xlog/run_phase5_regression.sh` + `crates/xlog/examples/bench_backend.rs` 已固定为 Rust 路径回归与性能采样。
+- Phase 6：进行中（默认构建链路已脱离 C++；legacy `xlog-sys` 发布链路待单独整理）。
 
-### 0.2 Review 收口清单（截至 2026-03-03）
+### 0.2 Review 收口清单（截至 2026-03-04）
 
 基于 `docs/rust_migration_review.md`，本轮已收敛的关键项：
 
@@ -53,11 +52,10 @@
 16. `file_manager.rs`：`filepaths_from_timespan` 恢复 log_dir -> cache_dir 顺序，不做额外排序。
 17. `appender_engine.rs` + `oneshot.rs`：补齐 mmap 恢复 begin/end tip 行（含 mark info）。
 18. `platform_console.rs`：Apple console 改为原生 OSLog/NSLog/printf shim 输出。
-19. `backend/{mod.rs,rust.rs,ffi.rs}` + `xlog/lib.rs`：补齐 `RawLogMeta` 与 `appender_write_with_meta_raw`，对齐 `traceLog` 旁路语义及 `instance_ptr==0` 全局 raw metadata 写入路径。
+19. `backend/{mod.rs,rust.rs}` + `xlog/lib.rs`：补齐 `RawLogMeta` 与 `appender_write_with_meta_raw`，对齐 `traceLog` 旁路语义及 `instance_ptr==0` 全局 raw metadata 写入路径。
+20. `xlog-uniffi` + `mars-xlog-harmony-napi`：补齐实例控制/全局 appender/路径检索/`oneshot_flush`/`dump` 等接口覆盖，收口 wrapper 能力缺口。
 
-仍待收口（详见 `docs/rust_migration_review.md`）：
-
-1. UniFFI/NAPI 绑定覆盖仍小于 C++ 接口面。
+当前 review 阻断项：**0**（无未收口项）。
 
 ---
 
@@ -259,7 +257,7 @@ seq 规则：
 
 - `crates/xlog/src/lib.rs`（API 保持，后端切换）
 - `crates/xlog/src/backend/mod.rs`（trait）
-- `crates/xlog/src/backend/ffi.rs`（迁移原 sys 调用）
+- `crates/xlog/src/backend/ffi.rs`（历史阶段迁移原 sys 调用，Phase 6 起移出默认路径）
 - `crates/xlog/src/backend/rust.rs`（调用 `xlog-core`）
 - `crates/xlog/Cargo.toml`（新依赖、feature flag）
 
@@ -314,14 +312,14 @@ DoD：
 任务：
 
 1. 为 `Xlog` 全部公开方法定义 backend trait。
-2. 将现有 `sys::*` 调用迁入 `ffi backend`。
+2. 将现有 `sys::*` 调用迁入 `ffi backend`（历史阶段目标）。
 3. 保持对外 API 与行为 100% 不变。
 
 涉及文件：
 
 - 修改 `crates/xlog/src/lib.rs`
 - 新增 `crates/xlog/src/backend/mod.rs`
-- 新增 `crates/xlog/src/backend/ffi.rs`
+- 新增 `crates/xlog/src/backend/ffi.rs`（历史阶段文件）
 - 修改 `crates/xlog/Cargo.toml`
 
 实现要点：
@@ -487,14 +485,14 @@ DoD：
 
 ## Phase 5：切换默认后端并灰度（1 周）
 
-目标：在仓库内把默认实现切到 Rust，保留 FFI 作为紧急回退。
+目标：在仓库内把默认实现切到 Rust，并完成绑定层与回归链路收口。
 
-当前状态：进行中（默认后端切换与回归脚本已落地，性能优化继续推进）。
+当前状态：已完成（默认后端、绑定层覆盖、回归脚本均已收口）。
 
 任务：
 
 1. `xlog` 默认 feature 切到 Rust backend。
-2. 绑定层回归（JNI/UniFFI/NAPI）。
+2. 绑定层回归（JNI/UniFFI/NAPI）并补齐接口覆盖。
 3. 增加压测和 soak test。
 4. 复跑全链路回归并持续跟踪性能指标。
 
@@ -510,23 +508,25 @@ DoD：
 实现要点：
 
 - 默认 feature 切换：`mars-xlog` 默认启用 `rust-backend`。
-- 绑定层默认禁用 `mars-xlog` 的 default-features，并以各自 feature 显式转发 `rust-backend` / `ffi-backend`。
+- 绑定层统一禁用 `mars-xlog` 的 default-features，并显式启用 `rust-backend`。
 - `run_phase5_regression.sh` 一次性执行：
   - `run_phase2c2_official.sh` 官方解码回归（可选跳过）
-  - JNI/UniFFI/NAPI 在 Rust/FFI 双后端下的 `cargo check`
-  - `bench_backend.rs` 产出 Rust/FFI 吞吐与延迟 JSON 指标；支持可选门槛判定（90% 吞吐/110% p99）
+  - JNI/UniFFI/NAPI Rust backend `cargo check`
+  - `bench_backend.rs` 产出 Rust backend 吞吐与延迟 JSON 指标
 
 DoD：
 
 - 回归与性能指标可脚本化复跑并产出 artifacts。
-- 保留 `ffi-backend` feature 可一键回退。
 - `run_phase5_regression.sh` 在不跳过回归项时稳定通过（含 `phase2c2_official`）。
+- 绑定层覆盖达到 `mars-xlog` 公开能力面（含 raw metadata + global appender 能力）。
 
 ---
 
 ## Phase 6：移除 C++ 依赖（1 周）
 
 目标：完成收尾，默认构建不再编译 Mars C++ xlog。
+
+当前状态：进行中（默认构建链路已收口，legacy `xlog-sys` 仍保留用于兼容/对照）。
 
 任务：
 
@@ -538,13 +538,21 @@ DoD：
 
 - 修改根 `Cargo.toml`
 - 修改 `crates/xlog/Cargo.toml`
-- 修改/冻结 `crates/xlog-sys/*`（可保留为 legacy feature）
+- 修改/冻结 `crates/xlog-sys/*`（legacy crate，不参与默认构建）
 - 更新 `README.md`
 
 DoD：
 
 - 默认 `cargo build` 不依赖 C++14/Boost。
 - `third_party/mars` 仅用于参考与兼容测试，不参与主构建。
+- `mars-xlog-core` / `mars-xlog` / bindings 可按顺序执行 `cargo publish --dry-run`。
+
+当前发布状态（2026-03-04）：
+
+- `mars-xlog-core`：`cargo publish --dry-run` 通过。
+- `mars-xlog`：需在 `mars-xlog-core` 真正发布后再 dry-run/publish（当前因 crates.io 尚无 `mars-xlog-core` 而失败）。
+- `mars-xlog-uniffi` / `oh-xlog`：需在 `mars-xlog` 发布后再 dry-run/publish。
+- `mars-xlog-sys`：当前 dry-run 验证失败（打包后找不到 `third_party/mars` 源码路径），应单独作为 legacy 发布问题处理，不阻塞 Rust 主链路发布。
 
 ---
 

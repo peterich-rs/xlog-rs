@@ -1,25 +1,25 @@
 # mars-xlog (Rust workspace)
 
-This workspace provides Rust bindings for Tencent Mars `xlog` using a C ABI wrapper.
+This workspace provides a Rust-native implementation of Tencent Mars `xlog`, with optional legacy C/C++ FFI support kept for compatibility/testing.
 
 ## Crates
-- `mars-xlog-sys`: raw FFI + native build (C/C++/ObjC++).
-- `mars-xlog`: safe Rust wrapper API.
+- `mars-xlog-core`: Rust runtime core (protocol/compress/crypto/mmap/appender).
+- `mars-xlog`: safe Rust wrapper API (default Rust backend).
 - `mars-xlog-uniffi`: minimal UniFFI surface (Kotlin/Swift friendly).
 - `mars-xlog-android-jni`: JNI bridge used by the Android example app.
 - `oh-xlog`: Harmony/ohos N-API bindings.
+- `mars-xlog-sys`: legacy raw FFI + native build (C/C++/ObjC++) crate.
 
 ## Build notes
-- Default source path: `./third_party/mars/mars` relative to this workspace.
-- Override with `MARS_SRC_DIR=/path/to/mars` (the `mars` directory inside the Mars repo).
-- Requires a C++14 compiler and `zlib`.
-- iOS/macOS: links `Foundation` + `objc`.
-- Android: links `log` + `android`.
-- Harmony/ohos: links `hilog` (adjust if your toolchain differs).
+- Default workspace build (`cargo build`) uses the Rust backend and does not require C++14/Boost toolchains.
+- `mars-xlog-sys` is excluded from workspace `default-members`; build it explicitly when needed:
+  - `cargo build -p mars-xlog-sys`
+- Building `mars-xlog-sys` uses source path `./third_party/mars/mars` by default.
+- Override Mars source with `MARS_SRC_DIR=/path/to/mars` (the `mars` directory inside the Mars repo).
 
 ## Mars submodule
-This repository uses Tencent Mars as a git submodule at `third_party/mars`.
-The build uses `third_party/mars/mars` (the Mars repo's `mars/` directory).
+This repository uses Tencent Mars as a git submodule at `third_party/mars` for compatibility tests, decoder scripts, and legacy FFI builds.
+The legacy `mars-xlog-sys` build uses `third_party/mars/mars` (the Mars repo's `mars/` directory).
 
 Initialize the submodule (first time):
 ```bash
@@ -82,9 +82,9 @@ An Android app example that calls the `mars-xlog` crate via JNI lives at:
 `examples/android-jni`. See its README for build steps.
 
 ## Notes
- - `Xlog::log`/`Xlog::write` capture caller file/line but not function name. Use the `xlog!` macros (feature `macros`) or `write_with_meta` for full metadata.
-- iOS ObjC++ sources are included to preserve original behavior.
- - For low-level/global appender APIs, use `mars-xlog-sys`.
+- `Xlog::log`/`Xlog::write` capture caller file/line but not function name. Use the `xlog!` macros (feature `macros`) or `write_with_meta` for full metadata.
+- iOS/macOS console behavior keeps a native shim to preserve `printf`/`NSLog`/`OSLog` semantics.
+- Low-level/global appender APIs are available directly in `mars-xlog` (`appender_open`/`appender_close`/`flush_all`/`appender_write_with_meta_raw`).
 
 ## License
 MIT. See `LICENSE` and `NOTICE`.

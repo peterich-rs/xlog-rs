@@ -10,17 +10,14 @@ crate-type = ["rlib"]
 [dependencies]
 libc = { workspace = true }
 thiserror = { workspace = true }
-mars-xlog-sys = { path = "../xlog-sys" }
-mars-xlog-core = { path = "../xlog-core", optional = true }
+mars-xlog-core = { path = "../xlog-core", version = "0.1.0", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"], optional = true }
 
 [features]
-# Phase 5: 默认切换到 Rust backend，保留 FFI 可紧急回退。
+# Phase 6: 默认仅保留 Rust backend，移除 C++ 构建依赖链。
 default = ["rust-backend"]
-# C++ Mars FFI 后端（可作为紧急回退开关）
-ffi-backend = []
 # Rust 后端
 rust-backend = ["dep:mars-xlog-core", "dep:chrono"]
 # 控制是否启用 Rust 侧便捷宏

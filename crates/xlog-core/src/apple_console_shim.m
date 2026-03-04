@@ -2,12 +2,11 @@
 #import <os/log.h>
 #include <stdio.h>
 
-namespace {
-const char* safe_cstr(const char* value) {
-    return value == nullptr ? "" : value;
+static const char* safe_cstr(const char* value) {
+    return value == NULL ? "" : value;
 }
 
-os_log_type_t to_oslog_type(int level) {
+static os_log_type_t to_oslog_type(int level) {
     switch (level) {
         case 0:  // Verbose
         case 1:  // Debug
@@ -23,17 +22,16 @@ os_log_type_t to_oslog_type(int level) {
             return OS_LOG_TYPE_DEFAULT;
     }
 }
-}  // namespace
 
-extern "C" void xlog_core_apple_console_printf(const char* text) {
-    if (text == nullptr) {
+void xlog_core_apple_console_printf(const char* text) {
+    if (text == NULL) {
         return;
     }
     printf("%s\n", text);
 }
 
-extern "C" void xlog_core_apple_console_nslog(const char* text) {
-    if (text == nullptr) {
+void xlog_core_apple_console_nslog(const char* text) {
+    if (text == NULL) {
         return;
     }
     @autoreleasepool {
@@ -41,7 +39,7 @@ extern "C" void xlog_core_apple_console_nslog(const char* text) {
     }
 }
 
-extern "C" void xlog_core_apple_console_oslog(
+void xlog_core_apple_console_oslog(
     int level,
     const char* tag,
     const char* file,
@@ -49,7 +47,7 @@ extern "C" void xlog_core_apple_console_oslog(
     const char* func,
     const char* msg
 ) {
-    if (msg == nullptr) {
+    if (msg == NULL) {
         return;
     }
     @autoreleasepool {

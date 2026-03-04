@@ -10,14 +10,13 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["rust-backend"]
 rust-backend = ["mars-xlog/rust-backend"]
-ffi-backend = ["mars-xlog/ffi-backend"]
 
 [dependencies]
-mars-xlog = { path = "../xlog", default-features = false, features = ["tracing"] }
+mars-xlog = { path = "../xlog", version = "0.1.0", default-features = false, features = ["tracing"] }
 thiserror = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
-uniffi = { version = "0.30.0"}
+uniffi = { version = "0.30.0" }
 
 [profile.release]
 lto = true

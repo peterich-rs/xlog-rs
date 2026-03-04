@@ -10,9 +10,6 @@ use crate::{AppenderMode, FileIoAction, LogLevel, RawLogMeta, XlogConfig, XlogEr
 ))]
 use crate::ConsoleFun;
 
-#[cfg(feature = "ffi-backend")]
-mod ffi;
-
 #[cfg(feature = "rust-backend")]
 mod rust;
 
@@ -85,15 +82,8 @@ pub(crate) fn provider() -> &'static dyn XlogBackendProvider {
         return rust::provider();
     }
 
-    #[cfg(all(not(feature = "rust-backend"), feature = "ffi-backend"))]
+    #[cfg(not(feature = "rust-backend"))]
     {
-        return ffi::provider();
-    }
-
-    #[cfg(not(any(feature = "ffi-backend", feature = "rust-backend")))]
-    {
-        compile_error!(
-            "xlog requires at least one backend; enable `ffi-backend` or `rust-backend`"
-        );
+        compile_error!("xlog requires `rust-backend`");
     }
 }
