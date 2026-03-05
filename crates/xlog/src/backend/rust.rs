@@ -453,11 +453,7 @@ impl RustBackend {
         let line = self.format_record_line(level, tag, file, func, line, msg, pid, tid, maintid);
         let now_hour = chrono::Timelike::hour(&Local::now()) as u8;
         let engine_epoch = self.engine.async_flush_epoch();
-        let capacity = self
-            .engine
-            .async_buffer_stats()
-            .map(|(_, cap)| cap)
-            .unwrap_or(DEFAULT_BUFFER_BLOCK_LEN);
+        let capacity = self.engine.buffer_capacity();
 
         let mut state_guard = self.async_state.lock().expect("async state lock poisoned");
         let stale = state_guard

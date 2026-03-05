@@ -60,6 +60,7 @@ enum EngineCommand {
 pub struct AppenderEngine {
     mode: AtomicI32,
     state: Arc<Mutex<EngineState>>,
+    buffer_capacity: usize,
     tx: Sender<EngineCommand>,
     pending_async_flush: Arc<AtomicBool>,
     async_flush_epoch: Arc<AtomicU64>,
@@ -92,6 +93,7 @@ impl AppenderEngine {
         max_alive_time: i64,
         flush_timeout: Duration,
     ) -> Self {
+        let buffer_capacity = buffer.capacity();
         let state = Arc::new(Mutex::new(EngineState {
             file_manager,
             buffer,
@@ -126,6 +128,7 @@ impl AppenderEngine {
         Self {
             mode: AtomicI32::new(mode_to_i32(mode)),
             state,
+            buffer_capacity,
             tx,
             pending_async_flush,
             async_flush_epoch,
@@ -204,11 +207,10 @@ impl AppenderEngine {
 
         match self.mode() {
             EngineMode::Sync => {
-                let mut state = self.state.lock().expect("state lock poisoned");
+                let state = self.state.lock().expect("state lock poisoned");
                 state
                     .file_manager
                     .append_log_bytes(block, state.max_file_size, false)?;
-                housekeep_locked(&mut state)?;
             }
             EngineMode::Async => {
                 let should_flush = {
@@ -247,6 +249,10 @@ impl AppenderEngine {
             .lock()
             .ok()
             .map(|s| (s.buffer.len(), s.buffer.capacity()))
+    }
+
+    pub fn buffer_capacity(&self) -> usize {
+        self.buffer_capacity
     }
 
     pub fn async_flush_epoch(&self) -> u64 {

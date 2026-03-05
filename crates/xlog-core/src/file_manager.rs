@@ -472,10 +472,6 @@ fn append_bytes(path: &Path, bytes: &[u8]) -> Result<(), FileManagerError> {
         rollback_file_to_len(&mut file, before_len);
         return Err(FileManagerError::WriteFile(path.to_path_buf(), e));
     }
-    if let Err(e) = file.flush() {
-        rollback_file_to_len(&mut file, before_len);
-        return Err(FileManagerError::WriteFile(path.to_path_buf(), e));
-    }
     Ok(())
 }
 

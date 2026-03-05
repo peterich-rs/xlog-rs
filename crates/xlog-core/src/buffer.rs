@@ -124,13 +124,18 @@ impl PersistentBuffer {
             });
         }
 
+        let old_len = self.len;
         {
             let data = self.store.as_mut_slice();
             if !bytes.is_empty() {
                 data[..bytes.len()].copy_from_slice(bytes);
             }
-            if bytes.len() < data.len() {
-                data[bytes.len()..].fill(0);
+            // Keep trailing bytes untouched when length grows to avoid repeatedly
+            // zeroing the full mmap region on every async pending update.
+            if bytes.len() < old_len {
+                data[bytes.len()..old_len].fill(0);
+            } else if bytes.len() < data.len() {
+                data[bytes.len()] = 0;
             }
             self.len = bytes.len();
         }

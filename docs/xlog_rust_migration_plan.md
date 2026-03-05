@@ -14,7 +14,7 @@
 
 - Phase 0：已完成（fixture/decoder 基线与 nightly 回归已固化）。
 - Phase 1：已完成（commit: `643900d`）。
-  - 已落地后端抽象：`crates/xlog/src/backend/{mod.rs,rust.rs}`（`ffi.rs` 为历史阶段文件，Phase 6 起不再参与默认路径）。
+  - 已落地后端抽象：`crates/xlog/src/backend/{mod.rs,rust.rs}`（`ffi.rs` 为历史阶段文件，Phase 5 起不再参与默认路径）。
   - `xlog` API 已通过 backend trait 间接调用，完成 Rust 运行时接管。
 - Phase 2：已完成（commit: `3558c76`，含 2A/2B/2C 全部收口）。
   - 已完成 2A：`xlog-core` 协议/压缩/加密基础模块。
@@ -28,7 +28,8 @@
   - `xlog` 默认后端稳定为 `rust-backend`。
   - JNI/UniFFI/NAPI 绑定覆盖补齐 `mars-xlog` 公开能力面（含 raw metadata 与全局 appender 路径）。
   - `scripts/xlog/run_phase5_regression.sh` + `crates/xlog/examples/bench_backend.rs` 已固定为 Rust 路径回归与性能采样。
-- Phase 6：进行中（默认构建链路已脱离 C++；legacy `xlog-sys` 发布链路待单独整理）。
+- Phase 6：进行中（性能对齐阶段；保留 `mars-xlog-sys` 与 C++ backend 作为长期对照基线）。
+- Phase 7：未开始（仅在性能完全对齐后执行 C++ 依赖移除）。
 
 ### 0.2 Review 收口清单（截至 2026-03-04）
 
@@ -56,6 +57,15 @@
 20. `xlog-uniffi` + `mars-xlog-harmony-napi`：补齐实例控制/全局 appender/路径检索/`oneshot_flush`/`dump` 等接口覆盖，收口 wrapper 能力缺口。
 
 当前 review 阻断项：**0**（无未收口项）。
+
+### 0.3 性能策略（新增，2026-03-05）
+
+在性能达到对齐门槛前，迁移策略调整为：
+
+1. `mars-xlog-sys` crate 不删除，C++ backend 持续保留。
+2. Rust/C++ 双后端 benchmark 常态化执行，用于回归门禁与定位。
+3. 性能优化仅允许“实现层优化”，不允许修改协议/逻辑语义（见 Phase 6 约束）。
+4. `Phase 7（删除 C++ 依赖）` 变更为后置阶段，需满足性能门槛后再执行。
 
 ---
 
@@ -257,7 +267,7 @@ seq 规则：
 
 - `crates/xlog/src/lib.rs`（API 保持，后端切换）
 - `crates/xlog/src/backend/mod.rs`（trait）
-- `crates/xlog/src/backend/ffi.rs`（历史阶段迁移原 sys 调用，Phase 6 起移出默认路径）
+- `crates/xlog/src/backend/ffi.rs`（历史阶段迁移原 sys 调用，Phase 5 起移出默认路径）
 - `crates/xlog/src/backend/rust.rs`（调用 `xlog-core`）
 - `crates/xlog/Cargo.toml`（新依赖、feature flag）
 
@@ -522,11 +532,117 @@ DoD：
 
 ---
 
-## Phase 6：移除 C++ 依赖（1 周）
+## Phase 6：性能对齐与双后端保留（持续）
 
-目标：完成收尾，默认构建不再编译 Mars C++ xlog。
+目标：在不改变线上语义的前提下，使 Rust 实现性能完整对齐 C++（吞吐/延迟门槛见 6.4）。
 
-当前状态：进行中（默认构建链路已收口，legacy `xlog-sys` 仍保留用于兼容/对照）。
+当前状态：进行中（已发现显著性能差距；`mars-xlog-sys` 与 C++ backend 保留中）。
+
+任务：
+
+1. 固化 Rust/C++ 双后端 A/B benchmark，长期追踪并可回放。
+2. 深度 review 两侧实现差异，整理“只做实现层优化”的问题清单。
+3. 按“不改逻辑协议”原则实施性能优化（生命周期、减少拷贝、减少内存抖动、减少锁竞争）。
+4. 每项优化必须附带同参数 Rust/C++ 对比产物与回归结论。
+
+涉及文件：
+
+- `docs/xlog_rust_migration_plan.md`
+- `scripts/xlog/run_phase5_regression.sh`（后续补齐 C++ 对照输出）
+- `crates/xlog/examples/bench_backend.rs`
+- `crates/xlog-sys/*`（保留用于 C++ backend 基线与对照）
+
+基线快照（2026-03-05，`artifacts/bench-compare/20260305-main`，本地 macOS，release，`messages=20000`，`compress=zlib`，`msg-size=96`，3 轮均值）：
+
+| mode | backend | throughput_mps | lat_avg_ns | lat_p99_ns |
+| :--- | :--- | ---: | ---: | ---: |
+| async | Rust | 95,062.90 | 10,391.62 | 48,375.33 |
+| async | C++ | 318,996.36 | 3,021.70 | 6,625.00 |
+| sync | Rust | 31,289.61 | 31,765.63 | 51,666.67 |
+| sync | C++ | 466,944.82 | 1,951.43 | 10,749.67 |
+
+当前差距（同上口径）：
+
+- async：Rust 吞吐约为 C++ 的 29.8%，平均延迟约 3.44x，p99 约 7.30x。
+- sync：Rust 吞吐约为 C++ 的 6.7%，平均延迟约 16.28x，p99 约 4.81x。
+
+P0/P1 执行后快照（2026-03-05，`artifacts/bench-compare/20260305-p0p1`，同口径）：
+
+| mode | backend | throughput_mps | lat_avg_ns | lat_p99_ns |
+| :--- | :--- | ---: | ---: | ---: |
+| async | Rust | 138,055.98 | 7,164.61 | 35,750.00 |
+| async | C++ | 333,156.55 | 2,845.75 | 6,625.00 |
+| sync | Rust | 50,334.56 | 19,676.99 | 37,000.00 |
+| sync | C++ | 487,713.61 | 1,793.75 | 13,819.33 |
+
+P0/P1 执行后差距（同上口径）：
+
+- async：Rust 吞吐约为 C++ 的 41.4%，平均延迟约 2.52x，p99 约 5.40x。
+- sync：Rust 吞吐约为 C++ 的 10.3%，平均延迟约 10.97x，p99 约 2.68x。
+- 相比基线：Rust async 吞吐约提升 45.2%，Rust sync 吞吐约提升 60.9%。
+
+已识别的关键实现差异（需优先优化）：
+
+1. async 写路径每条日志都会重写整段 pending bytes 到 mmap（`pending_bytes_without_tailer + replace_bytes_with_flush`）。
+2. sync 写路径每次 `write_block` 都执行 housekeeping（目录扫描/迁移/过期清理）。
+3. `append_bytes` 每次写入后都执行 `file.flush()`，与 C++ 当前写入策略存在明显差异。
+4. Rust 路径存在更多中间分配/拷贝（`String`/`Vec<u8>` 构造与转换）。
+
+深度差异 Review（实现对比与优化方向）：
+
+| 维度 | 当前 Rust 路径 | 当前 C++ 路径 | 优化方向（不改逻辑） |
+| :--- | :--- | :--- | :--- |
+| async pending 持久化 | 每次写入生成完整 pending 再整体替换 mmap | 内存缓冲区按增量写入，达到阈值再 flush | 改为增量写入/增量更新 pending，避免 O(n) 级重复拷贝 |
+| sync 热路径 housekeeping | `write_block(sync)` 后立即执行 housekeep | 清理/搬迁由后台线程周期执行 | 拆分 housekeeping 到后台周期任务，写路径仅做必要 IO |
+| 文件 flush 频率 | append 后立即 `file.flush()` | `fwrite` 为主，未在每次写后强制 flush | 按语义等价点批量 flush，减少系统调用抖动 |
+| 内存分配与拷贝 | `String -> Vec<u8>`、中间 buffer 多次构造 | 栈缓冲 + 复用 buffer 为主 | 引入可复用 scratch buffer / 预分配容量 / 减少临时对象 |
+| 锁竞争 | async path 同时涉及 state mutex + engine state lock | 关键路径锁粒度较小 | 缩小锁作用域，拆分冷热状态锁，降低临界区长度 |
+| 文件索引/目录扫描 | 文件管理路径中目录扫描频次较高 | 目录维护更多依赖周期任务 | 增加运行时缓存与失效策略，减少重复目录遍历 |
+
+性能优化约束（必须遵守）：
+
+1. 不修改协议格式：magic/header/tailer/seq/crypt 语义保持一致。
+2. 不修改功能逻辑：flush/move_file、cache 迁移、文件命名、过期策略保持一致。
+3. 不修改对外 API 行为：JNI/UniFFI/NAPI 与 `mars-xlog` 公开语义保持一致。
+4. 优化只能发生在实现细节：生命周期管理、内存布局、拷贝路径、锁粒度、缓冲复用。
+
+任务拆分（P0/P1/P2）：
+
+| 优先级 | 任务项 | 状态（2026-03-05） | 代码位置 | 验收与产物 |
+| :--- | :--- | :--- | :--- | :--- |
+| P0 | sync 热路径移除每次写入 housekeeping | 已完成 | `crates/xlog-core/src/appender_engine.rs` | `cargo check -p mars-xlog-core -p mars-xlog` 通过；见 `20260305-p0p1` |
+| P0 | 热路径移除每次 `append_bytes` 后 `file.flush()` | 已完成 | `crates/xlog-core/src/file_manager.rs` | 同上；同步吞吐显著改善 |
+| P1 | async 路径 capacity 读取去锁/缩短锁持有 | 已完成 | `crates/xlog/src/backend/rust.rs`、`crates/xlog-core/src/appender_engine.rs` | 同上；异步路径锁竞争下降 |
+| P1 | `replace_bytes_with_flush` 减少无效零填充 | 已完成 | `crates/xlog-core/src/buffer.rs` | 同上；减少 mmap 写放大 |
+| P2 | pending bytes 从“全量重写”改为“增量更新” | 待执行 | `crates/xlog/src/backend/rust.rs`、`crates/xlog-core/src/buffer.rs` | 目标：进一步降低 async O(n) 拷贝与 p99 |
+| P2 | 引入复用 scratch buffer，减少中间 `Vec/String` 构造 | 待执行 | `crates/xlog/src/backend/rust.rs`、`crates/xlog-core/src/encoder.rs` | 目标：降低分配抖动与 CPU cache miss |
+| P2 | 拆分冷热锁 + 文件索引缓存，减少目录扫描 | 待执行 | `crates/xlog-core/src/appender_engine.rs`、`crates/xlog-core/src/file_manager.rs` | 目标：进一步缩短临界区并降低 syscalls |
+
+Rust 特性驱动的实现层优化（不改逻辑）：
+
+1. 生命周期下沉：优先借用切片（`&[u8]`）与就地编码，避免短生命周期对象转堆分配。
+2. 缓冲复用：固定容量 scratch buffer + 预分配策略，避免热路径反复扩容/回收。
+3. 拷贝路径收敛：减少 `String <-> Vec<u8>` 往返转换，改为单向字节视图传递。
+4. 锁作用域压缩：把可在锁外完成的编码/拼包前移，锁内只保留必要状态更新与 IO 提交。
+5. IO 批次控制：保持语义等价点 flush，不在每条日志后触发强制 flush。
+
+DoD：
+
+- Rust 在目标平台达到并稳定满足 6.4 性能门槛。
+- benchmark 产物同时包含 Rust/C++，可直接审计差异来源。
+- 保持协议兼容、回归兼容、绑定层兼容全部通过。
+
+---
+
+## Phase 7：移除 C++ 依赖（1 周，后置）
+
+目标：在性能对齐完成后，收尾默认构建链路，默认构建不再编译 Mars C++ xlog。
+
+前置条件（必须同时满足）：
+
+1. Phase 6 性能门槛达标并稳定通过。
+2. Rust/C++ 双后端 A/B 回归连续通过（建议至少 7 天 nightly）。
+3. 线上灰度窗口内无新增协议/行为回归。
 
 任务：
 
@@ -538,7 +654,7 @@ DoD：
 
 - 修改根 `Cargo.toml`
 - 修改 `crates/xlog/Cargo.toml`
-- 修改/冻结 `crates/xlog-sys/*`（legacy crate，不参与默认构建）
+- 修改/冻结 `crates/xlog-sys/*`（legacy crate，转为可选/归档路径）
 - 更新 `README.md`
 
 DoD：
@@ -583,11 +699,16 @@ DoD：
 - HarmonyOS（NAPI）
 - Linux（纯 Rust）
 
-### 6.4 性能门槛（建议）
+### 6.4 性能门槛（强制）
 
 - 吞吐不低于现网 C++ 的 90%
 - p99 写入延迟不高于 C++ 的 110%
 - crash 恢复成功率 100%
+
+当前状态（2026-03-05）：
+
+- 未达标（见 Phase 6 基线快照）。
+- 基线产物：`artifacts/bench-compare/20260305-main/*.jsonl`。
 
 ---
 
@@ -607,6 +728,7 @@ DoD：
 
 1. 先完成 Phase 0 与 Phase 1，建立“可回退、可对比”的安全网。
 2. 再做 Phase 2~4，把 Rust 引擎跑通并与现有基线对齐。
-3. 最后做 Phase 5~6 切换默认与清理。
+3. Phase 5 切默认后，优先执行 Phase 6 性能对齐与双后端验证。
+4. 仅在 Phase 6 达标后执行 Phase 7（移除 C++ 依赖）。
 
 这个顺序可以保证：每个阶段都可验证、可回滚，不会出现“到最后才发现协议不兼容”的高风险收敛问题。
