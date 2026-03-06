@@ -225,10 +225,12 @@ impl AppenderEngine {
 
         match self.mode() {
             EngineMode::Sync => {
-                let state = self.state.lock().expect("state lock poisoned");
-                state
-                    .file_manager
-                    .append_log_bytes(block, state.max_file_size, false, true)?;
+                // Snapshot sync write inputs, then release the engine lock before file I/O.
+                let (file_manager, max_file_size) = {
+                    let state = self.state.lock().expect("state lock poisoned");
+                    (state.file_manager.clone(), state.max_file_size)
+                };
+                file_manager.append_log_bytes(block, max_file_size, false, true)?;
             }
             EngineMode::Async => {
                 let should_flush = {

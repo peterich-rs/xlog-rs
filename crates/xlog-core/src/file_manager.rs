@@ -186,12 +186,22 @@ impl FileManager {
 
         if self.cache_dir.is_none() {
             let now = Local::now();
-            let path = self
-                .active_append_path(now, &self.log_dir, keep_open)
-                .unwrap_or_else(|| {
-                    self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size)
-                });
-            return self.append_slices_with_runtime(&path, slices, now, keep_open);
+            let mut runtime = self.runtime.lock().expect("file_manager runtime lock poisoned");
+            let path = self.select_append_path_locked(
+                &mut runtime,
+                now,
+                &self.log_dir,
+                &self.name_prefix,
+                max_file_size,
+                keep_open,
+            );
+            return self.append_slices_with_runtime_locked(
+                &mut runtime,
+                &path,
+                slices,
+                now,
+                keep_open,
+            );
         }
 
         let cache_dir = self.cache_dir.as_ref().expect("cache_dir is_some");
@@ -593,28 +603,8 @@ impl FileManager {
         prefix: &str,
         max_file_size: u64,
     ) -> PathBuf {
-        let now_ts = now.timestamp();
-        let day_key = day_key(now);
-        if let Ok(mut runtime) = self.runtime.lock() {
-            if let Some(last_ts) = runtime.last_append_time {
-                if now_ts < last_ts {
-                    if let Some(path) = runtime.last_append_path.clone() {
-                        return path;
-                    }
-                }
-            }
-            if let Some(path) =
-                self.cached_target_path(&mut runtime, now_ts, dir, day_key, prefix, max_file_size)
-            {
-                return path;
-            }
-        }
-        let target = self.resolve_append_target(now, dir, prefix, max_file_size);
-        if let Ok(mut runtime) = self.runtime.lock() {
-            self.set_cached_target(&mut runtime, dir, target.clone());
-            Self::record_last_append(&mut runtime, now_ts, &target.path);
-        }
-        target.path
+        let mut runtime = self.runtime.lock().expect("file_manager runtime lock poisoned");
+        self.select_append_path_locked(&mut runtime, now, dir, prefix, max_file_size, false)
     }
 
     fn append_slices_with_runtime(
@@ -624,15 +614,71 @@ impl FileManager {
         now: chrono::DateTime<Local>,
         keep_open: bool,
     ) -> Result<(), FileManagerError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| FileManagerError::CreateDir(parent.to_path_buf(), e))?;
+        let mut runtime = self.runtime.lock().expect("file_manager runtime lock poisoned");
+        self.append_slices_with_runtime_locked(&mut runtime, path, slices, now, keep_open)
+    }
+
+    fn select_append_path_locked(
+        &self,
+        runtime: &mut RuntimeState,
+        now: chrono::DateTime<Local>,
+        dir: &Path,
+        prefix: &str,
+        max_file_size: u64,
+        keep_open: bool,
+    ) -> PathBuf {
+        let now_ts = now.timestamp();
+        let day_key = day_key(now);
+
+        if keep_open {
+            if let Some(active) = runtime.active_file.as_ref() {
+                if active.day_key == day_key && active.path.parent() == Some(dir) {
+                    let path = active.path.clone();
+                    Self::record_last_append(runtime, now_ts, &path);
+                    return path;
+                }
+            }
         }
 
+        if let Some(last_ts) = runtime.last_append_time {
+            if now_ts < last_ts {
+                if let Some(path) = runtime.last_append_path.clone() {
+                    return path;
+                }
+            }
+        }
+        if let Some(path) =
+            self.cached_target_path(runtime, now_ts, dir, day_key, prefix, max_file_size)
+        {
+            return path;
+        }
+
+        let target = self.resolve_append_target(now, dir, prefix, max_file_size);
+        self.set_cached_target(runtime, dir, target.clone());
+        Self::record_last_append(runtime, now_ts, &target.path);
+        target.path
+    }
+
+    fn append_slices_with_runtime_locked(
+        &self,
+        runtime: &mut RuntimeState,
+        path: &Path,
+        slices: &[&[u8]],
+        now: chrono::DateTime<Local>,
+        keep_open: bool,
+    ) -> Result<(), FileManagerError> {
         let day_key = day_key(now);
-        let mut runtime = self.runtime.lock().expect("file_manager runtime lock poisoned");
         let path_buf = path.to_path_buf();
-        let cached_local_len = self.cached_local_len_for_path(&runtime, &path_buf, day_key);
+        let active_matches = runtime
+            .active_file
+            .as_ref()
+            .map(|active| active.path == path_buf && active.day_key == day_key)
+            .unwrap_or(false);
+        let cached_local_len = if active_matches {
+            None
+        } else {
+            self.cached_local_len_for_path(runtime, &path_buf, day_key)
+        };
 
         let must_reopen = runtime
             .active_file
@@ -643,11 +689,7 @@ impl FileManager {
             runtime.active_file = None;
         }
         if runtime.active_file.is_none() {
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|e| FileManagerError::OpenFile(path_buf.clone(), e))?;
+            let file = open_append_file(path, &path_buf)?;
             let len = match cached_local_len {
                 Some(len) => len,
                 None => file
@@ -692,14 +734,8 @@ impl FileManager {
 
         if let Ok((written, current_len)) = result {
             let merged_len =
-                self.merged_len_after_append(path, &runtime, day_key, written, current_len);
-            self.update_cached_target_after_append(
-                &mut runtime,
-                path,
-                day_key,
-                merged_len,
-                current_len,
-            );
+                self.merged_len_after_append(path, runtime, day_key, written, current_len);
+            self.update_cached_target_after_append(runtime, path, day_key, merged_len, current_len);
         }
 
         if !keep_open {
@@ -973,6 +1009,25 @@ fn rollback_file_to_len(file: &mut File, target_len: u64) {
     let _ = file.seek(SeekFrom::Start(target_len));
 }
 
+fn open_append_file(path: &Path, path_buf: &PathBuf) -> Result<File, FileManagerError> {
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => Ok(file),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let Some(parent) = path.parent() else {
+                return Err(FileManagerError::OpenFile(path_buf.clone(), err));
+            };
+            fs::create_dir_all(parent)
+                .map_err(|e| FileManagerError::CreateDir(parent.to_path_buf(), e))?;
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| FileManagerError::OpenFile(path_buf.clone(), e))
+        }
+        Err(err) => Err(FileManagerError::OpenFile(path_buf.clone(), err)),
+    }
+}
+
 fn file_mtime(path: &Path) -> Result<SystemTime, FileManagerError> {
     let meta = fs::metadata(path).map_err(|e| FileManagerError::Metadata(path.to_path_buf(), e))?;
     meta.modified()
@@ -1143,5 +1198,23 @@ mod tests {
         assert_eq!(std::fs::read(&cache_path).unwrap(), b"aaaabbbb");
         assert!(!root.path().join("bogus").exists());
         assert!(std::fs::read_dir(&log_dir).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn append_recreates_missing_parent_dir_on_open() {
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("log");
+        let manager = FileManager::new(log_dir.clone(), None, "demo".to_string(), 0).unwrap();
+
+        std::fs::remove_dir_all(&log_dir).unwrap();
+        manager.append_log_bytes(b"hello", 0, false, false).unwrap();
+
+        let entry = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read(entry).unwrap(), b"hello");
     }
 }
