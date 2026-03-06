@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::mmap_store::{MmapStore, MmapStoreError};
-use crate::protocol::{LogHeader, HEADER_LEN, MAGIC_END};
+use crate::protocol::{update_end_hour_in_place, LogHeader, HEADER_LEN, MAGIC_END};
 
 pub const DEFAULT_BUFFER_BLOCK_LEN: usize = 150 * 1024;
 
@@ -72,6 +72,10 @@ impl PersistentBuffer {
         self.len
     }
 
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.store.as_slice()[..self.len]
+    }
+
     pub fn capacity(&self) -> usize {
         self.store.len()
     }
@@ -81,6 +85,14 @@ impl PersistentBuffer {
     }
 
     pub fn append_block(&mut self, block: &[u8]) -> Result<bool, BufferError> {
+        self.append_block_with_flush(block, true)
+    }
+
+    pub fn append_block_with_flush(
+        &mut self,
+        block: &[u8],
+        flush: bool,
+    ) -> Result<bool, BufferError> {
         validate_block(block)?;
 
         if block.len() > self.capacity() {
@@ -104,7 +116,9 @@ impl PersistentBuffer {
                 data[self.len] = 0;
             }
         }
-        self.store.flush()?;
+        if flush {
+            self.store.flush()?;
+        }
         Ok(true)
     }
 
@@ -149,6 +163,117 @@ impl PersistentBuffer {
         let out = self.store.as_slice()[..self.len].to_vec();
         self.clear()?;
         Ok(out)
+    }
+
+    pub fn begin_pending_block_with_flush(
+        &mut self,
+        header: &LogHeader,
+        flush: bool,
+    ) -> Result<(), BufferError> {
+        let encoded = header.encode();
+        if encoded.len() > self.capacity() {
+            return Err(BufferError::BlockTooLarge {
+                block_len: encoded.len(),
+                capacity: self.capacity(),
+            });
+        }
+
+        let old_len = self.len;
+        {
+            let data = self.store.as_mut_slice();
+            data[..HEADER_LEN].copy_from_slice(&encoded);
+            if HEADER_LEN < old_len {
+                data[HEADER_LEN..old_len].fill(0);
+            } else if HEADER_LEN < data.len() {
+                data[HEADER_LEN] = 0;
+            }
+            self.len = HEADER_LEN;
+        }
+        if flush {
+            self.store.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn append_to_pending_with_flush(
+        &mut self,
+        truncate_bytes: usize,
+        bytes: &[u8],
+        end_hour: u8,
+        flush: bool,
+    ) -> Result<(), BufferError> {
+        if self.len < HEADER_LEN || truncate_bytes > self.len.saturating_sub(HEADER_LEN) {
+            return Err(BufferError::InvalidBlock);
+        }
+        let next_len = self
+            .len
+            .checked_sub(truncate_bytes)
+            .and_then(|len| len.checked_add(bytes.len()))
+            .ok_or(BufferError::BlockLenOverflow)?;
+        if next_len > self.capacity() {
+            return Err(BufferError::BlockTooLarge {
+                block_len: next_len,
+                capacity: self.capacity(),
+            });
+        }
+
+        let old_len = self.len;
+        {
+            let data = self.store.as_mut_slice();
+            let write_offset = self.len - truncate_bytes;
+            if !bytes.is_empty() {
+                data[write_offset..write_offset + bytes.len()].copy_from_slice(bytes);
+            }
+            if next_len < old_len {
+                data[next_len..old_len].fill(0);
+            } else if next_len < data.len() {
+                data[next_len] = 0;
+            }
+            let payload_len = u32::try_from(next_len - HEADER_LEN).map_err(|_| BufferError::BlockLenOverflow)?;
+            data[5..9].copy_from_slice(&payload_len.to_le_bytes());
+            update_end_hour_in_place(&mut data[..HEADER_LEN], end_hour)
+                .map_err(|_| BufferError::InvalidBlock)?;
+            self.len = next_len;
+        }
+        if flush {
+            self.store.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn finalize_pending_block_with_flush(
+        &mut self,
+        end_hour: u8,
+        flush: bool,
+    ) -> Result<(), BufferError> {
+        if self.len < HEADER_LEN {
+            return Err(BufferError::InvalidBlock);
+        }
+        let next_len = self
+            .len
+            .checked_add(1)
+            .ok_or(BufferError::BlockLenOverflow)?;
+        if next_len > self.capacity() {
+            return Err(BufferError::BlockTooLarge {
+                block_len: next_len,
+                capacity: self.capacity(),
+            });
+        }
+
+        {
+            let data = self.store.as_mut_slice();
+            data[self.len] = MAGIC_END;
+            if next_len < data.len() {
+                data[next_len] = 0;
+            }
+            update_end_hour_in_place(&mut data[..HEADER_LEN], end_hour)
+                .map_err(|_| BufferError::InvalidBlock)?;
+            self.len = next_len;
+        }
+        if flush {
+            self.store.flush()?;
+        }
+        Ok(())
     }
 
     pub fn clear(&mut self) -> Result<(), BufferError> {
