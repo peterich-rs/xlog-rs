@@ -1,5 +1,7 @@
 use std::env;
+use std::fs;
 use std::hint::black_box;
+use std::path::Path;
 use std::time::Instant;
 
 use mars_xlog_core::compress::{
@@ -7,8 +9,10 @@ use mars_xlog_core::compress::{
     ZstdChunkCompressor, ZstdStreamCompressor,
 };
 use mars_xlog_core::crypto::{tea_encrypt_in_place, EcdhTeaCipher};
+use mars_xlog_core::file_manager::FileManager;
 use mars_xlog_core::formatter::{format_record, format_record_parts_into};
 use mars_xlog_core::record::{LogLevel, LogRecord};
+use tempfile::TempDir;
 
 const SAMPLE_PUBKEY: &str =
     "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
@@ -20,11 +24,12 @@ Usage:
   cargo run -p mars-xlog-core --example bench_components -- [target] [options]
 
 Targets:
-  all | compress | crypto | formatter
+  all | compress | crypto | formatter | io
 
 Options:
   --iterations <n>   Iterations per benchmark (default: 100000)
   --payload-size <n> Payload size in bytes (default: 256)
+  --io-iterations <n> Iterations for file I/O path benchmarks (default: min(iterations, 5000))
 ";
 
 #[derive(Copy, Clone)]
@@ -33,6 +38,7 @@ enum Target {
     Compress,
     Crypto,
     Formatter,
+    Io,
 }
 
 impl Target {
@@ -42,6 +48,7 @@ impl Target {
             "compress" => Ok(Target::Compress),
             "crypto" => Ok(Target::Crypto),
             "formatter" => Ok(Target::Formatter),
+            "io" => Ok(Target::Io),
             _ => Err(format!("invalid target: {input}")),
         }
     }
@@ -51,6 +58,7 @@ struct Options {
     target: Target,
     iterations: usize,
     payload_size: usize,
+    io_iterations: usize,
 }
 
 fn main() {
@@ -67,10 +75,12 @@ fn run() -> Result<(), String> {
             run_compress(&opts)?;
             run_crypto(&opts)?;
             run_formatter(&opts)?;
+            run_io(&opts)?;
         }
         Target::Compress => run_compress(&opts)?,
         Target::Crypto => run_crypto(&opts)?,
         Target::Formatter => run_formatter(&opts)?,
+        Target::Io => run_io(&opts)?,
     }
     Ok(())
 }
@@ -79,6 +89,7 @@ fn parse_args() -> Result<Options, String> {
     let mut target = Target::All;
     let mut iterations = 100_000usize;
     let mut payload_size = 256usize;
+    let mut io_iterations: Option<usize> = None;
     let mut target_set = false;
 
     let mut iter = env::args().skip(1);
@@ -101,6 +112,15 @@ fn parse_args() -> Result<Options, String> {
                     .parse::<usize>()
                     .map_err(|e| format!("invalid --payload-size value {v}: {e}"))?;
             }
+            "--io-iterations" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--io-iterations requires a value".to_string())?;
+                io_iterations = Some(
+                    v.parse::<usize>()
+                        .map_err(|e| format!("invalid --io-iterations value {v}: {e}"))?,
+                );
+            }
             token if token.starts_with("--") => {
                 return Err(format!("unknown argument: {token}\n\n{USAGE}"));
             }
@@ -122,11 +142,13 @@ fn parse_args() -> Result<Options, String> {
     if payload_size == 0 {
         return Err("--payload-size must be > 0".to_string());
     }
+    let io_iterations = io_iterations.unwrap_or(iterations.min(5_000)).max(1);
 
     Ok(Options {
         target,
         iterations,
         payload_size,
+        io_iterations,
     })
 }
 
@@ -300,6 +322,65 @@ fn run_formatter(opts: &Options) -> Result<(), String> {
     Ok(())
 }
 
+fn run_io(opts: &Options) -> Result<(), String> {
+    let payload = make_payload(opts.payload_size.max(64), 0xF0F0_AA55_1234_6789);
+    let rotate_max_file_size = (opts.payload_size.max(64) as u64).saturating_mul(2);
+    let append_max_file_size = (opts.payload_size.max(64) as u64).saturating_mul(1024 * 1024);
+
+    bench_append_path_variant(
+        "append_keep_open",
+        opts,
+        payload.as_slice(),
+        false,
+        0,
+        append_max_file_size,
+        false,
+        true,
+    )?;
+    bench_append_path_variant(
+        "append_close_after_write",
+        opts,
+        payload.as_slice(),
+        false,
+        0,
+        append_max_file_size,
+        false,
+        false,
+    )?;
+    bench_append_path_variant(
+        "append_rotate_keep_open",
+        opts,
+        payload.as_slice(),
+        false,
+        0,
+        rotate_max_file_size,
+        false,
+        true,
+    )?;
+    bench_append_path_variant(
+        "append_rotate_close_after_write",
+        opts,
+        payload.as_slice(),
+        false,
+        0,
+        rotate_max_file_size,
+        false,
+        false,
+    )?;
+    bench_append_path_variant(
+        "append_cache_keep_open",
+        opts,
+        payload.as_slice(),
+        true,
+        1,
+        append_max_file_size,
+        false,
+        true,
+    )?;
+    bench_move_old_cache_files_variant(opts, payload.as_slice())?;
+    Ok(())
+}
+
 fn bench_stream_compressor<C, D>(
     variant: &str,
     opts: &Options,
@@ -352,6 +433,124 @@ where
     );
 
     Ok(())
+}
+
+fn bench_append_path_variant(
+    variant: &str,
+    opts: &Options,
+    payload: &[u8],
+    use_cache_dir: bool,
+    cache_days: i32,
+    max_file_size: u64,
+    move_file: bool,
+    keep_open: bool,
+) -> Result<(), String> {
+    let root = TempDir::new().map_err(|e| format!("{variant} temp dir: {e}"))?;
+    let log_dir = root.path().join("logs");
+    let cache_dir = use_cache_dir.then(|| root.path().join("cache"));
+    let manager = FileManager::new(
+        log_dir.clone(),
+        cache_dir.clone(),
+        "bench".to_string(),
+        cache_days,
+    )
+    .map_err(|e| format!("{variant} file manager init: {e}"))?;
+
+    let start = Instant::now();
+    for _ in 0..opts.io_iterations {
+        manager
+            .append_log_bytes(
+                black_box(payload),
+                max_file_size,
+                move_file,
+                keep_open,
+            )
+            .map_err(|e| format!("{variant} append failed: {e}"))?;
+    }
+    let elapsed = start.elapsed();
+
+    let input_bytes = payload.len().saturating_mul(opts.io_iterations);
+    let mut output_bytes = total_size_under(&log_dir);
+    if let Some(cache) = cache_dir.as_ref() {
+        output_bytes = output_bytes.saturating_add(total_size_under(cache));
+    }
+    let ratio = if input_bytes == 0 {
+        0.0
+    } else {
+        output_bytes as f64 / input_bytes as f64
+    };
+    emit_result(
+        "io",
+        variant,
+        opts.payload_size,
+        opts.io_iterations,
+        elapsed.as_secs_f64() * 1000.0,
+        input_bytes,
+        output_bytes,
+        ratio,
+    );
+    Ok(())
+}
+
+fn bench_move_old_cache_files_variant(opts: &Options, payload: &[u8]) -> Result<(), String> {
+    let variant = "move_old_cache_files";
+    let root = TempDir::new().map_err(|e| format!("{variant} temp dir: {e}"))?;
+    let log_dir = root.path().join("logs");
+    let cache_dir = root.path().join("cache");
+    let manager = FileManager::new(
+        log_dir.clone(),
+        Some(cache_dir.clone()),
+        "bench".to_string(),
+        0,
+    )
+    .map_err(|e| format!("{variant} file manager init: {e}"))?;
+
+    let mut input_bytes = 0usize;
+    let start = Instant::now();
+    for idx in 0..opts.io_iterations {
+        let path = cache_dir.join(format!("bench-move-{idx}.xlog"));
+        fs::write(&path, payload).map_err(|e| format!("{variant} seed file write failed: {e}"))?;
+        input_bytes = input_bytes.saturating_add(payload.len());
+        manager
+            .move_old_cache_files(0)
+            .map_err(|e| format!("{variant} move failed: {e}"))?;
+    }
+    let elapsed = start.elapsed();
+
+    let output_bytes = total_size_under(&log_dir).saturating_add(total_size_under(&cache_dir));
+    let ratio = if input_bytes == 0 {
+        0.0
+    } else {
+        output_bytes as f64 / input_bytes as f64
+    };
+    emit_result(
+        "io",
+        variant,
+        opts.payload_size,
+        opts.io_iterations,
+        elapsed.as_secs_f64() * 1000.0,
+        input_bytes,
+        output_bytes,
+        ratio,
+    );
+    Ok(())
+}
+
+fn total_size_under(path: &Path) -> usize {
+    if !path.exists() {
+        return 0;
+    }
+    if path.is_file() {
+        return path.metadata().map(|m| m.len() as usize).unwrap_or(0);
+    }
+
+    let mut total = 0usize;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            total = total.saturating_add(total_size_under(&entry.path()));
+        }
+    }
+    total
 }
 
 fn emit_result(
