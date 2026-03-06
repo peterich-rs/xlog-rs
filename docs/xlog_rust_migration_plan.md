@@ -601,12 +601,17 @@ P2/P3 执行后快照（2026-03-06，`artifacts/bench-compare/20260306-perf5`，
 | `20260306-perf7` | async Rust | 213,855.31 | 4,537.35 | 39,194.67 | `async mmap persist cadence` 调优后的 async 专项结果 |
 | `20260306-perf8` | async Rust | 256,989.09 | 3,772.17 | 36,416.67 | `async_state` 短锁 checkout + 锁外压缩/加密/engine 提交后的 async 专项结果 |
 | `20260306-perf9` | async Rust | 234,499.66 | 4,055.71 | 35,583.67 | `finalize/recover/oneshot` 边界复制与尾块处理收敛后的专项结果；仅记录，不替换主基线 |
+| `20260306-p0p1wave` | async Rust（4 threads smoke） | 184,021.92 | 19,261.10 | 63,958.00 | 新 threaded harness + 同轮 Rust/C++ smoke，结果见 `artifacts/bench-compare/20260306-p0p1wave/results_smoke.jsonl` |
+| `20260306-p0p1wave` | sync Rust（4 threads smoke） | 117,198.59 | 29,534.00 | 484,792.00 | 同上；仅用于验证 harness 与当前实现路径，不替换阶段基线 |
+| `20260306-p0p1wave` | async C++（4 threads smoke） | 157,537.94 | 24,974.10 | 246,916.00 | 同上；首次恢复同轮同参数 smoke 对照 |
+| `20260306-p0p1wave` | sync C++（4 threads smoke） | 256,480.81 | 14,460.13 | 160,000.00 | 同上；仅 smoke，不作为阶段结论 |
 
 当前有效对齐结论（Rust 对保留 C++ 基线）：
 
 - async：以 `20260306-perf8` 为当前参考，Rust 吞吐约为 C++ 的 77.1%，平均延迟约 1.33x，p99 约 5.50x。
 - sync：以 `20260306-perf6` 为当前参考，Rust 吞吐约为 C++ 的 39.4%，平均延迟约 2.77x，p99 约 1.33x。
 - 说明：`20260306-perf8` 仍作为 async 主参考；`20260306-perf9` 主要验证边界路径复制收敛，p99 略降但均值受环境波动影响，不提升为阶段基线。sync 当前仍采用 `20260306-perf6` 作为阶段参考。
+- `20260306-p0p1wave` 已恢复同轮 Rust/C++ threaded smoke，对照不再完全依赖历史产物；但由于仅单次 smoke、线程数和消息规模与阶段主基线不同，不替换上述阶段参考。
 
 Phase 6 已完成项（仅保留仍有信息价值的条目）：
 
@@ -618,11 +623,14 @@ Phase 6 已完成项（仅保留仍有信息价值的条目）：
 6. async mmap 持久化已从固定小步长触发改为“更新次数 + 增量字节数 + 时间窗 + force flush”的组合策略。
 7. `RustBackend::async_state` 已改为短锁 checkout + 锁外压缩/加密/engine 提交，保留单 backend 顺序语义的同时收窄串行区。
 8. `PersistentBuffer` 启动恢复与 `oneshot_flush` 已改为 scan + slice 路径，避免整段 `recover_blocks()`/`read_exact()` 复制；async finalize 空尾块不再执行无意义 append。
+9. `AppenderEngine` 后台 async flush 在 state 忙时改为 `try_lock + requeue`，避免 flush worker 在热写入期间长时间阻塞主串行区。
+10. benchmark harness 已恢复 compile-time Rust/C++ backend 选择，并补齐 `--threads`、`--flush-every` 等 threaded smoke 能力。
 
 当前剩余差距（只保留主计划内仍值得做的项）：
 
 1. sync：轮转边界和 cache/log 切换边界仍有额外 metadata/path 探测。
-2. benchmark：仍缺少可直接同轮重跑的 C++ backend harness。
+2. benchmark：虽已恢复同轮 Rust/C++ smoke，但仍缺少多轮统计化基准与更完整的场景矩阵。
+3. async：`AppenderEngine::state` 仍保留必要串行区，后续是否继续拆分需要结合新的 threaded profiling 决定。
 
 性能优化约束（必须遵守）：
 
@@ -640,8 +648,10 @@ Phase 6 已完成项（仅保留仍有信息价值的条目）：
 | 已完成 | async mmap persist cadence 调优 | `crates/xlog-core/src/appender_engine.rs` | `cargo test -p mars-xlog --lib -- --nocapture` 通过；见 `20260306-perf7` |
 | 已完成 | 收窄 `RustBackend::async_state` 串行区，改为短锁 checkout + 锁外压缩/加密/engine 提交 | `crates/xlog/src/backend/rust.rs` | `cargo test -p mars-xlog --lib -- --nocapture` 通过；见 `20260306-perf8` |
 | 已完成 | 收敛 finalize / recover / oneshot 边界复制与尾块处理 | `crates/xlog/src/backend/rust.rs`、`crates/xlog-core/src/buffer.rs`、`crates/xlog-core/src/oneshot.rs` | `cargo test -p mars-xlog-core --test mmap_recovery --test oneshot_flush -- --nocapture` 通过；见 `20260306-perf9` |
-| 待执行 | 继续减少 sync 轮转边界的 metadata/path 探测 | `crates/xlog-core/src/file_manager.rs` | 目标：提升 sync 吞吐稳定性 |
-| 待执行 | 补齐独立 C++ backend benchmark harness，恢复同轮 Rust/C++ 对照 | `crates/xlog/examples/bench_backend.rs`、`scripts/xlog/*`、`crates/xlog-sys/*` | 目标：不依赖历史产物，直接产出同参数 A/B 数据 |
+| 已完成 | `AppenderEngine` async flush worker 改为 busy 时 `try_lock + requeue` | `crates/xlog-core/src/appender_engine.rs` | `cargo test -p mars-xlog-core --test async_engine -- --nocapture` 通过 |
+| 已完成 | 恢复独立 C++ backend benchmark harness，并补齐 threaded benchmark 入口 | `crates/xlog/Cargo.toml`、`crates/xlog/src/backend/mod.rs`、`crates/xlog/examples/bench_backend.rs`、`scripts/xlog/run_phase5_regression.sh` | `cargo check -p mars-xlog --example bench_backend --no-default-features --features rust-backend/cpp-backend` 通过；见 `20260306-p0p1wave/results_smoke.jsonl` |
+| 进行中 | 继续减少 sync 轮转边界的 metadata/path 探测 | `crates/xlog-core/src/file_manager.rs` | 目标：提升 sync 吞吐稳定性 |
+| 待执行 | 把同轮 Rust/C++ threaded smoke 扩展为多轮统计基准 | `crates/xlog/examples/bench_backend.rs`、`scripts/xlog/*` | 目标：形成稳定 A/B 结论，而不只是 smoke |
 
 已从主计划移除（不再进入当前实现排期）：
 

@@ -45,36 +45,37 @@
 - `mars-xlog-uniffi` / `oh-xlog`：依赖 `mars-xlog` 先发布到 crates.io（当前 dry-run 因索引无该包失败）。
 - `mars-xlog-sys`：legacy FFI crate 的打包验证仍依赖仓库外路径（`third_party/mars`），需单独整改；不阻塞 Rust 主链路发布。
 
-## 5. 性能优化深层 Review (2026-03-06)
+## 5. 性能优化深层 Review (2026-03-06，已结合本轮实现更新)
 
 针对当前 Rust 版本的性能表现（Sync 吞吐 34.9%，Async 吞吐 43.1%，p99 延迟较高），结合 `xlog-core` / `xlog` 与 C++ `mars/xlog` 当前实现，对上一轮“性能优化想法”做进一步筛选。结论不是“想法越多越好”，而是只保留真正符合当前瓶颈、且不破坏既有协议与恢复语义的实现项。
 
-### 5.1 明确有价值，进入下一轮实现
+### 5.1 已验证有价值，并已落地
 
 1. **[AppenderEngine / Buffer] Async flush 路径继续压缩复制与清零**
-   - 这条是高价值项。当前异步热路径虽然已经从“每条日志重建完整 pending block”收敛为增量 mmap 更新，但 `flush_pending_locked` 仍会把整个已用 mmap 区间复制到新 `Vec`，随后再对整个缓冲区执行清空。这会直接放大 async 的长尾延迟。
-   - 下一步应继续把 flush 路径改成“优先复用 mmap 已有字节视图，只在 pending block 缺尾标记时做最小补齐”，并把 clear 从“整段 mmap 清零”收敛为“仅处理已用区间”。
-   - 这条优化不改协议、不改恢复规则，只减少热路径内存复制和写放大。
+   - 这条已经落地。`flush_pending_locked` 不再走整段 `take_all + clear`，而是优先复用 mmap 已有字节视图，只在 pending block 缺尾标记时做最小补齐，并把 clear 收敛为已用区间。
+   - 结论成立：这是有效的实现层优化，不改协议、不改恢复规则，只减少热路径复制和写放大。
 
 2. **[FileManager] 按目录/按天缓存 append target，减少热路径目录扫描**
-   - 这条也是高价值项。当前 `append_log_bytes` 进入 `select_append_path -> make_path_for_time -> next_file_index` 时，仍然会在边界条件下触发 `fs::read_dir`、`fs::metadata` 和路径重新选择。
-   - C++ 路径的核心优势不是“逻辑不同”，而是 `logfile_` 和当天文件状态是长寿命的；Rust 下一步应补齐按目录/按天的 append target cache，把 steady-state 写入从“每次重新探测”改成“跨天、超 size、写失败时才失效重建”。
-   - 这条优化直接针对 sync 仍明显落后 C++ 的主因，优先级高于继续做零碎的 formatter 微调。
+   - 这条也已经落地当前一阶段：steady-state 已有按目录/按天的 append target cache，并补上活跃 cache 文件 fast path，热路径不再每次重新 `read_dir / metadata / path-select`。
+   - 结论仍然成立：这条直接命中 sync 明显落后 C++ 的主因，收益高于继续做零碎 formatter 微调。
 
-3. **[Buffer / Crypto] 重写后的值钱部分：收敛 finalize/flush 阶段的额外复制**
-   - 原始提法里把重点放在 `crypt_tail` 上，这个判断不够准确。`crypt_tail` 复制确实存在，但它最多只覆盖零碎尾字节，并不是当前吞吐和 p99 的主矛盾。
-   - 真正值得继续做的是：flush/finalize 过程中避免把整段 pending 内容再次拼装成新 `Vec`，以及继续收敛 `buffer` 在废弃/回收场景下的零填充范围。
-   - 这条仍属于“高价值，但优先级略低于前两项”。
+3. **[Benchmark Harness] 恢复同轮 Rust/C++ 对照能力**
+   - 这条本轮也已落地。benchmark example 已支持 compile-time Rust/C++ backend 选择，并补齐 `--threads`、`--flush-every` 等参数；同轮 threaded smoke 也已经恢复。
+   - 这让后续性能结论不再完全依赖历史基线，而能直接基于同参数 A/B。
 
-### 5.2 有一定价值，但要先做 profiling 再决定
+### 5.2 仍有价值，但要先做 profiling 再决定
 
-1. **[Atomic / Lock-free] 细化部分计数器到锁外**
-   - 方向本身没问题，但不能把它误判成当前主瓶颈。`EngineState` 的主要成本并不在单个计数器自增，而在 buffer 一致性、flush 生命周期和文件 IO 这几个必须串行的关键区。
-   - 可以在前两项落地后，再通过 profiling 判断 `async_pending_updates_since_persist`、`pending_async_flush` 等状态是否值得进一步拆成独立 `Atomic`。
+1. **[AppenderEngine::state] 继续收窄 engine 串行区**
+   - 本轮已经先做了低风险版本：后台 async flush 在 state 忙时改为 `try_lock + requeue`，避免 worker 在热写入期间长时间阻塞。
+   - 但 `EngineState` 仍保留必要串行区。是否继续往更细的状态拆分推进，要以新的 threaded benchmark/profiling 为前提。
 
 2. **[SIMD] TEA / 压缩指令级加速**
    - 这条只在特定配置下才可能明显收益，例如启用了 crypt，或者压缩路径确实在 profile 中占主导。
    - 在当前阶段，先没有证据表明它比减少内存复制、减少目录扫描更值钱，因此只保留为实验项，不进入当前主线。
+
+3. **[FileManager] 继续减少轮转边界和 cache/log 切换边界探测**
+   - 这条仍然值钱，但已经从“热路径每次都探测”收敛为“主要集中在边界时刻的探测”。
+   - 下一步应继续把边界上的 `metadata / read_dir / path-select` 探测压缩到更少的失效点，而不是重新改大结构。
 
 ### 5.3 当前价值不高，暂不进入主线
 
@@ -94,11 +95,18 @@
    - 这条平台相关性太强，而且会引入额外运维与权限复杂度。
    - 在当前还没有证明 Worker 线程被调度饿死之前，不进入主线。
 
-### 5.4 本轮结论
+### 5.4 当前结论
 
-下一轮主线只做两件事：
+这轮已经完成的主线项：
 
 1. AppenderEngine / PersistentBuffer：去掉 async flush 路径的整段 `take_all + clear`。
-2. FileManager：引入按目录/按天的 append target cache，减少 `read_dir / metadata / path-select`。
+2. FileManager：引入按目录/按天的 append target cache，并补上活跃 cache 文件 fast path。
+3. benchmark：恢复 compile-time Rust/C++ backend harness，并支持 threaded smoke。
+4. AppenderEngine：后台 async flush 在 busy state 时改为 `try_lock + requeue`。
+
+下一步只保留两类内容：
+
+1. sync 边界探测继续收敛。
+2. 基于新的 threaded benchmark，对 `AppenderEngine::state` 是否继续拆分做 profiling 决策。
 
 其余优化想法保留在文档中，但默认视为“实验项”或“后置项”，不再并行扩散实现范围。
