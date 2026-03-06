@@ -138,6 +138,8 @@ benchmark 的角色应拆成两层：
    - rotate（小文件尺寸触发）
    - cache write route
    - `move_old_cache_files`
+   - `flush_via_delete_expired`
+   - `delete_expired_files`
 
 这意味着 benchmark 体系已经不再只有端到端吞吐对比，也开始具备初步归因能力。
 
@@ -222,7 +224,7 @@ benchmark 的角色应拆成两层：
 
 1. formatter / record-build 更细粒度拆分
 2. compress / crypto 组合矩阵系统化
-3. 文件 I/O 路径已补齐第一版微基准，但仍需补充 `delete_expired_files`、更细粒度 flush route 与资源指标
+3. 文件 I/O 路径已补齐第二版微基准，但仍需补充资源指标与更细粒度子阶段拆分
 
 ### 4.4 矩阵治理还没有完全成型
 
@@ -345,6 +347,6 @@ benchmark 体系达到“可信基线 + 基本可归因”至少需要满足：
 
 仍未完成（下一阶段重点）：
 
-1. 文件 I/O 微基准第二阶段：补 `delete_expired_files`、flush 子路径与资源指标
+1. 文件 I/O 微基准第三阶段：补资源指标（CPU/IO/内存）与更细粒度子阶段
 2. 真实业务分布回放数据集接入（当前仍以合成 profile 为主）
 3. CI 周期化策略固化（各矩阵频率、规模上限、阻断阈值）

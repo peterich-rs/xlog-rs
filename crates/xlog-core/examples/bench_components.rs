@@ -2,8 +2,9 @@ use std::env;
 use std::fs;
 use std::hint::black_box;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use filetime::{set_file_mtime, FileTime};
 use mars_xlog_core::compress::{
     decompress_raw_zlib, decompress_zstd_frames, StreamCompressor, ZlibStreamCompressor,
     ZstdChunkCompressor, ZstdStreamCompressor,
@@ -29,7 +30,7 @@ Targets:
 Options:
   --iterations <n>   Iterations per benchmark (default: 100000)
   --payload-size <n> Payload size in bytes (default: 256)
-  --io-iterations <n> Iterations for file I/O path benchmarks (default: min(iterations, 5000))
+  --io-iterations <n> Iterations for file I/O path benchmarks (default: min(iterations, 2000))
 ";
 
 #[derive(Copy, Clone)]
@@ -142,7 +143,7 @@ fn parse_args() -> Result<Options, String> {
     if payload_size == 0 {
         return Err("--payload-size must be > 0".to_string());
     }
-    let io_iterations = io_iterations.unwrap_or(iterations.min(5_000)).max(1);
+    let io_iterations = io_iterations.unwrap_or(iterations.min(2_000)).max(1);
 
     Ok(Options {
         target,
@@ -377,7 +378,9 @@ fn run_io(opts: &Options) -> Result<(), String> {
         false,
         true,
     )?;
+    bench_flush_via_delete_expired_variant(opts, payload.as_slice())?;
     bench_move_old_cache_files_variant(opts, payload.as_slice())?;
+    bench_delete_expired_files_variant(opts, payload.as_slice())?;
     Ok(())
 }
 
@@ -505,9 +508,10 @@ fn bench_move_old_cache_files_variant(opts: &Options, payload: &[u8]) -> Result<
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
+    let rounds = opts.io_iterations.min(1_000).max(1);
     let mut input_bytes = 0usize;
     let start = Instant::now();
-    for idx in 0..opts.io_iterations {
+    for idx in 0..rounds {
         let path = cache_dir.join(format!("bench-move-{idx}.xlog"));
         fs::write(&path, payload).map_err(|e| format!("{variant} seed file write failed: {e}"))?;
         input_bytes = input_bytes.saturating_add(payload.len());
@@ -527,12 +531,123 @@ fn bench_move_old_cache_files_variant(opts: &Options, payload: &[u8]) -> Result<
         "io",
         variant,
         opts.payload_size,
-        opts.io_iterations,
+        rounds,
         elapsed.as_secs_f64() * 1000.0,
         input_bytes,
         output_bytes,
         ratio,
     );
+    Ok(())
+}
+
+fn bench_flush_via_delete_expired_variant(opts: &Options, payload: &[u8]) -> Result<(), String> {
+    let variant = "flush_via_delete_expired";
+    let root = TempDir::new().map_err(|e| format!("{variant} temp dir: {e}"))?;
+    let log_dir = root.path().join("logs");
+    let cache_dir = root.path().join("cache");
+    let manager = FileManager::new(
+        log_dir.clone(),
+        Some(cache_dir.clone()),
+        "bench".to_string(),
+        1,
+    )
+    .map_err(|e| format!("{variant} file manager init: {e}"))?;
+
+    let rounds = opts.io_iterations.min(1_000).max(1);
+    let max_file_size = (payload.len().max(64) as u64).saturating_mul(1024 * 1024);
+    let start = Instant::now();
+    for _ in 0..rounds {
+        manager
+            .append_log_bytes(payload, max_file_size, false, true)
+            .map_err(|e| format!("{variant} append failed: {e}"))?;
+        manager
+            .delete_expired_files(365 * 24 * 60 * 60)
+            .map_err(|e| format!("{variant} flush route failed: {e}"))?;
+    }
+    let elapsed = start.elapsed();
+
+    let input_bytes = payload.len().saturating_mul(rounds);
+    let output_bytes = total_size_under(&log_dir).saturating_add(total_size_under(&cache_dir));
+    let ratio = if input_bytes == 0 {
+        0.0
+    } else {
+        output_bytes as f64 / input_bytes as f64
+    };
+    emit_result(
+        "io",
+        variant,
+        opts.payload_size,
+        rounds,
+        elapsed.as_secs_f64() * 1000.0,
+        input_bytes,
+        output_bytes,
+        ratio,
+    );
+    Ok(())
+}
+
+fn bench_delete_expired_files_variant(opts: &Options, payload: &[u8]) -> Result<(), String> {
+    let variant = "delete_expired_files";
+    let root = TempDir::new().map_err(|e| format!("{variant} temp dir: {e}"))?;
+    let log_dir = root.path().join("logs");
+    let cache_dir = root.path().join("cache");
+    let manager = FileManager::new(
+        log_dir.clone(),
+        Some(cache_dir.clone()),
+        "bench".to_string(),
+        1,
+    )
+    .map_err(|e| format!("{variant} file manager init: {e}"))?;
+
+    let seed_files = opts.io_iterations.min(512).max(1);
+    for idx in 0..seed_files {
+        let log_path = log_dir.join(format!("bench-expired-log-{idx}.xlog"));
+        let cache_path = cache_dir.join(format!("bench-expired-cache-{idx}.xlog"));
+        create_old_file(&log_path, payload, variant)?;
+        create_old_file(&cache_path, payload, variant)?;
+    }
+
+    // Seed one active keep-open append so delete path also covers active flush.
+    let max_file_size = (payload.len().max(64) as u64).saturating_mul(1024 * 1024);
+    manager
+        .append_log_bytes(payload, max_file_size, false, true)
+        .map_err(|e| format!("{variant} active append failed: {e}"))?;
+
+    let start = Instant::now();
+    manager
+        .delete_expired_files(1)
+        .map_err(|e| format!("{variant} delete failed: {e}"))?;
+    let elapsed = start.elapsed();
+
+    let logical_ops = seed_files.saturating_mul(2).saturating_add(1);
+    let input_bytes = payload.len().saturating_mul(logical_ops);
+    let output_bytes = total_size_under(&log_dir).saturating_add(total_size_under(&cache_dir));
+    let ratio = if input_bytes == 0 {
+        0.0
+    } else {
+        output_bytes as f64 / input_bytes as f64
+    };
+    emit_result(
+        "io",
+        variant,
+        opts.payload_size,
+        logical_ops,
+        elapsed.as_secs_f64() * 1000.0,
+        input_bytes,
+        output_bytes,
+        ratio,
+    );
+    Ok(())
+}
+
+fn create_old_file(path: &Path, payload: &[u8], variant: &str) -> Result<(), String> {
+    fs::write(path, payload).map_err(|e| format!("{variant} seed file write failed: {e}"))?;
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("{variant} system time error: {e}"))?
+        .as_secs() as i64;
+    let old = FileTime::from_unix_time(now_secs.saturating_sub(2 * 60 * 60), 0);
+    set_file_mtime(path, old).map_err(|e| format!("{variant} set mtime failed: {e}"))?;
     Ok(())
 }
 
