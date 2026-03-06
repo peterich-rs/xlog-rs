@@ -518,7 +518,9 @@ impl RustBackend {
             CompressMode::Zstd => CompressionKind::Zstd,
         };
         let compressor = match self.config.compress_mode {
-            CompressMode::Zlib => AsyncCompressor::Zlib(ZlibStreamCompressor::default()),
+            CompressMode::Zlib => {
+                AsyncCompressor::Zlib(ZlibStreamCompressor::new(self.config.compress_level))
+            }
             CompressMode::Zstd => {
                 AsyncCompressor::Zstd(ZstdStreamCompressor::new(self.config.compress_level).ok()?)
             }

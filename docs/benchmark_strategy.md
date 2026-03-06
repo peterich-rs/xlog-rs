@@ -10,6 +10,70 @@
 
 迁移评审文档只保留项目级结论，不再重复承载完整 benchmark 设计细节。
 
+## 1.1 最近实现进展（2026-03-06）
+
+本次实现已补齐一批文档里定义的扩展项，重点如下：
+
+1. 端到端 benchmark 入口扩展
+   - `crates/xlog/examples/bench_backend.rs` 新增 `compress-level / pub-key / warmup / time-buckets / json-pretty`
+   - 新增 `payload_profile`（`compressible / semi_structured / human_text / high_entropy`）与 `payload_seed`
+   - 输出指标补齐为 `lat_min / avg / stdev / p50 / p95 / p99 / p999 / max`、`output_bytes`、`bytes_per_msg`、timeline bucket
+2. 诊断层微基准入口落地
+   - 新增 `crates/xlog-core/examples/bench_components.rs`
+   - 覆盖 `zlib stream level 6/9`、`zstd stream/chunk`、`TEA encrypt`、`ECDH derive`、`formatter` 相关基准
+3. manifest-driven runner 增强
+   - `scripts/xlog/run_bench_matrix.sh` 新增 backend 顺序策略：`fixed / alternating / randomized`
+   - `randomized` 支持 seed，默认记录到 metadata，便于复现
+   - `metadata.json` 扩展了 CPU 型号、内存总量、OS 版本、governor/频率策略、`rustc/cargo` 版本、manifest hash
+4. 矩阵分层落地
+   - 新增 `scripts/xlog/bench_matrix_baseline.tsv`
+   - 新增 `scripts/xlog/bench_matrix_stress.tsv`
+   - 新增 `scripts/xlog/bench_matrix_feature.tsv`
+   - `scripts/xlog/bench_matrix.tsv` 保留为综合矩阵，并显式标注为 legacy all-in-one
+
+## 1.2 最新双端全量结果摘要（2026-03-06）
+
+数据来源：
+
+1. 全量矩阵目录：`artifacts/bench-compare/20260306-full-matrix-latest`
+2. 场景规模：`31 scenarios × 2 backends × 1 run = 62` 条 raw 结果
+3. 完整性：`failures = 0`
+
+对比口径（Rust/CPP）：
+
+1. 吞吐更优场景：`20 / 31`（`64.5%`）
+2. 平均延迟更优场景：`20 / 31`（`64.5%`）
+3. P99 更优场景：`12 / 31`（`38.7%`）
+4. P999 更优场景：`12 / 31`（`38.7%`）
+
+按分层矩阵（几何均值，ratio < 1 表示 Rust 延迟/体积更低）：
+
+1. baseline（10 场景）
+   - throughput ratio gmean: `1.456`
+   - p99 ratio gmean: `1.384`
+   - p999 ratio gmean: `1.129`
+2. stress（10 场景）
+   - throughput ratio gmean: `1.484`
+   - p99 ratio gmean: `0.789`
+   - p999 ratio gmean: `0.934`
+3. feature（11 场景）
+   - throughput ratio gmean: `1.089`
+   - p99 ratio gmean: `2.688`
+   - p999 ratio gmean: `1.980`
+
+关键结论：
+
+1. Rust 在吞吐与均值延迟上整体领先，但 async 特性路径存在明显 tail 风险，尤其 flush / zstd / 4t+ 场景。
+2. sync 压力与 boundary/cache 场景 Rust 优势明显，且 tail 也有显著改善。
+3. feature 矩阵目前是主要风险区，后续优化优先级应放在 async tail 收敛而不是继续扩大吞吐峰值。
+
+不提交全量产物的落地策略：
+
+1. 仓库内仅保留分析脚本与结论摘要文档。
+2. 大体量 benchmark 原始产物继续放在本地 artifacts 或外部制品系统，不进 git。
+3. 每次重跑后更新本节关键汇总值即可满足回归审查。
+4. 统一使用 `python3 scripts/xlog/analyze_bench.py --root <artifact_dir>` 生成汇总报告与对比表。
+
 ## 2. 当前判断
 
 当前 benchmark 体系已经比 `artifacts/bench-compare/20260306-harness-matrix-rerun` 阶段完整得多，但仍然不能直接视为“性能归因体系已经完成”。
@@ -76,16 +140,16 @@ benchmark 的角色应拆成两层：
 
 `scripts/xlog/run_bench_matrix.sh` 与 `scripts/xlog/bench_matrix.tsv` 已经把端到端场景从固定脚本参数推进到 manifest-driven 运行。
 
-当前 manifest 已覆盖 `24` 个场景，主要维度包括：
+当前综合 manifest 已覆盖 `31` 个场景，主要维度包括：
 
 1. backend
    - Rust / C++
 2. mode
    - async / sync
 3. thread sweep
-   - 1 / 2 / 4 / 8
+   - 1 / 4 / 8
 4. message size
-   - 16B / 96B / 512B / 4096B
+   - 96B / 128B / 4096B（并覆盖特定功能场景）
 5. compress
    - zlib level 6
    - zlib level 9
@@ -107,7 +171,7 @@ benchmark 的角色应拆成两层：
 
 当前 runner 已补上的可信度治理包括：
 
-1. Rust / C++ backend 顺序按 scenario 和 run 交替执行，避免固定 `rust -> cpp`
+1. Rust / C++ backend 顺序支持 `fixed / alternating / randomized`，并可记录 seed 便于复现
 2. `results_raw.jsonl` 记录 `scenario / backend / run_index / run_dir`
 3. `metadata.json` 记录时间、主机、CPU、git commit、branch、build profile、manifest、backend policy
 
@@ -117,19 +181,20 @@ benchmark 的角色应拆成两层：
 
 ### 4.1 可信基线仍有缺口
 
-1. 当前 backend 顺序治理只做到交替执行，还没有做真正随机化或更严格的冷热隔离
-2. `metadata.json` 已落地，但环境信息还不够完整
-   - CPU 型号
-   - 内存规模
-   - governor / 频率策略
-   - 操作系统版本细项
+1. backend 顺序策略虽然已支持 `randomized`，但默认策略与冷热隔离规约尚未标准化（例如 PR/CI 场景是否强制随机顺序）
+2. `metadata.json` 已包含 CPU/内存/OS/rustc/cargo 等信息，但硬件负载与运行态信息仍不足
+   - 后台负载快照
+   - 温控/频率波动窗口
+   - 磁盘可用空间与 I/O 压力
 3. 结果目录已有 `manifest/raw/summary/metadata/log`，但跨运行对比模板和稳定命名约定还需要继续固化
 
 这意味着结果已经比旧脚本可信得多，但环境偏差治理还没有完全收口。
 
 ### 4.2 数据分布仍偏合成
 
-当前矩阵已经补了 size sweep、compress、crypto 和 flush 维度，但 payload profile 还没有正式拆成独立数据模型。
+当前矩阵已经补了 size sweep、compress、crypto 和 flush 维度，且 payload profile 已经落地 `compressible / semi_structured / human_text / high_entropy` 四类。
+
+但“数据分布治理完成”仍然不能算达标，原因是这些 profile 目前仍以规则化生成为主，尚未引入真实业务分布回放。
 
 仍待补齐的核心数据形态：
 
@@ -156,13 +221,13 @@ benchmark 的角色应拆成两层：
 
 ### 4.4 矩阵治理还没有完全成型
 
-当前 `bench_matrix.tsv` 还是一个综合矩阵，尚未正式拆成：
+矩阵已经完成第一步分层，当前已提供：
 
 1. `baseline_matrix`
 2. `stress_matrix`
 3. `feature_matrix`
 
-这会导致同一个 manifest 同时承担日常回归、阶段压测和功能专项验证三类职责，规模与频率都不够清晰。
+当前剩余问题是运行频率、规模上限和 CI 接入策略还需要继续固化，否则分层会停留在“文件拆分”而不是“治理闭环”。
 
 ## 5. 后续推进顺序
 
@@ -230,6 +295,28 @@ benchmark 后续按以下顺序推进。
    - 管端到端 benchmark 入口
 5. `crates/xlog-core/examples/bench_components.rs`
    - 管诊断层微基准入口
+6. `scripts/xlog/analyze_bench.py`
+   - 管单次 benchmark 结果聚合与统计摘要
+7. `scripts/xlog/check_bench_regression.py`
+   - 管双运行结果对比与阈值回归判定
+8. `scripts/xlog/bench_regression_thresholds.json`
+   - 管 baseline/stress/feature 分层阈值
+
+## 6.1 标准运行流程（建议）
+
+1. 跑矩阵（示例：全量双端）
+   - `scripts/xlog/run_bench_matrix.sh --manifest scripts/xlog/bench_matrix.tsv --out-root <current_root> --backends rust,cpp --runs 1 --components`
+2. 跑单次分析
+   - `python3 scripts/xlog/analyze_bench.py --root <current_root>`
+3. 跑回归判定（对比上一次基线）
+   - `python3 scripts/xlog/check_bench_regression.py --baseline-root <baseline_root> --current-root <current_root> --backend rust`
+4. 更新文档基线摘要（只保留核心统计与结论，不提交原始产物）
+
+说明：
+
+1. `check_bench_regression.py` 默认按层使用阈值：`baseline/stress/feature`，配置在 `bench_regression_thresholds.json`
+2. 如需在 CI 中阻断回归，保持默认行为即可（有回归时退出码 `2`）
+3. 如需先观察不阻断，可加 `--allow-regressions`
 
 ## 7. 退出条件
 
@@ -240,3 +327,19 @@ benchmark 体系达到“可信基线 + 基本可归因”至少需要满足：
 3. payload profile 不再只有规则化合成文本
 4. baseline / stress / feature 三类矩阵边界清晰
 5. 关键热点已有对应微基准，而不是只靠端到端吞吐猜测
+
+## 8. 当前完成度快照（2026-03-06）
+
+已完成：
+
+1. 端到端 runner 的 manifest/raw/summary/metadata 稳定输出
+2. backend 顺序策略（`fixed/alternating/randomized`）与 seed 记录
+3. payload profile 四分类落地
+4. baseline/stress/feature 矩阵拆分
+5. 单次分析脚本与跨运行回归判定脚本落地
+
+仍未完成（下一阶段重点）：
+
+1. file manager / appender engine / flush-route / rotate-route 的独立微基准
+2. 真实业务分布回放数据集接入（当前仍以合成 profile 为主）
+3. CI 周期化策略固化（各矩阵频率、规模上限、阻断阈值）

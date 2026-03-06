@@ -1,0 +1,12 @@
+# Stress matrix: larger thread/sizing pressure and intensive flush/cache scenarios.
+# Columns: scenario	messages	mode	threads	compress	compress_level	msg_size	flush_every	cache_days	max_file_size	pub_key	warmup	time_buckets	payload_profile	payload_seed
+async_8t_dense	200000	async	8	zlib	6	96	0	0	0		2000	24	semi_structured	20260306
+async_8t_flush64	200000	async	8	zlib	6	96	64	0	0		2000	24	semi_structured	20260306
+async_4t_large_entropy	120000	async	4	zlib	6	4096	0	0	0		1000	16	high_entropy	20260306
+async_4t_large_human	120000	async	4	zlib	6	4096	0	0	0		1000	16	human_text	20260306
+sync_8t_dense	140000	sync	8	zlib	6	96	0	0	0		2000	24	semi_structured	20260306
+sync_8t_rotate	140000	sync	8	zlib	6	96	0	0	4096		2000	24	semi_structured	20260306
+sync_8t_cache	140000	sync	8	zlib	6	96	0	1	0		2000	24	semi_structured	20260306
+sync_8t_boundary	140000	sync	8	zlib	6	96	0	1	4096		2000	24	compressible	20260306
+sync_4t_large_entropy	100000	sync	4	zlib	6	4096	0	0	0		1000	16	high_entropy	20260306
+sync_4t_large_human	100000	sync	4	zlib	6	4096	0	0	0		1000	16	human_text	20260306

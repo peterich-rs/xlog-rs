@@ -26,12 +26,19 @@ pub struct ZlibStreamCompressor {
     emitted: usize,
 }
 
-impl Default for ZlibStreamCompressor {
-    fn default() -> Self {
+impl ZlibStreamCompressor {
+    pub fn new(level: i32) -> Self {
+        let level = level.clamp(0, 9) as u32;
         Self {
-            inner: flate2::write::DeflateEncoder::new(Vec::new(), Compression::best()),
+            inner: flate2::write::DeflateEncoder::new(Vec::new(), Compression::new(level)),
             emitted: 0,
         }
+    }
+}
+
+impl Default for ZlibStreamCompressor {
+    fn default() -> Self {
+        Self::new(9)
     }
 }
 

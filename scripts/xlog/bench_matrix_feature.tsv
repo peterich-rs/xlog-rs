@@ -1,0 +1,13 @@
+# Feature matrix: focused validation for compression, crypto, and cache/rotate routes.
+# Columns: scenario	messages	mode	threads	compress	compress_level	msg_size	flush_every	cache_days	max_file_size	pub_key	warmup	time_buckets	payload_profile	payload_seed
+async_1t_zlib6	100000	async	1	zlib	6	96	0	0	0		1000	0	compressible	20260306
+async_1t_zlib9	100000	async	1	zlib	9	96	0	0	0		1000	0	compressible	20260306
+async_1t_zstd3	100000	async	1	zstd	3	96	0	0	0		1000	0	compressible	20260306
+async_4t_zstd3	120000	async	4	zstd	3	96	0	0	0		1000	20	compressible	20260306
+async_1t_crypto	100000	async	1	zlib	6	96	0	0	0	79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8	1000	0	semi_structured	20260306
+async_4t_crypto	120000	async	4	zlib	6	96	0	0	0	79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8	1000	20	semi_structured	20260306
+async_4t_flush1024	120000	async	4	zlib	6	96	1024	0	0		1000	20	semi_structured	20260306
+sync_4t_rotate_only	100000	sync	4	zlib	6	96	0	0	4096		1000	0	compressible	20260306
+sync_4t_cache_only	100000	sync	4	zlib	6	96	0	1	0		1000	0	compressible	20260306
+sync_4t_zlib9	100000	sync	4	zlib	9	96	0	0	0		1000	20	semi_structured	20260306
+sync_1t_zstd3	80000	sync	1	zstd	3	96	0	0	0		1000	0	semi_structured	20260306

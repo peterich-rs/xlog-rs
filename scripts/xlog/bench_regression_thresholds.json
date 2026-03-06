@@ -1,0 +1,32 @@
+{
+  "default": {
+    "throughput_drop_pct": 8.0,
+    "avg_increase_pct": 20.0,
+    "p99_increase_pct": 35.0,
+    "p999_increase_pct": 50.0,
+    "bytes_increase_pct": 20.0
+  },
+  "layers": {
+    "baseline": {
+      "throughput_drop_pct": 5.0,
+      "avg_increase_pct": 15.0,
+      "p99_increase_pct": 25.0,
+      "p999_increase_pct": 35.0,
+      "bytes_increase_pct": 15.0
+    },
+    "stress": {
+      "throughput_drop_pct": 8.0,
+      "avg_increase_pct": 20.0,
+      "p99_increase_pct": 35.0,
+      "p999_increase_pct": 50.0,
+      "bytes_increase_pct": 20.0
+    },
+    "feature": {
+      "throughput_drop_pct": 12.0,
+      "avg_increase_pct": 30.0,
+      "p99_increase_pct": 50.0,
+      "p999_increase_pct": 80.0,
+      "bytes_increase_pct": 25.0
+    }
+  }
+}

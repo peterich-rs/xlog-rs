@@ -1,3 +1,0 @@
-{"backend":"rust","messages":20000,"elapsed_ms":77.913,"throughput_mps":256697.395,"lat_avg_ns":3778.020,"lat_p50_ns":2792,"lat_p95_ns":4541,"lat_p99_ns":35375}
-{"backend":"rust","messages":20000,"elapsed_ms":78.575,"throughput_mps":254534.827,"lat_avg_ns":3809.205,"lat_p50_ns":2792,"lat_p95_ns":4541,"lat_p99_ns":39125}
-{"backend":"rust","messages":20000,"elapsed_ms":77.002,"throughput_mps":259735.058,"lat_avg_ns":3729.282,"lat_p50_ns":2791,"lat_p95_ns":4541,"lat_p99_ns":34750}

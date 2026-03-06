@@ -1,3 +1,0 @@
-{"backend":"cpp","messages":20000,"threads":1,"flush_every":0,"elapsed_ms":35.861,"throughput_mps":557703.100,"lat_avg_ns":1654.534,"lat_p50_ns":1334,"lat_p95_ns":4708,"lat_p99_ns":6167}
-{"backend":"cpp","messages":20000,"threads":1,"flush_every":0,"elapsed_ms":35.632,"throughput_mps":561287.974,"lat_avg_ns":1644.536,"lat_p50_ns":1333,"lat_p95_ns":4667,"lat_p99_ns":6041}
-{"backend":"cpp","messages":20000,"threads":1,"flush_every":0,"elapsed_ms":35.553,"throughput_mps":562545.717,"lat_avg_ns":1631.281,"lat_p50_ns":1333,"lat_p95_ns":4500,"lat_p99_ns":5833}

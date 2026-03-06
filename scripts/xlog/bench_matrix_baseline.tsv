@@ -1,0 +1,12 @@
+# Baseline matrix: daily/PR regression set focused on signal stability.
+# Columns: scenario	messages	mode	threads	compress	compress_level	msg_size	flush_every	cache_days	max_file_size	pub_key	warmup	time_buckets	payload_profile	payload_seed
+async_1t	100000	async	1	zlib	6	96	0	0	0		1000	20	semi_structured	20260306
+async_4t	120000	async	4	zlib	6	96	0	0	0		1000	20	semi_structured	20260306
+async_4t_flush256	120000	async	4	zlib	6	96	256	0	0		1000	20	semi_structured	20260306
+async_1t_human	100000	async	1	zlib	6	128	0	0	0		1000	0	human_text	20260306
+async_1t_entropy	100000	async	1	zlib	6	128	0	0	0		1000	0	high_entropy	20260306
+sync_1t	80000	sync	1	zlib	6	96	0	0	0		1000	20	semi_structured	20260306
+sync_4t	100000	sync	4	zlib	6	96	0	0	0		1000	20	semi_structured	20260306
+sync_4t_boundary	100000	sync	4	zlib	6	96	0	1	4096		1000	0	compressible	20260306
+sync_1t_human	80000	sync	1	zlib	6	128	0	0	0		1000	0	human_text	20260306
+sync_1t_entropy	80000	sync	1	zlib	6	128	0	0	0		1000	0	high_entropy	20260306
