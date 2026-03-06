@@ -1,501 +1,278 @@
-# mars-xlog-core 深度性能审查报告
+# mars-xlog-core 深度性能与正确性审查
 
 > 审查日期: 2026-03-06
-> 审查范围: `crates/xlog-core/` 全部 16 个源文件 + `crates/xlog/src/backend/rust.rs` 集成层
-> 审查视角: Rust 语言特性 × 计算机工程性能优化
+> 审查范围: `crates/xlog-core/` + `crates/xlog/src/backend/rust.rs`
+> benchmark 基线: `artifacts/bench-compare/20260306-harness-matrix-rerun`
 
----
+## 1. 当前结论
 
-## 一、关键热路径分析
+当前 Rust 实现的协议兼容、解码兼容、压缩/加密主路径和主要 benchmark 结果都已经收敛，但不能再把 `core` crate 描述为“只剩纯性能问题”。
 
-每次 `write` 调用的完整路径：
+这轮深度 review 的结论是：
 
-```
-Xlog::write
-  → RustBackend::write_with_meta_internal
-    → level check (AtomicI32 Relaxed load)
-    → resolve_record_meta (pid/tid/maintid)
-    → [Sync]  format → build_sync_block → engine.write_block → file_manager.append
-    → [Async] format → checkout_async_state(LOCK) → compress → encrypt → engine.append(LOCK) → maybe flush
-```
+1. 当前分支确实拿到了明显的性能改善，尤其是 `sync_1t`、`async_4t` 和最近的 `sync_4t` 定向 rerun。
+2. 但最近几轮性能优化里，已经出现了会影响语义边界的高风险点，主要集中在恢复路径零拷贝、文件所有权假设，以及若继续扩大会放大问题的 sync keep-open 路径。
+3. 项目级门槛仍然是 `语义级阻断项为 0`；当前 benchmark 改善不代表这条红线已经满足。
+4. 因此，当前主任务不是继续盲目追 benchmark，而是先把“哪些优化仍然语义安全”重新收口，再继续做实现层性能对齐。
 
-### Async 热路径锁序列
+一句话总结：
 
-```
-调用线程:
-  1. thread_local HOT_PATH_SCRATCH (RefCell borrow)      — 无竞争
-  2. format_record_parts_into()                            — 并行
-  3. async_state Mutex + Condvar (checkout)                 — 独占，串行点 ①
-     ├─ compress_chunk (流式压缩)
-     ├─ encrypt_async_in_place (TEA 加密)
-     └─ engine.state Mutex (buffer append)                 — 串行点 ②
-  4. release async_state → notify_one
+- 当前代码总体可用，benchmark 也不差。
+- 但 `core` 现在不是“无阻断问题的高性能稳定态”，而是“性能已接近目标、但存在几处必须明确处理的语义风险”。
+- 项目级红线与阻断项清单以 `docs/rust_semantic_redlines.md` 为准。
 
-后台 worker 线程:
-  5. engine.state Mutex (flush pending → file I/O)         — 串行点 ②
-```
+## 2. Benchmark 事实基线
 
-### Sync 热路径锁序列
+当前主基线仍应只看 `20260306-harness-matrix-rerun`：
 
-```
-调用线程:
-  1. thread_local HOT_PATH_SCRATCH                         — 无竞争
-  2. format + build_sync_block                             — 并行
-  3. engine.state Mutex (clone FileManager + max_file_size) — 短暂持有
-  4. FileManager.runtime Mutex (file I/O)                  — 串行点，持有期间执行文件写入
-```
+| scenario | rust / cpp | 结论 |
+| :--- | ---: | :--- |
+| `async_1t` | 81.0% | 仍有明显 fixed cost 和单线程 p99 问题 |
+| `async_4t` | 110.7% | Rust 已超过 C++，不是当前主瓶颈 |
+| `async_4t_flush256` | 97.3% | 已非常接近，需要谨慎归因 |
+| `sync_1t` | 111.7% | Rust 已领先 |
+| `sync_4t` | 81.8% | 主差距仍在多线程 steady-state |
+| `sync_4t_rotate_only` | 90.0% | 已接近 |
+| `sync_4t_cache_only` | 145.6% | Rust 已领先 |
+| `sync_4t_boundary` | 1120.7% | Rust 显著领先 |
 
----
+另外，当前分支已有一次定向 rerun 观察值：
 
-## 二、发现的性能问题
+- `sync_4t`: 约 `403,461.676 msg/s`
+- 对比当前 C++ 基线 `420,277.596 msg/s`
 
-### P0：关键瓶颈
+这说明：
 
-#### P0-1: Zlib 压缩级别硬编码为最高级别
+1. `FileManager` 热路径继续收缩锁职责，仍然是有效方向。
+2. 但性能数据本身不能替代语义审查，尤其是 sync/flush/durability 语义。
 
-**文件:** `crates/xlog-core/src/compress.rs:29-35`
+## 3. 当前热路径判断
 
-```rust
-impl Default for ZlibStreamCompressor {
-    fn default() -> Self {
-        Self {
-            inner: flate2::write::DeflateEncoder::new(Vec::new(), Compression::best()),
-            emitted: 0,
-        }
-    }
-}
-```
+### 3.1 Sync
 
-**问题:** `Compression::best()` = zlib level 9，是最慢的压缩级别。`XlogConfig.compress_level` 默认值为 6，但 `ZlibStreamCompressor::default()` 完全忽略了这个配置。zlib level 6 通常比 level 9 快 2-3 倍，压缩率仅损失 1-3%。
+当前 sync 热路径已经不再先争用 `engine.state` 来读取 `file_manager` 和 `max_file_size`。主要串行点已经收敛到：
 
-**调用链:** `RustBackend::new_async_pending_state` → `ZlibStreamCompressor::default()` — 永远使用 level 9。
+1. `format_record_parts_into`
+2. `AppenderEngine::write_block`
+3. `FileManager.runtime` 互斥区
 
-**优化方案:**
-- `ZlibStreamCompressor` 增加 `new(level: u32)` 构造方法
-- 在 `RustBackend::new_async_pending_state` 中传递 `config.compress_level`
+这个判断成立，也是最近 `sync_4t` 变好的直接原因。
 
-**预估收益:** Async 单线程写入速度提升 2-3 倍（压缩是 async 热路径中 CPU 占比最高的操作）。
+### 3.2 Async
 
----
+当前 async 路径的真实约束不是“同一把 mutex 长时间持有”，而是：
 
-#### P0-2: 流式压缩器双缓冲 (Double Buffering)
+1. `checkout_async_state()` 通过 `busy + Condvar` 维持单 pending-state 独占
+2. 压缩、加密和 engine append 期间，其他线程不能 checkout 新状态
+3. flush worker 仍然需要和前台线程共享 `engine.state`
 
-**文件:** `crates/xlog-core/src/compress.rs:38-64`, `crates/xlog-core/src/compress.rs:116-134`
+因此，async 的问题本质是单 pending-block 模型下的 fixed cost 与控制面抖动，而不是一个简单的“大 mutex”。
 
-```rust
-pub struct ZlibStreamCompressor {
-    inner: flate2::write::DeflateEncoder<Vec<u8>>,  // 内部缓冲 ①
-    emitted: usize,
-}
+## 4. 严重问题
 
-fn compress_chunk(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), CompressError> {
-    self.inner.write_all(input)?;
-    self.inner.flush()?;
-    let encoded = self.inner.get_ref();
-    if encoded.len() > self.emitted {
-        output.extend_from_slice(&encoded[self.emitted..]);  // 拷贝到外部缓冲 ②
-        self.emitted = encoded.len();
-    }
-    Ok(())
-}
-```
+以下问题按严重度排序，优先级高于继续追 benchmark。
 
-**问题:** 压缩后的数据经历两次缓冲：
+### S0-1: 恢复路径和 oneshot 零拷贝引入了 split-write framing 风险
 
-1. `DeflateEncoder` 写入其内部 `Vec<u8>` → 第一次缓冲
-2. 从 `self.emitted` 偏移拷贝到 `output` → 第二次缓冲（memcpy）
+相关位置：
 
-内部 `Vec<u8>` 在 pending block 生命周期内持续增长，不被释放。对于 150KB 的 buffer，压缩后数据可能占 50-100KB，全部累积在内部 Vec 中直到 block finalize。
+- `crates/xlog-core/src/appender_engine.rs`
+- `crates/xlog-core/src/oneshot.rs`
+- `crates/xlog-core/src/file_manager.rs`
 
-`ZstdStreamCompressor` 存在相同问题。
+当前针对 `recovered_pending_block` 的实现会把恢复数据和 `MAGIC_END` 拆成多段：
 
-**优化方案:**
-- 实现自定义 `Write` 适配器，让 `DeflateEncoder` 直接追加写入 `output` Vec
-- 通过 wrapper 追踪 emitted 位置，避免内部累积缓冲区
+1. `append_log_slices(&[recovered, &end], ...)`
+2. `FileManager` 再把这些 slice 逐段 `write_all`
 
-**预估收益:** 减少 50-100KB memcpy / pending block + 降低内存峰值。
+如果同一目标文件在这些 syscall 之间被其他进程追加：
 
----
+1. `recovered` 与 `MAGIC_END` 可能被第三方写入打断
+2. block framing 会损坏
+3. 这与项目已经显式支持的 “other process / oneshot flush” 场景是冲突的
 
-#### P0-3: mmap flush 使用同步 msync
+因此，`af3dd2c` 这类“恢复路径零拷贝”改动不是纯低风险优化。
 
-**文件:** `crates/xlog-core/src/mmap_store.rs:88-93`
+### S0-2: 本地缓存长度 + rollback 假设独占文件所有权
 
-```rust
-pub fn flush(&mut self) -> Result<(), MmapStoreError> {
-    self.mmap
-        .flush()
-        .map_err(|e| MmapStoreError::Flush(self.path.clone(), e))
-}
-```
+相关位置：
 
-**问题:** `MmapMut::flush()` 调用 `msync(MS_SYNC)`，是阻塞系统调用，强制脏页写入存储介质后才返回。在 async 的周期性持久化中（`should_persist_async_mmap` 触发，非 force_flush），使用同步 flush 会不必要地阻塞调用线程。
+- `crates/xlog-core/src/file_manager.rs`
 
-当前的持久化节流策略已经很合理：
+最近 sync/path 优化引入了：
 
-```rust
-const ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES: u32 = 32;
-const ASYNC_PENDING_MMAP_PERSIST_EVERY_BYTES: usize = 32 * 1024;
-const ASYNC_PENDING_MMAP_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
-```
+1. `active_file.logical_len / disk_len`
+2. `AppendTargetCache.local_len / merged_len`
+3. 写失败时的 `rollback_file_to_len`
 
-但每次触发时的 `msync(MS_SYNC)` 在移动设备 flash 存储上可能耗时 1-10ms。
+如果文件在本进程之外也被修改：
 
-**优化方案:**
-- `MmapStore` 增加 `flush_async()` 方法，调用 `self.mmap.flush_async()` (`msync(MS_ASYNC)`)
-- 在非强制持久化（`should_persist_async_mmap` 且 `!force_flush`）时使用 `flush_async`
-- 仅在 `force_flush=true`、shutdown、mode switch 时使用同步 `flush`
+1. 本地缓存长度可能落后于真实长度
+2. 之后一旦本进程发生写失败
+3. `rollback_file_to_len()` 可能把外部进程追加的数据一起截掉
 
-**预估收益:** 减少 async 写入路径中的 I/O 等待时间，尤其在 flash 存储设备上。
+如果项目明确假设“同一 `.xlog` 文件永远只由一个 writer 进程独占”，需要写进文档；如果不是，这就是语义风险。
 
----
+## 5. 当前共享语义边界
 
-#### P0-4: Async 状态锁持有范围过大
+下面这些点是真问题，但不应再表述成“Rust 偏离了当前 C++ 参考实现”。
 
-**文件:** `crates/xlog/src/backend/rust.rs:546-626`
+### C1: sync / fatal 不等价于每条日志立即落文件
 
-```rust
-fn write_async_line(&self, ...) {
-    with_hot_path_scratch(|scratch| {
-        self.format_record_line_into(&mut scratch.line, ...);  // 并行部分
+Rust 现在是显式 keep-open 用户态缓冲写；但 C++ 当前也是 keep-open 的 `FILE* + fwrite` / stdio buffering，sync 下 `FlushSync()` 仍是 no-op。  
+因此需要修正的是文档和语义叙述，而不是把这一点误记成 Rust 独有偏差。
 
-        let mut checked_out = self.checkout_async_state();  // ← 获取独占锁
+### C2: 清空 mmap 或删除 cache 之前没有建立稳定存储屏障
 
-        // 以下全部在锁内执行:
-        // - 流式压缩 (CPU 密集)
-        // - TEA 加密 (CPU 密集)
-        // - engine.append_async_chunk (获取 engine state 锁)
-        state.append_chunk(...);
+Rust 和 C++ 目前都没有在删除恢复源前建立 `sync_data` / `fsync` 级稳定存储保证。  
+这说明当前整套方案都存在 crash window；如果要把这项升级成强语义红线，就必须按双端共同改造处理。
 
-        // ← 锁在 checked_out drop 时释放
-    });
-}
-```
+## 6. 中等级风险与性能取舍
 
-`checkout_async_state` 使用 `Mutex + Condvar` 独占流式压缩器，锁的持有范围覆盖了 **压缩 + 加密 + engine buffer 追加**。这意味着多线程 async 写入在压缩/加密阶段完全串行化，无法利用多核并行。
+### S1-1: async mmap persist cadence 扩大了 crash-loss window
 
-**优化方案（短期）:**
-- 将锁的粒度细化：先在锁外做格式化，进入锁后只做压缩+加密+append
-- 当前实现已经在锁外做格式化，瓶颈在于压缩占锁时间长
+当前阈值：
 
-**优化方案（中期 - 架构调整）:**
-- 采用 per-thread pending block 方案：每线程维护独立的 compressor + pending state
-- flush 时将所有线程的 pending blocks 按序合并写入 mmap buffer
-- 这需要修改 async 协议模型，但可以完全消除压缩阶段的锁竞争
+- 每 `32` 次更新
+- 或每 `32 KiB`
+- 或每 `250 ms`
 
-**预估收益:** Async 4T 场景吞吐量可能提升 30-60%（取决于压缩占总延迟的比例）。
+这是明显的吞吐优化，但它不再等价于“每次 async 更新都尽快持久化到 mmap”。如果 async 语义定义为 best-effort，这个取舍可以接受；如果文档暗示强恢复可见性，就必须改写文档。
 
----
+### S1-2: `try_lock + sleep(1ms) + requeue` 是吞吐优先策略，不是 tail-latency 最佳实践
 
-### P1：重要优化
+这不是 correctness bug，但它会让：
 
-#### P1-1: `current_tid()` 重复系统调用
+1. flush 请求延迟更依赖调度时机
+2. `async_1t` / `flush256` 的 p99 归因更复杂
 
-**文件:** `crates/xlog-core/src/platform_tid.rs:3-22`
+因此，当前不能把 `async_4t_flush256` 简单归因为单一 `msync(MS_SYNC)` 成本。
 
-```rust
-pub fn current_tid() -> i64 {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        unsafe { libc::syscall(libc::SYS_gettid) as i64 }
-    }
-    #[cfg(any(target_os = "macos", ...))]
-    {
-        let mut tid: u64 = 0;
-        unsafe { libc::pthread_threadid_np(0, &mut tid); }
-        tid as i64
-    }
-}
-```
+### S1-3: `append_log_slices` / `append_file_to_file` 仍然不是 I/O 最佳实践
 
-**问题:** 每条日志调用一次 `syscall(SYS_gettid)` 或 `pthread_threadid_np`。线程 ID 在线程生命周期内不变，无需反复查询。
+当前还有两类明显但次级的问题：
 
-**优化方案:**
+1. 多 slice 写入仍是多次 `write_all`，不是单次拼接或 `write_vectored`
+2. `append_file_to_file()` 仍用 `4 KiB` buffer，属于冷路径但偏保守
 
-```rust
-pub fn current_tid() -> i64 {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        thread_local! {
-            static TID: i64 = unsafe { libc::syscall(libc::SYS_gettid) as i64 };
-        }
-        TID.with(|t| *t)
-    }
-    // ...
-}
-```
+这些问题更多影响性能和原子性质量，不是当前最高级的功能阻断。
 
-**预估收益:** 每条日志减少 1 次系统调用。
+## 7. 哪些已经和旧文档不同
 
----
+以下结论已经不能再出现在“当前状态”文档里：
 
-#### P1-2: 时间格式化效率低
+1. `compress_level` 尚未接入 zlib async 路径
+2. `current_tid()` 仍然每条日志都做系统调用
+3. mmap 预分配仍然使用一次性大 `Vec`
+4. 当前只剩“继续做低风险性能收敛”，没有新的语义风险
+5. `async_4t` 是当前最主要吞吐瓶颈
 
-**文件:** `crates/xlog-core/src/formatter.rs:33-48`
+当前真实状态是：
 
-```rust
-fn format_time_into(out: &mut String, ts: std::time::SystemTime) {
-    let dt: DateTime<Local> = ts.into();  // timezone 查找
-    let offset_hours = (dt.offset().local_minus_utc() as f64) / 3600.0;  // 浮点除法
-    let _ = write!(out, "{:04}-{:02}-{:02} {:+.1} {:02}:{:02}:{:02}.{:03}", ...);
-}
-```
+1. `compress_level` 已接入
+2. tid 已做 thread-local 缓存
+3. mmap 预分配已改为栈缓冲循环写零
+4. 当前最需要修正文档的是 sync / recovery / durability 语义边界
+5. async 主差距是 `async_1t` fixed cost 和 tail latency
 
-**问题:**
-1. `DateTime<Local>` 转换涉及 timezone 查找（某些平台读 `/etc/localtime`）
-2. `offset_hours` 使用 f64 除法（不必要的精度）
-3. `write!` 宏每个数字都经过 `Display` trait，效率低于直接字符串操作
+## 8. 最近 perf 提交逐条结论
 
-每条日志都执行一次这些操作。
+### 风险最低
 
-**优化方案:**
-- 使用 `thread_local!` 缓存 UTC offset（每小时或每分钟刷新）
-- 使用 `itoa` crate 或手动定宽数字格式化替代 `write!` 宏
-- 预计算 `offset_hours` 避免每条日志的浮点除法
+- `45f2385 perf: reuse hot path formatter and crypto buffers`
+  - 方向正确
+  - 属于经典 hot-path allocation 收敛
+  - 当前看不到明显语义破坏
 
-**预估收益:** 格式化阶段耗时减少 30-50%。
+### 中等风险，可接受但必须写明语义取舍
 
----
+- `b809e1b perf: tune async mmap persist cadence`
+  - 提升吞吐的方向成立
+  - 但扩大了 crash-loss window
+- `a5a05ba perf: defer async flush when engine state is busy`
+  - 提升吞吐 / 减争用的方向成立
+  - 但 p99 和 flush 时序更依赖调度
 
-#### P1-3: mmap 预分配使用堆分配 Vec
+### 高风险，需要重新评估是否保留现状
 
-**文件:** `crates/xlog-core/src/mmap_store.rs:104-111`
+- `af3dd2c perf: trim recovery and oneshot buffer copies`
+  - 主要风险是 recovered block + end marker 的 split-write framing
+- `ab5f1d9 perf: reuse active cache files in sync path`
+  - 提高命中率和少扫目录是对的
+  - 但更强地依赖本地缓存长度与路径状态正确
+- `62ed8b0 perf: streamline sync steady-state writes`
+  - 对 sync steady-state benchmark 有帮助
+  - 但继续把语义往“用户态缓冲 + 本地 bookkeeping”方向推
+- `3eb24a0 perf: buffer sync keep-open file writes`
+  - 性能收益明确
+  - 但这类方向是否可接受，需要以当前 C++ 语义和文档定义一起判断
+- `b62fda7 perf: fast-path active sync file appends`
+  - 继续缩短 steady-state 热路径
+  - 但建立在前述 keep-open / active-file 假设之上
 
-```rust
-fn preallocate_by_zero_write(file: &mut File, capacity: usize) -> std::io::Result<()> {
-    file.seek(SeekFrom::Start(0))?;
-    let zeros = vec![0u8; capacity];  // 150KB 堆分配
-    file.write_all(&zeros)?;
-    file.flush()?;
-    Ok(())
-}
-```
+## 9. 当前是否符合高性能最佳实践
 
-**问题:** 每次创建 mmap 文件时在堆上分配 150KB 的零值 Vec，只用一次就释放。
+结论不能简单写成“是”或“否”。
 
-**优化方案:**
+### 已符合或基本符合的部分
 
-```rust
-fn preallocate_by_zero_write(file: &mut File, capacity: usize) -> std::io::Result<()> {
-    file.seek(SeekFrom::Start(0))?;
-    let zeros = [0u8; 8192];
-    let mut remaining = capacity;
-    while remaining > 0 {
-        let n = remaining.min(zeros.len());
-        file.write_all(&zeros[..n])?;
-        remaining -= n;
-    }
-    file.flush()?;
-    Ok(())
-}
-```
+1. 热路径 scratch buffer 复用是正确方向
+2. sync 路径移除非必要 engine 锁是正确方向
+3. tid thread-local 缓存、mmap 栈缓冲预分配都是合理微优化
+4. `compress_level` 接入让配置面与实现一致
 
-进阶方案: Linux/Android 上使用 `fallocate(FALLOC_FL_ZERO_RANGE)`。
+### 仍不算最佳实践的部分
 
-**预估收益:** 初始化阶段减少 150KB 堆分配（一次性，非热路径但仍有意义）。
+1. sync 模式为吞吐牺牲了过多显式语义
+2. 恢复路径零拷贝没有同时维护跨进程 append 原子性
+3. cache/log 搬运没有 durability barrier
+4. `FileManager` 仍把路径决策、缓存、活跃文件状态和真实 I/O 绑在同一把锁里
+5. async 固定成本问题还没有被 profile 充分量化
 
----
+所以更准确的说法是：
 
-#### P1-4: 文件扩展名字符串重复分配
+- 当前实现已经有不少高性能工程化实践。
+- 但还不能称为“语义边界完全稳固的高性能最佳实践版本”。
 
-**文件:** `crates/xlog-core/src/file_manager.rs` 多处
+## 10. 之后的主线优先级
 
-```rust
-// 出现在 list_existing_files, move_old_cache_files, get_file_names_by_prefix 中
-if name.starts_with(file_prefix) && name.ends_with(&format!(".{LOG_EXT}"))
-```
+### P0: 先收敛语义，再继续追 benchmark
 
-**问题:** 每次目录遍历的每个条目都 `format!` 分配一个新 String `".xlog"`。
+1. 恢复 / oneshot 路径必须把 recovered block + `MAGIC_END` 作为单次连续 append 语义处理
+2. 明确 `.xlog` 是否允许多 writer 竞争写入
+3. 如果不允许，就把独占假设写进文档与测试；如果允许，就回收当前缓存长度与 rollback 假设
+4. 对 C++ / Rust 共享的 sync / fatal / durability 语义边界，文档必须先写准确
 
-**优化方案:**
+### P1: 继续做不会改坏语义的性能优化
 
-```rust
-const LOG_EXT_DOT: &str = ".xlog";
-// 替换所有 format!(".{LOG_EXT}") 为 LOG_EXT_DOT
-```
+1. `compress.rs` 双缓冲收敛
+2. formatter / 时间格式化 / 冗余时钟调用 profiling
+3. `FileManager.runtime` 热路径继续拆职责
+4. 冷路径 `append_file_to_file` buffer 放大或平台专用搬运优化
 
-**预估收益:** 消除目录遍历中每条目的堆分配。
+### 研究项，不进入当前主线
 
----
+1. per-thread async pending pipeline
+2. per-thread sync file handle / append-only 重构
+3. `msync(MS_ASYNC)` / `madvise` 一类 OS 级 mmap 调优
+4. SIMD / lock-free 大改
 
-#### P1-5: `Local::now()` 和 `SystemTime::now()` 冗余双重调用
+## 11. 当前测试结论与缺口
 
-**文件:** `crates/xlog/src/backend/rust.rs:558-560`
+已执行并通过：
 
-```rust
-let now = Local::now();              // 调用 ① clock_gettime + tz lookup
-let now_hour = chrono::Timelike::hour(&now) as u8;
-let timestamp = std::time::SystemTime::now();  // 调用 ② clock_gettime
-```
+1. `cargo test -p mars-xlog-core --test async_engine`
+2. `cargo test -p mars-xlog-core --test mmap_recovery`
+3. `cargo test -p mars-xlog-core --test oneshot_flush`
 
-**问题:** 两次独立的时钟调用获取本质上相同的时间点。
+这些测试说明：
 
-**优化方案:**
+1. 当前实现的已有回归面仍然能跑通
+2. 但它们主要证明“现有实现自洽”，不能证明上面的语义风险不存在
 
-```rust
-let timestamp = std::time::SystemTime::now();
-let dt: DateTime<Local> = timestamp.into();
-let now_hour = dt.hour() as u8;
-```
+仍缺少的关键测试：
 
-`build_sync_block_into` (第 369-381 行) 中也存在相同问题。
-
-**预估收益:** 每条日志减少 1 次 `clock_gettime` 系统调用。
-
----
-
-### P2：架构级优化
-
-#### P2-1: Sync 模式多线程 FileManager 锁竞争
-
-**文件:** `crates/xlog-core/src/file_manager.rs`
-
-**问题:** `FileManager.runtime` 是 `Arc<Mutex<RuntimeState>>`，sync 模式的 `append_log_bytes` 在持有该锁期间执行文件 I/O。多线程 sync 写入完全串行化在 FileManager 的 Mutex 上。
-
-从 benchmark 数据看：Sync 4T Rust ≈ 81.8% of C++，这个差距的主要原因就是锁竞争。
-
-**优化方案（高复杂度）:**
-- 使用 OS 级 `O_APPEND` 原子追加语义，每线程持有独立文件句柄
-- 通过 `pwrite` + `O_APPEND` 保证并发写入的原子性和顺序
-- 路径选择和轮转逻辑使用 `RwLock` 或 lock-free 设计
-
-**风险:** 需要处理文件轮转（rotation）时的同步问题。
-
----
-
-#### P2-2: Async 模式 per-thread 压缩管道
-
-**文件:** `crates/xlog/src/backend/rust.rs`
-
-**问题:** 当前所有线程共享一个 `AsyncPendingState`（包含流式压缩器），通过 Mutex + Condvar 串行化。这限制了 async 多线程的并行度。
-
-**优化方案（高复杂度）:**
-- 每线程维护独立的 `AsyncPendingState`（独立的压缩器实例）
-- 每线程的 compressed+encrypted 输出写入独立的小缓冲区
-- flush 时按序合并所有线程的输出到 mmap buffer
-- 需要修改协议模型：从「单 pending block」变为「多 pending block」
-
-**风险:** 修改了 async block 语义，需要验证解码兼容性。
-
----
-
-#### P2-3: scan_recovery 尾部扫描 O(n)
-
-**文件:** `crates/xlog-core/src/buffer.rs:394`
-
-```rust
-let dropped_nonzero_tail_bytes = raw[offset..].iter().filter(|b| **b != 0).count();
-```
-
-**问题:** 对于 150KB 的 buffer，如果 valid_len 只有几 KB，剩余约 147KB 全部被扫描。这只是诊断信息，不影响正确性。
-
-**优化方案:**
-- 惰性求值：只在实际访问 `dropped_nonzero_tail_bytes` 时才计算
-- 或设置扫描上限：`raw[offset..].iter().take(4096).filter(...)` 采样前 4KB 即可判断是否有脏数据
-
----
-
-#### P2-4: `append_file_to_file` 缓冲区过小
-
-**文件:** `crates/xlog-core/src/file_manager.rs:1034`
-
-```rust
-let mut buf = [0u8; 4096];
-```
-
-**问题:** 4KB 的读写缓冲区意味着每 4KB 就需要一次 `read` + `write` 系统调用对。对于较大的日志文件合并，系统调用次数可能很高。
-
-**优化方案:** 增大到 64KB：
-
-```rust
-let mut buf = [0u8; 65536];
-```
-
-或在 Linux 上使用 `copy_file_range` / `sendfile` 系统调用实现零拷贝。
-
----
-
-### P3：微优化
-
-#### P3-1: TEA 加密可考虑 SIMD 或 unsafe 优化
-
-**文件:** `crates/xlog-core/src/crypto.rs:143-167`
-
-当前实现使用 `chunks_exact_mut(8)` + 手动字节到 u32 转换，safe Rust 编译器一般能很好地优化。但在 ARM NEON（Android 主要平台）上，可以考虑 SIMD 批量加密提高吞吐。
-
-属于极限优化，优先级低。
-
-#### P3-2: `LogRecord` 拥有 String 字段
-
-**文件:** `crates/xlog-core/src/record.rs:33-42`
-
-```rust
-pub struct LogRecord {
-    pub tag: String,
-    pub filename: String,
-    pub func_name: String,
-    // ...
-}
-```
-
-热路径实际使用 `format_record_parts_into` 直接传入 `&str`，绕过了 `LogRecord` 构造。当前不是性能问题，但如果未来有代码路径需要构造 `LogRecord`，应考虑使用 `Cow<'a, str>` 避免不必要的拷贝。
-
----
-
-## 三、优化优先级矩阵
-
-| 优先级 | ID | 优化项 | 预估收益 | 实现复杂度 | 兼容性风险 |
-|--------|----|--------|---------|-----------|-----------|
-| **P0** | P0-1 | Zlib 压缩级别传入配置 | Async 写入 2-3x | 低 | 无 |
-| **P0** | P0-2 | 流式压缩器消除双缓冲 | 减少 memcpy + 内存 | 中 | 无 |
-| **P0** | P0-3 | mmap flush_async 替代 flush | 减少 I/O 阻塞 | 低 | 低 |
-| **P0** | P0-4 | 缩减 async 状态锁持有范围 | Async 4T 提升 30-60% | 高 | 中 |
-| **P1** | P1-1 | Thread-local tid 缓存 | 减少 syscall/line | 低 | 无 |
-| **P1** | P1-2 | 时间格式化优化 | Format 阶段 30-50% | 中 | 无 |
-| **P1** | P1-3 | mmap 预分配用栈缓冲区 | 减少堆分配 | 低 | 无 |
-| **P1** | P1-4 | 文件扩展名常量化 | 消除热路径分配 | 低 | 无 |
-| **P1** | P1-5 | 合并冗余时钟调用 | 减少 syscall/line | 低 | 无 |
-| **P2** | P2-1 | Sync per-thread 文件句柄 | Sync 4T 吞吐量大幅提升 | 高 | 高 |
-| **P2** | P2-2 | Async per-thread 压缩管道 | Async 4T 吞吐量大幅提升 | 高 | 高 |
-| **P2** | P2-3 | scan_recovery 惰性尾部计算 | 减少不必要计算 | 低 | 无 |
-| **P2** | P2-4 | append_file_to_file 增大 buffer | 减少 syscall 次数 | 低 | 无 |
-
----
-
-## 四、Benchmark 现状与优化目标
-
-### 当前性能 (基于 20260306-harness-matrix-rerun 数据)
-
-| 场景 | Rust / C++ 比值 | 瓶颈分析 |
-|------|----------------|---------|
-| Async 1T | ≈ 81% | 压缩级别 (P0-1) + 双缓冲 (P0-2) |
-| Async 4T | ≈ 110.7% | 已优于 C++，P0-4 可进一步提升 |
-| Async 4T + flush/256 | ≈ 97.3% | flush 路径 msync 开销 (P0-3) |
-| Sync 1T | ≈ 111.7% | 已优于 C++ |
-| Sync 4T | ≈ 81.8% | FileManager 锁竞争 (P2-1) |
-| Sync 4T + cache | 优于 C++ | 特定场景已优 |
-| Sync 4T + boundary | 远优于 C++ | C++ 在此场景有已知问题 |
-
-### P0 优化完成后预期目标
-
-| 场景 | 预期 Rust / C++ 比值 |
-|------|---------------------|
-| Async 1T | **100-130%** (主要来自 P0-1 压缩级别修正) |
-| Async 4T | **120-150%** (P0-4 锁优化) |
-| Sync 4T | 81-85% (需 P2 级别重构才能显著提升) |
-
----
-
-## 五、实施建议
-
-### 第一阶段：低风险高收益 (P0-1, P0-3, P1-1, P1-3, P1-4, P1-5)
-
-这些修改实现简单、无兼容性风险，可以快速验证收益。建议先实施后跑 benchmark 确认提升幅度。
-
-### 第二阶段：中等复杂度 (P0-2, P1-2)
-
-流式压缩器重构和时间格式化优化需要更仔细的测试，但风险可控。
-
-### 第三阶段：架构调整 (P0-4, P2-1, P2-2)
-
-这些需要修改核心并发模型，建议先做详细设计，评估对协议兼容性和错误恢复的影响。
+1. 多进程或模拟 interleaving 下 recovered pending block append 的 framing 测试
+2. 外部 writer 干扰下 rollback 不截断外部追加数据的测试
+3. 如果后续决定升级 shared durability 语义，再补 cache/log 搬运与 mmap 清空前后的 durability 测试
+4. 如果后续决定升级 sync/fatal 语义，再补即时可见性测试
