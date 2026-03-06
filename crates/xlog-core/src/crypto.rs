@@ -113,9 +113,16 @@ impl EcdhTeaCipher {
         }
 
         let mut out = input.to_vec();
-        let block_bytes = out.len() / TEA_BLOCK_LEN * TEA_BLOCK_LEN;
-        tea_encrypt_in_place(&mut out[..block_bytes], &self.tea_key);
+        self.encrypt_async_in_place(&mut out);
         out
+    }
+
+    pub fn encrypt_async_in_place(&self, input: &mut [u8]) {
+        if !self.enabled {
+            return;
+        }
+        let block_bytes = input.len() / TEA_BLOCK_LEN * TEA_BLOCK_LEN;
+        tea_encrypt_in_place(&mut input[..block_bytes], &self.tea_key);
     }
 }
 

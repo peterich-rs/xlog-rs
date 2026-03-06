@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use chrono::{DateTime, Datelike, Local, Timelike};
 
 use crate::record::LogRecord;
@@ -28,10 +30,11 @@ fn truncate_utf8_to_max_bytes(input: &str, max_bytes: usize) -> &str {
     &input[..end]
 }
 
-fn format_time(ts: std::time::SystemTime) -> String {
+fn format_time_into(out: &mut String, ts: std::time::SystemTime) {
     let dt: DateTime<Local> = ts.into();
     let offset_hours = (dt.offset().local_minus_utc() as f64) / 3600.0;
-    format!(
+    let _ = write!(
+        out,
         "{:04}-{:02}-{:02} {:+.1} {:02}:{:02}:{:02}.{:03}",
         dt.year(),
         dt.month(),
@@ -41,48 +44,89 @@ fn format_time(ts: std::time::SystemTime) -> String {
         dt.minute(),
         dt.second(),
         dt.timestamp_subsec_millis()
-    )
+    );
 }
 
-/// Reproduce C++ `formater.cc` output layout as one text line.
-pub fn format_record(record: &LogRecord, body: &str) -> String {
-    let filename = extract_file_name(&record.filename);
-    let tid_suffix = if record.tid == record.maintid {
+pub fn format_record_into(
+    out: &mut String,
+    record: &LogRecord,
+    body: &str,
+) {
+    format_record_parts_into(
+        out,
+        record.level,
+        &record.tag,
+        &record.filename,
+        &record.func_name,
+        record.line,
+        record.timestamp,
+        record.pid,
+        record.tid,
+        record.maintid,
+        body,
+    );
+}
+
+pub fn format_record_parts_into(
+    out: &mut String,
+    level: crate::record::LogLevel,
+    tag: &str,
+    filename: &str,
+    func_name: &str,
+    line: i32,
+    timestamp: std::time::SystemTime,
+    pid: i64,
+    tid: i64,
+    maintid: i64,
+    body: &str,
+) {
+    out.clear();
+    let filename = extract_file_name(filename);
+    let tid_suffix = if tid == maintid {
         "*"
     } else {
         ""
     };
-    let func_name = if record.func_name.is_empty() {
+    let func_name = if func_name.is_empty() {
         ""
     } else {
-        &record.func_name
+        func_name
     };
-    let prefix = format!(
-        "[{}][{}][{}, {}{}][{}][{}:{}, {}][",
-        record.level.short(),
-        format_time(record.timestamp),
-        record.pid,
-        record.tid,
+
+    out.push('[');
+    out.push_str(level.short());
+    out.push_str("][");
+    format_time_into(out, timestamp);
+    let _ = write!(
+        out,
+        "][{}, {}{}][{}][{}:{}, {}][",
+        pid,
+        tid,
         tid_suffix,
-        record.tag,
+        tag,
         filename,
-        record.line,
+        line,
         func_name
     );
+
     let body_cap = LEGACY_STACK_BUFFER_BYTES
-        .saturating_sub(prefix.len())
+        .saturating_sub(out.len())
         .saturating_sub(LEGACY_BODY_RESERVED_BYTES)
         .min(MAX_LOG_BODY_BYTES);
     let body = truncate_utf8_to_max_bytes(body, body_cap);
-    let mut out = String::with_capacity(prefix.len() + body.len() + 1);
-    out.push_str(&prefix);
     out.push_str(body);
     if !out.ends_with('\n') && out.len() < LEGACY_STACK_BUFFER_BYTES {
         out.push('\n');
     }
     if out.len() > LEGACY_STACK_BUFFER_BYTES {
-        out = truncate_utf8_to_max_bytes(&out, LEGACY_STACK_BUFFER_BYTES).to_string();
+        out.truncate(truncate_utf8_to_max_bytes(out, LEGACY_STACK_BUFFER_BYTES).len());
     }
+}
+
+/// Reproduce C++ `formater.cc` output layout as one text line.
+pub fn format_record(record: &LogRecord, body: &str) -> String {
+    let mut out = String::with_capacity(LEGACY_STACK_BUFFER_BYTES);
+    format_record_into(&mut out, record, body);
     out
 }
 
