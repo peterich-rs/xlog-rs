@@ -242,6 +242,13 @@ def component_summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         cpu_user = numeric_values(items, "cpu_user_ms")
         cpu_system = numeric_values(items, "cpu_system_ms")
         rss = numeric_values(items, "max_rss_kb")
+        io_read_syscalls = numeric_values(items, "io_read_syscalls")
+        io_write_syscalls = numeric_values(items, "io_write_syscalls")
+        io_write_bytes = numeric_values(items, "io_write_bytes")
+        syscalls_per_op = numeric_values(items, "syscalls_per_op")
+        scanned_entries = numeric_values(items, "scanned_entries")
+        moved_files = numeric_values(items, "moved_files")
+        deleted_files = numeric_values(items, "deleted_files")
         variants.append(
             {
                 "variant": variant,
@@ -256,6 +263,23 @@ def component_summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 "cpu_system_ms_mean": (sum(cpu_system) / len(cpu_system)) if cpu_system else None,
                 "cpu_system_ms_median": median(cpu_system) if cpu_system else None,
                 "max_rss_kb_max": max(rss) if rss else None,
+                "io_read_syscalls_mean": (sum(io_read_syscalls) / len(io_read_syscalls))
+                if io_read_syscalls
+                else None,
+                "io_write_syscalls_mean": (sum(io_write_syscalls) / len(io_write_syscalls))
+                if io_write_syscalls
+                else None,
+                "io_write_mb_mean": (sum(io_write_bytes) / len(io_write_bytes) / (1024.0 * 1024.0))
+                if io_write_bytes
+                else None,
+                "syscalls_per_op_mean": (sum(syscalls_per_op) / len(syscalls_per_op))
+                if syscalls_per_op
+                else None,
+                "scanned_entries_mean": (sum(scanned_entries) / len(scanned_entries))
+                if scanned_entries
+                else None,
+                "moved_files_sum": sum(moved_files) if moved_files else None,
+                "deleted_files_sum": sum(deleted_files) if deleted_files else None,
             }
         )
 
@@ -600,9 +624,14 @@ def main() -> None:
                     "Ops/s Mean",
                     "Ops/s Median",
                     "Ratio Mean",
+                    "Syscalls/Op Mean",
+                    "IO Write MB Mean",
                     "CPU User ms Mean",
                     "CPU Sys ms Mean",
                     "Max RSS KB",
+                    "Scanned Mean",
+                    "Moved Sum",
+                    "Deleted Sum",
                     "Ratio Range",
                 ],
                 [
@@ -612,9 +641,14 @@ def main() -> None:
                         f"{v['ops_per_sec_mean']:.3f}",
                         f"{v['ops_per_sec_median']:.3f}",
                         f"{v['ratio_mean']:.6f}",
+                        fmt_opt(v.get("syscalls_per_op_mean"), 6),
+                        fmt_opt(v.get("io_write_mb_mean")),
                         fmt_opt(v.get("cpu_user_ms_mean")),
                         fmt_opt(v.get("cpu_system_ms_mean")),
                         fmt_opt(v.get("max_rss_kb_max"), 0),
+                        fmt_opt(v.get("scanned_entries_mean")),
+                        fmt_opt(v.get("moved_files_sum"), 0),
+                        fmt_opt(v.get("deleted_files_sum"), 0),
                         f"{v['ratio_min']:.6f}..{v['ratio_max']:.6f}",
                     ]
                     for v in comp_summary["variants"]

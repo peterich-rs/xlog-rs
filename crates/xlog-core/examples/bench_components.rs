@@ -63,10 +63,19 @@ struct Options {
 }
 
 #[derive(Copy, Clone)]
+struct ProcIoSnapshot {
+    read_syscalls: u64,
+    write_syscalls: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+#[derive(Copy, Clone)]
 struct ResourceSnapshot {
     user_us: i64,
     sys_us: i64,
     max_rss_kb: i64,
+    proc_io: Option<ProcIoSnapshot>,
 }
 
 #[derive(Copy, Clone, Default)]
@@ -74,6 +83,17 @@ struct ResourceDelta {
     cpu_user_ms: Option<f64>,
     cpu_system_ms: Option<f64>,
     max_rss_kb: Option<i64>,
+    io_read_syscalls: Option<u64>,
+    io_write_syscalls: Option<u64>,
+    io_read_bytes: Option<u64>,
+    io_write_bytes: Option<u64>,
+}
+
+#[derive(Copy, Clone, Default)]
+struct IoEventDelta {
+    scanned_entries: Option<u64>,
+    moved_files: Option<u64>,
+    deleted_files: Option<u64>,
 }
 
 fn main() {
@@ -224,6 +244,7 @@ fn run_crypto(opts: &Options) -> Result<(), String> {
         input_bytes,
         1.0,
         resources,
+        IoEventDelta::default(),
     );
 
     let (start, start_res) = begin_measurement();
@@ -253,6 +274,7 @@ fn run_crypto(opts: &Options) -> Result<(), String> {
         input_bytes,
         1.0,
         resources,
+        IoEventDelta::default(),
     );
 
     Ok(())
@@ -298,6 +320,7 @@ fn run_formatter(opts: &Options) -> Result<(), String> {
             sink as f64 / input_bytes as f64
         },
         resources,
+        IoEventDelta::default(),
     );
 
     let mut out = String::with_capacity(16 * 1024);
@@ -336,6 +359,7 @@ fn run_formatter(opts: &Options) -> Result<(), String> {
             sink_reuse as f64 / input_bytes as f64
         },
         resources,
+        IoEventDelta::default(),
     );
 
     Ok(())
@@ -396,8 +420,12 @@ fn run_io(opts: &Options) -> Result<(), String> {
         false,
         true,
     )?;
+    bench_flush_append_only_variant(opts, payload.as_slice())?;
+    bench_flush_sweep_only_variant(opts, payload.as_slice())?;
     bench_flush_via_delete_expired_variant(opts, payload.as_slice())?;
+    bench_move_old_cache_files_only_variant(opts, payload.as_slice())?;
     bench_move_old_cache_files_variant(opts, payload.as_slice())?;
+    bench_delete_expired_scan_only_variant(opts, payload.as_slice())?;
     bench_delete_expired_files_variant(opts, payload.as_slice())?;
     Ok(())
 }
@@ -452,6 +480,7 @@ where
         output_bytes,
         ratio,
         resources,
+        IoEventDelta::default(),
     );
 
     Ok(())
@@ -481,12 +510,7 @@ fn bench_append_path_variant(
     let (start, start_res) = begin_measurement();
     for _ in 0..opts.io_iterations {
         manager
-            .append_log_bytes(
-                black_box(payload),
-                max_file_size,
-                move_file,
-                keep_open,
-            )
+            .append_log_bytes(black_box(payload), max_file_size, move_file, keep_open)
             .map_err(|e| format!("{variant} append failed: {e}"))?;
     }
     let (elapsed_ms, resources) = end_measurement(start, start_res);
@@ -511,6 +535,7 @@ fn bench_append_path_variant(
         output_bytes,
         ratio,
         resources,
+        IoEventDelta::default(),
     );
     Ok(())
 }
@@ -557,6 +582,173 @@ fn bench_move_old_cache_files_variant(opts: &Options, payload: &[u8]) -> Result<
         output_bytes,
         ratio,
         resources,
+        IoEventDelta {
+            scanned_entries: Some(rounds as u64),
+            moved_files: Some(rounds as u64),
+            deleted_files: None,
+        },
+    );
+    Ok(())
+}
+
+fn bench_move_old_cache_files_only_variant(opts: &Options, payload: &[u8]) -> Result<(), String> {
+    let variant = "move_old_cache_files_only";
+    let root = TempDir::new().map_err(|e| format!("{variant} temp dir: {e}"))?;
+    let log_dir = root.path().join("logs");
+    let cache_dir = root.path().join("cache");
+    let manager = FileManager::new(
+        log_dir.clone(),
+        Some(cache_dir.clone()),
+        "bench".to_string(),
+        0,
+    )
+    .map_err(|e| format!("{variant} file manager init: {e}"))?;
+
+    let seed_files = opts.io_iterations.min(2_000).max(1);
+    for idx in 0..seed_files {
+        let path = cache_dir.join(format!("bench-move-only-{idx}.xlog"));
+        create_old_file(&path, payload, variant)?;
+    }
+    let input_bytes = payload.len().saturating_mul(seed_files);
+    let before_total =
+        count_xlog_files_under(&log_dir).saturating_add(count_xlog_files_under(&cache_dir));
+
+    let (start, start_res) = begin_measurement();
+    manager
+        .move_old_cache_files(0)
+        .map_err(|e| format!("{variant} move failed: {e}"))?;
+    let (elapsed_ms, resources) = end_measurement(start, start_res);
+
+    let output_bytes = total_size_under(&log_dir).saturating_add(total_size_under(&cache_dir));
+    let ratio = if input_bytes == 0 {
+        0.0
+    } else {
+        output_bytes as f64 / input_bytes as f64
+    };
+    let after_total =
+        count_xlog_files_under(&log_dir).saturating_add(count_xlog_files_under(&cache_dir));
+    let moved_files = count_xlog_files_under(&log_dir) as u64;
+    let deleted_files = before_total.saturating_sub(after_total) as u64;
+    emit_result(
+        "io",
+        variant,
+        opts.payload_size,
+        seed_files,
+        elapsed_ms,
+        input_bytes,
+        output_bytes,
+        ratio,
+        resources,
+        IoEventDelta {
+            scanned_entries: Some(before_total as u64),
+            moved_files: Some(moved_files),
+            deleted_files: Some(deleted_files),
+        },
+    );
+    Ok(())
+}
+
+fn bench_flush_append_only_variant(opts: &Options, payload: &[u8]) -> Result<(), String> {
+    let variant = "flush_append_only";
+    let root = TempDir::new().map_err(|e| format!("{variant} temp dir: {e}"))?;
+    let log_dir = root.path().join("logs");
+    let cache_dir = root.path().join("cache");
+    let manager = FileManager::new(
+        log_dir.clone(),
+        Some(cache_dir.clone()),
+        "bench".to_string(),
+        1,
+    )
+    .map_err(|e| format!("{variant} file manager init: {e}"))?;
+
+    let rounds = opts.io_iterations.min(2_000).max(1);
+    let max_file_size = (payload.len().max(64) as u64).saturating_mul(1024 * 1024);
+    let (start, start_res) = begin_measurement();
+    for _ in 0..rounds {
+        manager
+            .append_log_bytes(payload, max_file_size, false, true)
+            .map_err(|e| format!("{variant} append failed: {e}"))?;
+    }
+    let (elapsed_ms, resources) = end_measurement(start, start_res);
+
+    // Flush keep-open writer once outside the timed path.
+    manager
+        .delete_expired_files(365 * 24 * 60 * 60)
+        .map_err(|e| format!("{variant} post flush failed: {e}"))?;
+
+    let input_bytes = payload.len().saturating_mul(rounds);
+    let output_bytes = total_size_under(&log_dir).saturating_add(total_size_under(&cache_dir));
+    let ratio = if input_bytes == 0 {
+        0.0
+    } else {
+        output_bytes as f64 / input_bytes as f64
+    };
+    emit_result(
+        "io",
+        variant,
+        opts.payload_size,
+        rounds,
+        elapsed_ms,
+        input_bytes,
+        output_bytes,
+        ratio,
+        resources,
+        IoEventDelta::default(),
+    );
+    Ok(())
+}
+
+fn bench_flush_sweep_only_variant(opts: &Options, payload: &[u8]) -> Result<(), String> {
+    let variant = "flush_sweep_only";
+    let root = TempDir::new().map_err(|e| format!("{variant} temp dir: {e}"))?;
+    let log_dir = root.path().join("logs");
+    let cache_dir = root.path().join("cache");
+    let manager = FileManager::new(
+        log_dir.clone(),
+        Some(cache_dir.clone()),
+        "bench".to_string(),
+        1,
+    )
+    .map_err(|e| format!("{variant} file manager init: {e}"))?;
+
+    let rounds = opts.io_iterations.min(1_000).max(1);
+    let max_file_size = (payload.len().max(64) as u64).saturating_mul(1024 * 1024);
+    for _ in 0..rounds {
+        manager
+            .append_log_bytes(payload, max_file_size, false, true)
+            .map_err(|e| format!("{variant} seed append failed: {e}"))?;
+    }
+    let file_scan_entries =
+        count_xlog_files_under(&log_dir).saturating_add(count_xlog_files_under(&cache_dir));
+
+    let (start, start_res) = begin_measurement();
+    manager
+        .delete_expired_files(365 * 24 * 60 * 60)
+        .map_err(|e| format!("{variant} flush sweep failed: {e}"))?;
+    let (elapsed_ms, resources) = end_measurement(start, start_res);
+
+    let input_bytes = payload.len().saturating_mul(rounds);
+    let output_bytes = total_size_under(&log_dir).saturating_add(total_size_under(&cache_dir));
+    let ratio = if input_bytes == 0 {
+        0.0
+    } else {
+        output_bytes as f64 / input_bytes as f64
+    };
+    emit_result(
+        "io",
+        variant,
+        opts.payload_size,
+        1,
+        elapsed_ms,
+        input_bytes,
+        output_bytes,
+        ratio,
+        resources,
+        IoEventDelta {
+            scanned_entries: Some(file_scan_entries as u64),
+            moved_files: None,
+            deleted_files: None,
+        },
     );
     Ok(())
 }
@@ -604,6 +796,71 @@ fn bench_flush_via_delete_expired_variant(opts: &Options, payload: &[u8]) -> Res
         output_bytes,
         ratio,
         resources,
+        IoEventDelta {
+            scanned_entries: Some((rounds * 2) as u64),
+            moved_files: None,
+            deleted_files: None,
+        },
+    );
+    Ok(())
+}
+
+fn bench_delete_expired_scan_only_variant(opts: &Options, payload: &[u8]) -> Result<(), String> {
+    let variant = "delete_expired_scan_only";
+    let root = TempDir::new().map_err(|e| format!("{variant} temp dir: {e}"))?;
+    let log_dir = root.path().join("logs");
+    let cache_dir = root.path().join("cache");
+    let manager = FileManager::new(
+        log_dir.clone(),
+        Some(cache_dir.clone()),
+        "bench".to_string(),
+        1,
+    )
+    .map_err(|e| format!("{variant} file manager init: {e}"))?;
+
+    let seed_files = opts.io_iterations.min(2_000).max(1);
+    for idx in 0..seed_files {
+        let log_path = log_dir.join(format!("bench-fresh-log-{idx}.xlog"));
+        let cache_path = cache_dir.join(format!("bench-fresh-cache-{idx}.xlog"));
+        fs::write(&log_path, payload)
+            .map_err(|e| format!("{variant} seed log write failed: {e}"))?;
+        fs::write(&cache_path, payload)
+            .map_err(|e| format!("{variant} seed cache write failed: {e}"))?;
+    }
+    let before_total =
+        count_xlog_files_under(&log_dir).saturating_add(count_xlog_files_under(&cache_dir));
+
+    let (start, start_res) = begin_measurement();
+    manager
+        .delete_expired_files(365 * 24 * 60 * 60)
+        .map_err(|e| format!("{variant} scan failed: {e}"))?;
+    let (elapsed_ms, resources) = end_measurement(start, start_res);
+
+    let input_bytes = payload.len().saturating_mul(seed_files.saturating_mul(2));
+    let output_bytes = total_size_under(&log_dir).saturating_add(total_size_under(&cache_dir));
+    let ratio = if input_bytes == 0 {
+        0.0
+    } else {
+        output_bytes as f64 / input_bytes as f64
+    };
+    let after_total =
+        count_xlog_files_under(&log_dir).saturating_add(count_xlog_files_under(&cache_dir));
+    let deleted_files = before_total.saturating_sub(after_total) as u64;
+    emit_result(
+        "io",
+        variant,
+        opts.payload_size,
+        seed_files.saturating_mul(2),
+        elapsed_ms,
+        input_bytes,
+        output_bytes,
+        ratio,
+        resources,
+        IoEventDelta {
+            scanned_entries: Some(before_total as u64),
+            moved_files: None,
+            deleted_files: Some(deleted_files),
+        },
     );
     Ok(())
 }
@@ -634,6 +891,8 @@ fn bench_delete_expired_files_variant(opts: &Options, payload: &[u8]) -> Result<
     manager
         .append_log_bytes(payload, max_file_size, false, true)
         .map_err(|e| format!("{variant} active append failed: {e}"))?;
+    let before_total =
+        count_xlog_files_under(&log_dir).saturating_add(count_xlog_files_under(&cache_dir));
 
     let (start, start_res) = begin_measurement();
     manager
@@ -649,6 +908,9 @@ fn bench_delete_expired_files_variant(opts: &Options, payload: &[u8]) -> Result<
     } else {
         output_bytes as f64 / input_bytes as f64
     };
+    let after_total =
+        count_xlog_files_under(&log_dir).saturating_add(count_xlog_files_under(&cache_dir));
+    let deleted_files = before_total.saturating_sub(after_total) as u64;
     emit_result(
         "io",
         variant,
@@ -659,6 +921,11 @@ fn bench_delete_expired_files_variant(opts: &Options, payload: &[u8]) -> Result<
         output_bytes,
         ratio,
         resources,
+        IoEventDelta {
+            scanned_entries: Some(before_total as u64),
+            moved_files: None,
+            deleted_files: Some(deleted_files),
+        },
     );
     Ok(())
 }
@@ -691,6 +958,27 @@ fn total_size_under(path: &Path) -> usize {
     total
 }
 
+fn count_xlog_files_under(path: &Path) -> usize {
+    if !path.exists() {
+        return 0;
+    }
+    if path.is_file() {
+        return path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| usize::from(ext == "xlog"))
+            .unwrap_or(0);
+    }
+
+    let mut total = 0usize;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            total = total.saturating_add(count_xlog_files_under(&entry.path()));
+        }
+    }
+    total
+}
+
 fn begin_measurement() -> (Instant, Option<ResourceSnapshot>) {
     (Instant::now(), capture_resource_snapshot())
 }
@@ -699,11 +987,31 @@ fn end_measurement(start: Instant, start_res: Option<ResourceSnapshot>) -> (f64,
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     let end_res = capture_resource_snapshot();
     let delta = match (start_res, end_res) {
-        (Some(s), Some(e)) => ResourceDelta {
-            cpu_user_ms: Some((e.user_us - s.user_us) as f64 / 1000.0),
-            cpu_system_ms: Some((e.sys_us - s.sys_us) as f64 / 1000.0),
-            max_rss_kb: Some(e.max_rss_kb),
-        },
+        (Some(s), Some(e)) => {
+            let (io_read_syscalls, io_write_syscalls, io_read_bytes, io_write_bytes) =
+                match (s.proc_io, e.proc_io) {
+                    (Some(start_io), Some(end_io)) => (
+                        Some(end_io.read_syscalls.saturating_sub(start_io.read_syscalls)),
+                        Some(
+                            end_io
+                                .write_syscalls
+                                .saturating_sub(start_io.write_syscalls),
+                        ),
+                        Some(end_io.read_bytes.saturating_sub(start_io.read_bytes)),
+                        Some(end_io.write_bytes.saturating_sub(start_io.write_bytes)),
+                    ),
+                    _ => (None, None, None, None),
+                };
+            ResourceDelta {
+                cpu_user_ms: Some((e.user_us - s.user_us) as f64 / 1000.0),
+                cpu_system_ms: Some((e.sys_us - s.sys_us) as f64 / 1000.0),
+                max_rss_kb: Some(e.max_rss_kb),
+                io_read_syscalls,
+                io_write_syscalls,
+                io_read_bytes,
+                io_write_bytes,
+            }
+        }
         _ => ResourceDelta::default(),
     };
     (elapsed_ms, delta)
@@ -738,11 +1046,53 @@ fn capture_resource_snapshot() -> Option<ResourceSnapshot> {
         user_us,
         sys_us,
         max_rss_kb,
+        proc_io: capture_proc_io_snapshot(),
     })
 }
 
 #[cfg(not(unix))]
 fn capture_resource_snapshot() -> Option<ResourceSnapshot> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn capture_proc_io_snapshot() -> Option<ProcIoSnapshot> {
+    let content = fs::read_to_string("/proc/self/io").ok()?;
+    let mut read_syscalls = None;
+    let mut write_syscalls = None;
+    let mut read_bytes = None;
+    let mut write_bytes = None;
+
+    for line in content.lines() {
+        let mut parts = line.splitn(2, ':');
+        let Some(key) = parts.next().map(str::trim) else {
+            continue;
+        };
+        let Some(raw_value) = parts.next().map(str::trim) else {
+            continue;
+        };
+        let Ok(value) = raw_value.parse::<u64>() else {
+            continue;
+        };
+        match key {
+            "syscr" => read_syscalls = Some(value),
+            "syscw" => write_syscalls = Some(value),
+            "read_bytes" => read_bytes = Some(value),
+            "write_bytes" => write_bytes = Some(value),
+            _ => {}
+        }
+    }
+
+    Some(ProcIoSnapshot {
+        read_syscalls: read_syscalls?,
+        write_syscalls: write_syscalls?,
+        read_bytes: read_bytes?,
+        write_bytes: write_bytes?,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn capture_proc_io_snapshot() -> Option<ProcIoSnapshot> {
     None
 }
 
@@ -756,10 +1106,12 @@ fn emit_result(
     output_bytes: usize,
     ratio: f64,
     resources: ResourceDelta,
+    io_events: IoEventDelta,
 ) {
     let elapsed_s = (elapsed_ms / 1000.0).max(1e-12);
     let ops_per_sec = iterations as f64 / elapsed_s;
     let bytes_per_sec = input_bytes as f64 / elapsed_s;
+    let output_bytes_per_sec = output_bytes as f64 / elapsed_s;
     let cpu_user_ms = resources
         .cpu_user_ms
         .map(|v| format!("{v:.3}"))
@@ -772,8 +1124,46 @@ fn emit_result(
         .max_rss_kb
         .map(|v| v.to_string())
         .unwrap_or_else(|| "null".to_string());
+    let io_read_syscalls = resources
+        .io_read_syscalls
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let io_write_syscalls = resources
+        .io_write_syscalls
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let io_read_bytes = resources
+        .io_read_bytes
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let io_write_bytes = resources
+        .io_write_bytes
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let io_write_bytes_per_sec = resources
+        .io_write_bytes
+        .map(|v| format!("{:.3}", v as f64 / elapsed_s))
+        .unwrap_or_else(|| "null".to_string());
+    let syscalls_per_op = resources
+        .io_read_syscalls
+        .zip(resources.io_write_syscalls)
+        .map(|(r, w)| (r + w) as f64 / iterations.max(1) as f64)
+        .map(|v| format!("{v:.6}"))
+        .unwrap_or_else(|| "null".to_string());
+    let scanned_entries = io_events
+        .scanned_entries
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let moved_files = io_events
+        .moved_files
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let deleted_files = io_events
+        .deleted_files
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
     println!(
-        "{{\"component\":\"{}\",\"variant\":\"{}\",\"payload_size\":{},\"iterations\":{},\"elapsed_ms\":{:.3},\"ops_per_sec\":{:.3},\"bytes_per_sec\":{:.3},\"input_bytes\":{},\"output_bytes\":{},\"ratio\":{:.6},\"cpu_user_ms\":{},\"cpu_system_ms\":{},\"max_rss_kb\":{}}}",
+        "{{\"component\":\"{}\",\"variant\":\"{}\",\"payload_size\":{},\"iterations\":{},\"elapsed_ms\":{:.3},\"ops_per_sec\":{:.3},\"bytes_per_sec\":{:.3},\"output_bytes_per_sec\":{:.3},\"input_bytes\":{},\"output_bytes\":{},\"ratio\":{:.6},\"cpu_user_ms\":{},\"cpu_system_ms\":{},\"max_rss_kb\":{},\"io_read_syscalls\":{},\"io_write_syscalls\":{},\"io_read_bytes\":{},\"io_write_bytes\":{},\"io_write_bytes_per_sec\":{},\"syscalls_per_op\":{},\"scanned_entries\":{},\"moved_files\":{},\"deleted_files\":{}}}",
         component,
         variant,
         payload_size,
@@ -781,12 +1171,22 @@ fn emit_result(
         elapsed_ms,
         ops_per_sec,
         bytes_per_sec,
+        output_bytes_per_sec,
         input_bytes,
         output_bytes,
         ratio,
         cpu_user_ms,
         cpu_system_ms,
-        max_rss_kb
+        max_rss_kb,
+        io_read_syscalls,
+        io_write_syscalls,
+        io_read_bytes,
+        io_write_bytes,
+        io_write_bytes_per_sec,
+        syscalls_per_op,
+        scanned_entries,
+        moved_files,
+        deleted_files
     );
 }
 

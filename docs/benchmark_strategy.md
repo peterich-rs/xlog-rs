@@ -137,11 +137,16 @@ benchmark 的角色应拆成两层：
    - append keep-open / close-after-write
    - rotate（小文件尺寸触发）
    - cache write route
+   - `flush_append_only` / `flush_sweep_only`
    - `move_old_cache_files`
+   - `move_old_cache_files_only`
    - `flush_via_delete_expired`
+   - `delete_expired_scan_only`
    - `delete_expired_files`
 5. 资源指标
    - 组件基准输出 `cpu_user_ms / cpu_system_ms / max_rss_kb`
+   - Linux 下补充 `/proc/self/io` 指标：`io_read_syscalls / io_write_syscalls / io_read_bytes / io_write_bytes`
+   - I/O 子阶段事件指标：`scanned_entries / moved_files / deleted_files`
 
 这意味着 benchmark 体系已经不再只有端到端吞吐对比，也开始具备初步归因能力。
 
@@ -226,7 +231,7 @@ benchmark 的角色应拆成两层：
 
 1. formatter / record-build 更细粒度拆分
 2. compress / crypto 组合矩阵系统化
-3. 文件 I/O 路径已补齐第二版微基准，但仍需补充资源指标与更细粒度子阶段拆分
+3. 文件 I/O 第三阶段已落地，下一步是把子阶段指标接入回归阈值与趋势看板
 
 ### 4.4 矩阵治理还没有完全成型
 
@@ -276,8 +281,8 @@ benchmark 后续按以下顺序推进。
 优先处理：
 
 1. 继续细化 file manager / appender engine 子路径（含 `delete_expired_files`）
-2. flush / rotate / cache route 的子阶段拆分与资源指标补充
-3. 组件级资源指标输出（CPU/IO/内存）
+2. 将 flush / rotate / cache 子阶段指标接入回归阈值（不仅展示，还要可阻断）
+3. 组件级资源指标持续扩展（CPU/IO/内存）并补跨平台口径说明
 
 目标是把“为什么慢”从推测变成直接观测。
 
@@ -349,6 +354,7 @@ benchmark 体系达到“可信基线 + 基本可归因”至少需要满足：
 
 仍未完成（下一阶段重点）：
 
-1. 文件 I/O 微基准第三阶段：补充 I/O 级吞吐/系统调用粒度指标与更细粒度子阶段
-2. 真实业务分布回放数据集接入（当前仍以合成 profile 为主）
-3. CI 周期化策略固化（各矩阵频率、规模上限、阻断阈值）
+1. formatter / record-build 更细粒度拆分与回归门槛定义
+2. compress / crypto 组合矩阵系统化（含常用组合的分层阈值）
+3. 真实业务分布回放数据集接入（当前仍以合成 profile 为主）
+4. CI 周期化策略固化（各矩阵频率、规模上限、阻断阈值）
