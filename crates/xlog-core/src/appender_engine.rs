@@ -7,7 +7,7 @@ use chrono::{Local, Timelike};
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use thiserror::Error;
 
-use crate::buffer::{recover_blocks, validate_block, BufferError, PersistentBuffer};
+use crate::buffer::{validate_block, BufferError, PersistentBuffer};
 use crate::file_manager::{FileManager, FileManagerError};
 use crate::platform_tid::current_tid;
 use crate::protocol::{
@@ -518,18 +518,22 @@ fn flush_pending_locked(
     move_file: bool,
     write_startup_mmap_tips: bool,
 ) -> Result<bool, AppenderEngineError> {
-    let pending = state.buffer.take_all()?;
     state.async_pending_updates_since_persist = 0;
     let mut flushed = false;
-    if !pending.is_empty() {
-        let recovered = recover_blocks(&pending);
-        if recovered.bytes.is_empty() {
+    if !state.buffer.is_empty() {
+        let scan = state.buffer.recovery_scan();
+        if scan.valid_len == 0 {
+            state.buffer.clear_used_with_flush(true)?;
             return Ok(false);
         }
-        let sample_header = if recovered.bytes.len() >= HEADER_LEN {
-            LogHeader::decode(&recovered.bytes[..HEADER_LEN]).ok()
-        } else {
-            None
+
+        let sample_header = {
+            let pending = state.buffer.as_bytes();
+            if scan.valid_len >= HEADER_LEN {
+                LogHeader::decode(&pending[..HEADER_LEN]).ok()
+            } else {
+                None
+            }
         };
         if write_startup_mmap_tips {
             if let Some(begin) = build_sync_tip_block(sample_header, "~~~~~ begin of mmap ~~~~~\n")
@@ -539,9 +543,29 @@ fn flush_pending_locked(
                     .append_log_bytes(&begin, state.max_file_size, false, false)?;
             }
         }
-        state
-            .file_manager
-            .append_log_bytes(&recovered.bytes, state.max_file_size, move_file, false)?;
+
+        {
+            let pending = state.buffer.as_bytes();
+            let recovered = &pending[..scan.valid_len];
+            if scan.recovered_pending_block {
+                let end = [MAGIC_END];
+                state.file_manager.append_log_slices(
+                    &[recovered, &end],
+                    state.max_file_size,
+                    move_file,
+                    false,
+                )?;
+            } else {
+                state.file_manager.append_log_bytes(
+                    recovered,
+                    state.max_file_size,
+                    move_file,
+                    false,
+                )?;
+            }
+        }
+        state.buffer.clear_used_with_flush(true)?;
+
         if write_startup_mmap_tips {
             let end = format!("~~~~~ end of mmap ~~~~~{}\n", current_mark_info());
             if let Some(end_block) = build_sync_tip_block(sample_header, &end) {

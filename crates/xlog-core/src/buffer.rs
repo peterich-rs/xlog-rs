@@ -20,6 +20,13 @@ impl RecoveryResult {
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct RecoveryScan {
+    pub valid_len: usize,
+    pub recovered_pending_block: bool,
+    pub dropped_nonzero_tail_bytes: usize,
+}
+
 #[derive(Debug, Error)]
 pub enum BufferError {
     #[error("mmap store error: {0}")]
@@ -82,6 +89,10 @@ impl PersistentBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub fn recovery_scan(&self) -> RecoveryScan {
+        scan_recovery(self.as_bytes())
     }
 
     pub fn append_block(&mut self, block: &[u8]) -> Result<bool, BufferError> {
@@ -163,6 +174,23 @@ impl PersistentBuffer {
         let out = self.store.as_slice()[..self.len].to_vec();
         self.clear()?;
         Ok(out)
+    }
+
+    pub fn clear_used_with_flush(&mut self, flush: bool) -> Result<(), BufferError> {
+        let old_len = self.len;
+        {
+            let data = self.store.as_mut_slice();
+            if old_len > 0 {
+                data[..old_len].fill(0);
+            } else if !data.is_empty() {
+                data[0] = 0;
+            }
+            self.len = 0;
+        }
+        if flush {
+            self.store.flush()?;
+        }
+        Ok(())
     }
 
     pub fn begin_pending_block_with_flush(
@@ -299,8 +327,21 @@ impl PersistentBuffer {
 }
 
 pub fn recover_blocks(raw: &[u8]) -> RecoveryResult {
+    let scan = scan_recovery(raw);
+    let mut out = raw[..scan.valid_len].to_vec();
+    if scan.recovered_pending_block {
+        out.push(MAGIC_END);
+    }
+
+    RecoveryResult {
+        bytes: out,
+        recovered_pending_block: scan.recovered_pending_block,
+        dropped_nonzero_tail_bytes: scan.dropped_nonzero_tail_bytes,
+    }
+}
+
+fn scan_recovery(raw: &[u8]) -> RecoveryScan {
     let mut offset = 0usize;
-    let mut out = Vec::new();
     let mut recovered_pending_block = false;
 
     while offset < raw.len() {
@@ -334,7 +375,6 @@ pub fn recover_blocks(raw: &[u8]) -> RecoveryResult {
         }
 
         if payload_end < raw.len() && raw[payload_end] == MAGIC_END {
-            out.extend_from_slice(&raw[offset..payload_end + 1]);
             offset = payload_end + 1;
             continue;
         }
@@ -344,8 +384,6 @@ pub fn recover_blocks(raw: &[u8]) -> RecoveryResult {
         // Mars C++ `LogCrypt::Fix` trusts header length and keeps the valid prefix
         // even when trailing bytes are dirty/torn, so recovery should not require a
         // zero-only remainder.
-        out.extend_from_slice(&raw[offset..payload_end]);
-        out.push(MAGIC_END);
         recovered_pending_block = true;
         offset = payload_end;
         break;
@@ -353,8 +391,8 @@ pub fn recover_blocks(raw: &[u8]) -> RecoveryResult {
 
     let dropped_nonzero_tail_bytes = raw[offset..].iter().filter(|b| **b != 0).count();
 
-    RecoveryResult {
-        bytes: out,
+    RecoveryScan {
+        valid_len: offset,
         recovered_pending_block,
         dropped_nonzero_tail_bytes,
     }
@@ -382,7 +420,7 @@ pub fn validate_block(block: &[u8]) -> Result<(), BufferError> {
 
 #[cfg(test)]
 mod tests {
-    use super::recover_blocks;
+    use super::{recover_blocks, PersistentBuffer};
     use crate::protocol::{select_magic, AppendMode, CompressionKind, LogHeader, MAGIC_END};
 
     fn make_block(payload: &[u8]) -> Vec<u8> {
@@ -433,5 +471,25 @@ mod tests {
         let recovered = recover_blocks(&bytes);
         assert_eq!(recovered.bytes, b1);
         assert!(recovered.dropped_nonzero_tail_bytes > 0);
+    }
+
+    #[test]
+    fn recovery_scan_and_clear_used_track_pending_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("buffer.mmap3");
+        let mut buffer = PersistentBuffer::open_with_capacity(path, 256).unwrap();
+
+        let full = make_block(b"pending");
+        buffer
+            .replace_bytes_with_flush(&full[..full.len() - 1], false)
+            .unwrap();
+
+        let scan = buffer.recovery_scan();
+        assert_eq!(scan.valid_len, full.len() - 1);
+        assert!(scan.recovered_pending_block);
+
+        buffer.clear_used_with_flush(false).unwrap();
+        assert!(buffer.is_empty());
+        assert!(buffer.as_bytes().is_empty());
     }
 }
