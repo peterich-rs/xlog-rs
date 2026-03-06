@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -69,8 +69,11 @@ enum EngineCommand {
 
 pub struct AppenderEngine {
     mode: AtomicI32,
+    file_manager: FileManager,
     state: Arc<Mutex<EngineState>>,
     buffer_capacity: usize,
+    max_file_size: AtomicU64,
+    max_alive_time: AtomicI64,
     tx: Sender<EngineCommand>,
     pending_async_flush: Arc<AtomicBool>,
     async_flush_epoch: Arc<AtomicU64>,
@@ -105,11 +108,12 @@ impl AppenderEngine {
     ) -> Self {
         let buffer_capacity = buffer.capacity();
         let now = Instant::now();
+        let clamped_alive_time = max_alive_time.max(MIN_LOG_ALIVE_SECONDS);
         let state = Arc::new(Mutex::new(EngineState {
-            file_manager,
+            file_manager: file_manager.clone(),
             buffer,
             max_file_size,
-            max_alive_time: max_alive_time.max(MIN_LOG_ALIVE_SECONDS),
+            max_alive_time: clamped_alive_time,
             async_pending_updates_since_persist: 0,
             async_pending_bytes_since_persist: 0,
             last_async_buffer_mutation_at: now,
@@ -145,8 +149,11 @@ impl AppenderEngine {
 
         Self {
             mode: AtomicI32::new(mode_to_i32(mode)),
+            file_manager,
             state,
             buffer_capacity,
+            max_file_size: AtomicU64::new(max_file_size),
+            max_alive_time: AtomicI64::new(clamped_alive_time),
             tx,
             pending_async_flush,
             async_flush_epoch,
@@ -167,6 +174,7 @@ impl AppenderEngine {
     }
 
     pub fn set_max_file_size(&self, max_file_size: u64) {
+        self.max_file_size.store(max_file_size, Ordering::Relaxed);
         if let Ok(mut state) = self.state.lock() {
             state.max_file_size = max_file_size;
         }
@@ -176,48 +184,33 @@ impl AppenderEngine {
         if alive_seconds < MIN_LOG_ALIVE_SECONDS {
             return;
         }
+        self.max_alive_time.store(alive_seconds, Ordering::Relaxed);
         if let Ok(mut state) = self.state.lock() {
             state.max_alive_time = alive_seconds;
         }
     }
 
     pub fn max_file_size(&self) -> u64 {
-        self.state
-            .lock()
-            .map(|s| s.max_file_size)
-            .unwrap_or_default()
+        self.max_file_size.load(Ordering::Relaxed)
     }
 
     pub fn log_dir(&self) -> Option<String> {
-        self.state
-            .lock()
-            .ok()
-            .map(|s| s.file_manager.log_dir().to_string_lossy().to_string())
+        Some(self.file_manager.log_dir().to_string_lossy().to_string())
     }
 
     pub fn cache_dir(&self) -> Option<String> {
-        self.state.lock().ok().and_then(|s| {
-            s.file_manager
-                .cache_dir()
-                .map(|p| p.to_string_lossy().to_string())
-        })
+        self.file_manager
+            .cache_dir()
+            .map(|p| p.to_string_lossy().to_string())
     }
 
     pub fn filepaths_from_timespan(&self, timespan: i32, prefix: &str) -> Vec<String> {
-        self.state
-            .lock()
-            .map(|s| s.file_manager.filepaths_from_timespan(timespan, prefix))
-            .unwrap_or_default()
+        self.file_manager.filepaths_from_timespan(timespan, prefix)
     }
 
     pub fn make_logfile_name(&self, timespan: i32, prefix: &str) -> Vec<String> {
-        self.state
-            .lock()
-            .map(|s| {
-                s.file_manager
-                    .make_logfile_name(timespan, prefix, s.max_file_size)
-            })
-            .unwrap_or_default()
+        self.file_manager
+            .make_logfile_name(timespan, prefix, self.max_file_size())
     }
 
     pub fn write_block(&self, block: &[u8], force_flush: bool) -> Result<(), AppenderEngineError> {
@@ -225,12 +218,12 @@ impl AppenderEngine {
 
         match self.mode() {
             EngineMode::Sync => {
-                // Snapshot sync write inputs, then release the engine lock before file I/O.
-                let (file_manager, max_file_size) = {
-                    let state = self.state.lock().expect("state lock poisoned");
-                    (state.file_manager.clone(), state.max_file_size)
-                };
-                file_manager.append_log_bytes(block, max_file_size, false, true)?;
+                self.file_manager.append_log_bytes(
+                    block,
+                    self.max_file_size.load(Ordering::Relaxed),
+                    false,
+                    true,
+                )?;
             }
             EngineMode::Async => {
                 let should_flush = {
@@ -241,7 +234,9 @@ impl AppenderEngine {
                         .async_pending_bytes_since_persist
                         .saturating_add(block.len());
                     let should_persist_mmap = should_persist_async_mmap(&state, force_flush);
-                    let appended = state.buffer.append_block_with_flush(block, should_persist_mmap)?;
+                    let appended = state
+                        .buffer
+                        .append_block_with_flush(block, should_persist_mmap)?;
                     if should_persist_mmap {
                         mark_async_mmap_persisted(&mut state);
                     }
@@ -249,8 +244,9 @@ impl AppenderEngine {
 
                     if !appended {
                         let _ = flush_pending_locked(&mut state, true, false)?;
-                        let appended_after_flush =
-                            state.buffer.append_block_with_flush(block, should_persist_mmap)?;
+                        let appended_after_flush = state
+                            .buffer
+                            .append_block_with_flush(block, should_persist_mmap)?;
                         if !appended_after_flush {
                             state.file_manager.append_log_bytes(
                                 block,
@@ -321,9 +317,12 @@ impl AppenderEngine {
                 .async_pending_bytes_since_persist
                 .saturating_add(bytes_delta);
             let should_persist_mmap = should_persist_async_mmap(&state, force_flush);
-            state
-                .buffer
-                .append_to_pending_with_flush(truncate_bytes, chunk, end_hour, should_persist_mmap)?;
+            state.buffer.append_to_pending_with_flush(
+                truncate_bytes,
+                chunk,
+                end_hour,
+                should_persist_mmap,
+            )?;
             if should_persist_mmap {
                 mark_async_mmap_persisted(&mut state);
             }
@@ -349,9 +348,8 @@ impl AppenderEngine {
             let mut state = self.state.lock().expect("state lock poisoned");
             state.async_pending_updates_since_persist =
                 state.async_pending_updates_since_persist.saturating_add(1);
-            state.async_pending_bytes_since_persist = state
-                .async_pending_bytes_since_persist
-                .saturating_add(1);
+            state.async_pending_bytes_since_persist =
+                state.async_pending_bytes_since_persist.saturating_add(1);
             let should_persist_mmap = should_persist_async_mmap(&state, force_flush);
             state
                 .buffer
@@ -381,10 +379,7 @@ impl AppenderEngine {
         if self.mode() != EngineMode::Async {
             return None;
         }
-        self.state
-            .lock()
-            .ok()
-            .map(|s| s.buffer.as_bytes().to_vec())
+        self.state.lock().ok().map(|s| s.buffer.as_bytes().to_vec())
     }
 
     pub fn buffer_capacity(&self) -> usize {
@@ -505,7 +500,9 @@ fn run_worker_loop(
                     match state.try_lock() {
                         Ok(mut s) => {
                             pending_async_flush.store(false, Ordering::Release);
-                            flush_pending_locked(&mut s, move_file, false).map_err(|_| ()).unwrap_or(false)
+                            flush_pending_locked(&mut s, move_file, false)
+                                .map_err(|_| ())
+                                .unwrap_or(false)
                         }
                         Err(_) => {
                             thread::sleep(ASYNC_FLUSH_RETRY_DELAY);
@@ -589,18 +586,21 @@ fn flush_pending_locked(
 
         {
             let pending = state.buffer.as_bytes();
-            let recovered = &pending[..scan.valid_len];
             if scan.recovered_pending_block {
-                let end = [MAGIC_END];
-                state.file_manager.append_log_slices(
-                    &[recovered, &end],
+                // Keep the recovered block contiguous so another process cannot
+                // interleave between payload bytes and the repaired tail marker.
+                let mut recovered = Vec::with_capacity(scan.valid_len.saturating_add(1));
+                recovered.extend_from_slice(&pending[..scan.valid_len]);
+                recovered.push(MAGIC_END);
+                state.file_manager.append_log_bytes(
+                    &recovered,
                     state.max_file_size,
                     move_file,
                     false,
                 )?;
             } else {
                 state.file_manager.append_log_bytes(
-                    recovered,
+                    &pending[..scan.valid_len],
                     state.max_file_size,
                     move_file,
                     false,
@@ -612,9 +612,12 @@ fn flush_pending_locked(
         if write_startup_mmap_tips {
             let end = format!("~~~~~ end of mmap ~~~~~{}\n", current_mark_info());
             if let Some(end_block) = build_sync_tip_block(sample_header, &end) {
-                state
-                    .file_manager
-                    .append_log_bytes(&end_block, state.max_file_size, false, false)?;
+                state.file_manager.append_log_bytes(
+                    &end_block,
+                    state.max_file_size,
+                    false,
+                    false,
+                )?;
             }
         }
         flushed = true;

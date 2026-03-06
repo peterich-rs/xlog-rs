@@ -74,17 +74,20 @@ pub fn oneshot_flush(
         }
     }
 
-    let recovered = &data[..scan.valid_len];
     if scan.recovered_pending_block {
-        let end = [MAGIC_END];
+        // Keep the recovered block contiguous so another process cannot
+        // interleave between payload bytes and the repaired tail marker.
+        let mut recovered = Vec::with_capacity(scan.valid_len.saturating_add(1));
+        recovered.extend_from_slice(&data[..scan.valid_len]);
+        recovered.push(MAGIC_END);
         if file_manager
-            .append_log_slices(&[recovered, &end], max_file_size, false, false)
+            .append_log_bytes(&recovered, max_file_size, false, false)
             .is_err()
         {
             return FileIoAction::WriteFailed;
         }
     } else if file_manager
-        .append_log_bytes(recovered, max_file_size, false, false)
+        .append_log_bytes(&data[..scan.valid_len], max_file_size, false, false)
         .is_err()
     {
         return FileIoAction::WriteFailed;
