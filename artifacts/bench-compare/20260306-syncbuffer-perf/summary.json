@@ -1,0 +1,30 @@
+{
+  "sync1t": {
+    "rust": {
+      "throughput_mps": 646165.728,
+      "lat_avg_ns": 1398.4953333333333,
+      "lat_p99_ns": 5111
+    },
+    "cpp": {
+      "throughput_mps": 577243.2623333333,
+      "lat_avg_ns": 1598.2833333333333,
+      "lat_p99_ns": 5861.333333333333
+    },
+    "rust_vs_cpp_throughput_ratio": 1.11939934194826,
+    "rust_vs_prev_throughput_delta_pct": 193.47731155855388
+  },
+  "sync4t": {
+    "rust": {
+      "throughput_mps": 327021.12200000003,
+      "lat_avg_ns": 11893.721666666666,
+      "lat_p99_ns": 83319.66666666667
+    },
+    "cpp": {
+      "throughput_mps": 375983.162,
+      "lat_avg_ns": 10359.508,
+      "lat_p99_ns": 52555.666666666664
+    },
+    "rust_vs_cpp_throughput_ratio": 0.8697759768295157,
+    "rust_vs_prev_throughput_delta_pct": 95.36248847107196
+  }
+}

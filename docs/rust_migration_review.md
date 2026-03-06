@@ -68,6 +68,11 @@
    - 当前已经先落了一阶段：sync 写入改为先 snapshot `AppenderEngine` 配置再锁外 append；`FileManager` plain 路径收敛到单次 runtime 锁，目录创建下沉到 `open(NotFound)` 兜底。
    - 结果是 plain sync `1T / 4T` 都有实质提升，说明这个方向比继续抠边界探测更值钱。
 
+5. **[Sync Active File] 对齐 C++ `FILE*` keep-open 缓冲写模型**
+   - 这条本轮已经落地，而且收益比预期更大。C++ sync steady-state 本质上是“常驻 `FILE*` + `fwrite`”，带 stdio 用户态缓冲；Rust 之前是“常驻 `File` + `write_all`”，固定 syscall 成本明显更高。
+   - 当前 `FileManager` 已把 keep-open 活跃文件改为 `BUFSIZ` 对齐的用户态缓冲，并在关闭、换文件、维护路径上显式冲刷。
+   - 结果是 plain sync `1T` 已经反超 C++，`4T` 也提升到 C++ 的约 `87%`。这基本证明：sync 的“固定成本”阶段已经收敛，后续重点应转到多线程竞争，而不是继续放大边界路径问题。
+
 ### 5.2 仍有价值，但要先做 profiling 再决定
 
 1. **[AppenderEngine::state] 继续收窄 engine 串行区**
@@ -112,7 +117,7 @@
 
 下一步只保留两类内容：
 
-1. sync plain steady-state 继续收敛，优先压活跃文件写入串行区。
+1. sync `4T` steady-state 继续收敛，优先压活跃文件写入串行区竞争。
 2. 基于新的 threaded benchmark，对 `AppenderEngine::state` 是否继续拆分做 profiling 决策。
 
 其余优化想法保留在文档中，但默认视为“实验项”或“后置项”，不再并行扩散实现范围。
