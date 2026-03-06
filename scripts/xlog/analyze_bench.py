@@ -227,10 +227,21 @@ def component_summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     for row in rows:
         by_variant.setdefault(str(row.get("variant", "unknown")), []).append(row)
 
+    def numeric_values(items: Sequence[Dict[str, Any]], key: str) -> List[float]:
+        out: List[float] = []
+        for item in items:
+            value = item.get(key)
+            if isinstance(value, (int, float)):
+                out.append(float(value))
+        return out
+
     variants = []
     for variant, items in sorted(by_variant.items()):
         ops = [float(i.get("ops_per_sec", 0.0)) for i in items]
         ratios = [float(i.get("ratio", 0.0)) for i in items]
+        cpu_user = numeric_values(items, "cpu_user_ms")
+        cpu_system = numeric_values(items, "cpu_system_ms")
+        rss = numeric_values(items, "max_rss_kb")
         variants.append(
             {
                 "variant": variant,
@@ -240,6 +251,11 @@ def component_summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 "ratio_mean": sum(ratios) / len(ratios),
                 "ratio_min": min(ratios),
                 "ratio_max": max(ratios),
+                "cpu_user_ms_mean": (sum(cpu_user) / len(cpu_user)) if cpu_user else None,
+                "cpu_user_ms_median": median(cpu_user) if cpu_user else None,
+                "cpu_system_ms_mean": (sum(cpu_system) / len(cpu_system)) if cpu_system else None,
+                "cpu_system_ms_median": median(cpu_system) if cpu_system else None,
+                "max_rss_kb_max": max(rss) if rss else None,
             }
         )
 
@@ -570,9 +586,25 @@ def main() -> None:
     if comp_summary.get("has_components"):
         lines.append("## Component Microbench")
         lines.append("")
+
+        def fmt_opt(value: Any, digits: int = 3) -> str:
+            if value is None:
+                return "-"
+            return f"{float(value):.{digits}f}"
+
         lines.extend(
             to_markdown_table(
-                ["Variant", "Count", "Ops/s Mean", "Ops/s Median", "Ratio Mean", "Ratio Range"],
+                [
+                    "Variant",
+                    "Count",
+                    "Ops/s Mean",
+                    "Ops/s Median",
+                    "Ratio Mean",
+                    "CPU User ms Mean",
+                    "CPU Sys ms Mean",
+                    "Max RSS KB",
+                    "Ratio Range",
+                ],
                 [
                     [
                         v["variant"],
@@ -580,6 +612,9 @@ def main() -> None:
                         f"{v['ops_per_sec_mean']:.3f}",
                         f"{v['ops_per_sec_median']:.3f}",
                         f"{v['ratio_mean']:.6f}",
+                        fmt_opt(v.get("cpu_user_ms_mean")),
+                        fmt_opt(v.get("cpu_system_ms_mean")),
+                        fmt_opt(v.get("max_rss_kb_max"), 0),
                         f"{v['ratio_min']:.6f}..{v['ratio_max']:.6f}",
                     ]
                     for v in comp_summary["variants"]

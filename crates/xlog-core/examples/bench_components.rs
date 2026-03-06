@@ -62,6 +62,20 @@ struct Options {
     io_iterations: usize,
 }
 
+#[derive(Copy, Clone)]
+struct ResourceSnapshot {
+    user_us: i64,
+    sys_us: i64,
+    max_rss_kb: i64,
+}
+
+#[derive(Copy, Clone, Default)]
+struct ResourceDelta {
+    cpu_user_ms: Option<f64>,
+    cpu_system_ms: Option<f64>,
+    max_rss_kb: Option<i64>,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -195,23 +209,24 @@ fn run_crypto(opts: &Options) -> Result<(), String> {
     let mut block = make_payload(aligned, 0x1234_5678_9ABC_DEF0);
     let input_bytes = aligned.saturating_mul(opts.iterations);
 
-    let start = Instant::now();
+    let (start, start_res) = begin_measurement();
     for _ in 0..opts.iterations {
         tea_encrypt_in_place(black_box(block.as_mut_slice()), black_box(&key));
     }
-    let elapsed = start.elapsed();
+    let (elapsed_ms, resources) = end_measurement(start, start_res);
     emit_result(
         "crypto",
         "tea_encrypt",
         opts.payload_size,
         opts.iterations,
-        elapsed.as_secs_f64() * 1000.0,
+        elapsed_ms,
         input_bytes,
         input_bytes,
         1.0,
+        resources,
     );
 
-    let start = Instant::now();
+    let (start, start_res) = begin_measurement();
     let mut sink = 0u64;
     for idx in 0..opts.iterations {
         let mut private_key = [0u8; 32];
@@ -226,17 +241,18 @@ fn run_crypto(opts: &Options) -> Result<(), String> {
         sink = sink.wrapping_add(derived.client_pubkey()[0] as u64);
     }
     black_box(sink);
-    let elapsed = start.elapsed();
+    let (elapsed_ms, resources) = end_measurement(start, start_res);
     let input_bytes = 32usize.saturating_mul(opts.iterations);
     emit_result(
         "crypto",
         "ecdh_derive",
         32,
         opts.iterations,
-        elapsed.as_secs_f64() * 1000.0,
+        elapsed_ms,
         input_bytes,
         input_bytes,
         1.0,
+        resources,
     );
 
     Ok(())
@@ -259,21 +275,21 @@ fn run_formatter(opts: &Options) -> Result<(), String> {
     };
 
     let mut sink = 0usize;
-    let start = Instant::now();
+    let (start, start_res) = begin_measurement();
     for _ in 0..opts.iterations {
         let line = format_record(black_box(&record), black_box(&payload));
         sink = sink.wrapping_add(line.len());
         black_box(&line);
     }
     black_box(sink);
-    let elapsed = start.elapsed();
+    let (elapsed_ms, resources) = end_measurement(start, start_res);
     let input_bytes = opts.payload_size.saturating_mul(opts.iterations);
     emit_result(
         "formatter",
         "format_record_alloc",
         opts.payload_size,
         opts.iterations,
-        elapsed.as_secs_f64() * 1000.0,
+        elapsed_ms,
         input_bytes,
         sink,
         if input_bytes == 0 {
@@ -281,11 +297,12 @@ fn run_formatter(opts: &Options) -> Result<(), String> {
         } else {
             sink as f64 / input_bytes as f64
         },
+        resources,
     );
 
     let mut out = String::with_capacity(16 * 1024);
     let mut sink_reuse = 0usize;
-    let start = Instant::now();
+    let (start, start_res) = begin_measurement();
     for _ in 0..opts.iterations {
         format_record_parts_into(
             &mut out,
@@ -304,13 +321,13 @@ fn run_formatter(opts: &Options) -> Result<(), String> {
         black_box(&out);
     }
     black_box(sink_reuse);
-    let elapsed = start.elapsed();
+    let (elapsed_ms, resources) = end_measurement(start, start_res);
     emit_result(
         "formatter",
         "format_record_parts_into",
         opts.payload_size,
         opts.iterations,
-        elapsed.as_secs_f64() * 1000.0,
+        elapsed_ms,
         input_bytes,
         sink_reuse,
         if input_bytes == 0 {
@@ -318,6 +335,7 @@ fn run_formatter(opts: &Options) -> Result<(), String> {
         } else {
             sink_reuse as f64 / input_bytes as f64
         },
+        resources,
     );
 
     Ok(())
@@ -397,7 +415,7 @@ where
 {
     let input_bytes = payload.len().saturating_mul(opts.iterations);
     let mut compressed = Vec::with_capacity(input_bytes / 2 + 1);
-    let start = Instant::now();
+    let (start, start_res) = begin_measurement();
     for _ in 0..opts.iterations {
         compressor
             .compress_chunk(black_box(payload), &mut compressed)
@@ -406,7 +424,7 @@ where
     compressor
         .flush(&mut compressed)
         .map_err(|e| format!("{variant} flush failed: {e}"))?;
-    let elapsed = start.elapsed();
+    let (elapsed_ms, resources) = end_measurement(start, start_res);
     black_box(&compressed);
 
     // Light decode sanity-check to avoid benchmarking broken output.
@@ -429,10 +447,11 @@ where
         variant,
         opts.payload_size,
         opts.iterations,
-        elapsed.as_secs_f64() * 1000.0,
+        elapsed_ms,
         input_bytes,
         output_bytes,
         ratio,
+        resources,
     );
 
     Ok(())
@@ -459,7 +478,7 @@ fn bench_append_path_variant(
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
-    let start = Instant::now();
+    let (start, start_res) = begin_measurement();
     for _ in 0..opts.io_iterations {
         manager
             .append_log_bytes(
@@ -470,7 +489,7 @@ fn bench_append_path_variant(
             )
             .map_err(|e| format!("{variant} append failed: {e}"))?;
     }
-    let elapsed = start.elapsed();
+    let (elapsed_ms, resources) = end_measurement(start, start_res);
 
     let input_bytes = payload.len().saturating_mul(opts.io_iterations);
     let mut output_bytes = total_size_under(&log_dir);
@@ -487,10 +506,11 @@ fn bench_append_path_variant(
         variant,
         opts.payload_size,
         opts.io_iterations,
-        elapsed.as_secs_f64() * 1000.0,
+        elapsed_ms,
         input_bytes,
         output_bytes,
         ratio,
+        resources,
     );
     Ok(())
 }
@@ -510,7 +530,7 @@ fn bench_move_old_cache_files_variant(opts: &Options, payload: &[u8]) -> Result<
 
     let rounds = opts.io_iterations.min(1_000).max(1);
     let mut input_bytes = 0usize;
-    let start = Instant::now();
+    let (start, start_res) = begin_measurement();
     for idx in 0..rounds {
         let path = cache_dir.join(format!("bench-move-{idx}.xlog"));
         fs::write(&path, payload).map_err(|e| format!("{variant} seed file write failed: {e}"))?;
@@ -519,7 +539,7 @@ fn bench_move_old_cache_files_variant(opts: &Options, payload: &[u8]) -> Result<
             .move_old_cache_files(0)
             .map_err(|e| format!("{variant} move failed: {e}"))?;
     }
-    let elapsed = start.elapsed();
+    let (elapsed_ms, resources) = end_measurement(start, start_res);
 
     let output_bytes = total_size_under(&log_dir).saturating_add(total_size_under(&cache_dir));
     let ratio = if input_bytes == 0 {
@@ -532,10 +552,11 @@ fn bench_move_old_cache_files_variant(opts: &Options, payload: &[u8]) -> Result<
         variant,
         opts.payload_size,
         rounds,
-        elapsed.as_secs_f64() * 1000.0,
+        elapsed_ms,
         input_bytes,
         output_bytes,
         ratio,
+        resources,
     );
     Ok(())
 }
@@ -555,7 +576,7 @@ fn bench_flush_via_delete_expired_variant(opts: &Options, payload: &[u8]) -> Res
 
     let rounds = opts.io_iterations.min(1_000).max(1);
     let max_file_size = (payload.len().max(64) as u64).saturating_mul(1024 * 1024);
-    let start = Instant::now();
+    let (start, start_res) = begin_measurement();
     for _ in 0..rounds {
         manager
             .append_log_bytes(payload, max_file_size, false, true)
@@ -564,7 +585,7 @@ fn bench_flush_via_delete_expired_variant(opts: &Options, payload: &[u8]) -> Res
             .delete_expired_files(365 * 24 * 60 * 60)
             .map_err(|e| format!("{variant} flush route failed: {e}"))?;
     }
-    let elapsed = start.elapsed();
+    let (elapsed_ms, resources) = end_measurement(start, start_res);
 
     let input_bytes = payload.len().saturating_mul(rounds);
     let output_bytes = total_size_under(&log_dir).saturating_add(total_size_under(&cache_dir));
@@ -578,10 +599,11 @@ fn bench_flush_via_delete_expired_variant(opts: &Options, payload: &[u8]) -> Res
         variant,
         opts.payload_size,
         rounds,
-        elapsed.as_secs_f64() * 1000.0,
+        elapsed_ms,
         input_bytes,
         output_bytes,
         ratio,
+        resources,
     );
     Ok(())
 }
@@ -613,11 +635,11 @@ fn bench_delete_expired_files_variant(opts: &Options, payload: &[u8]) -> Result<
         .append_log_bytes(payload, max_file_size, false, true)
         .map_err(|e| format!("{variant} active append failed: {e}"))?;
 
-    let start = Instant::now();
+    let (start, start_res) = begin_measurement();
     manager
         .delete_expired_files(1)
         .map_err(|e| format!("{variant} delete failed: {e}"))?;
-    let elapsed = start.elapsed();
+    let (elapsed_ms, resources) = end_measurement(start, start_res);
 
     let logical_ops = seed_files.saturating_mul(2).saturating_add(1);
     let input_bytes = payload.len().saturating_mul(logical_ops);
@@ -632,10 +654,11 @@ fn bench_delete_expired_files_variant(opts: &Options, payload: &[u8]) -> Result<
         variant,
         opts.payload_size,
         logical_ops,
-        elapsed.as_secs_f64() * 1000.0,
+        elapsed_ms,
         input_bytes,
         output_bytes,
         ratio,
+        resources,
     );
     Ok(())
 }
@@ -668,6 +691,61 @@ fn total_size_under(path: &Path) -> usize {
     total
 }
 
+fn begin_measurement() -> (Instant, Option<ResourceSnapshot>) {
+    (Instant::now(), capture_resource_snapshot())
+}
+
+fn end_measurement(start: Instant, start_res: Option<ResourceSnapshot>) -> (f64, ResourceDelta) {
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let end_res = capture_resource_snapshot();
+    let delta = match (start_res, end_res) {
+        (Some(s), Some(e)) => ResourceDelta {
+            cpu_user_ms: Some((e.user_us - s.user_us) as f64 / 1000.0),
+            cpu_system_ms: Some((e.sys_us - s.sys_us) as f64 / 1000.0),
+            max_rss_kb: Some(e.max_rss_kb),
+        },
+        _ => ResourceDelta::default(),
+    };
+    (elapsed_ms, delta)
+}
+
+#[cfg(unix)]
+fn capture_resource_snapshot() -> Option<ResourceSnapshot> {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    if rc != 0 {
+        return None;
+    }
+
+    let user_us = usage
+        .ru_utime
+        .tv_sec
+        .saturating_mul(1_000_000)
+        .saturating_add(usage.ru_utime.tv_usec as i64);
+    let sys_us = usage
+        .ru_stime
+        .tv_sec
+        .saturating_mul(1_000_000)
+        .saturating_add(usage.ru_stime.tv_usec as i64);
+
+    let raw_max_rss = usage.ru_maxrss;
+    #[cfg(target_os = "macos")]
+    let max_rss_kb = raw_max_rss.saturating_div(1024);
+    #[cfg(not(target_os = "macos"))]
+    let max_rss_kb = raw_max_rss;
+
+    Some(ResourceSnapshot {
+        user_us,
+        sys_us,
+        max_rss_kb,
+    })
+}
+
+#[cfg(not(unix))]
+fn capture_resource_snapshot() -> Option<ResourceSnapshot> {
+    None
+}
+
 fn emit_result(
     component: &str,
     variant: &str,
@@ -677,12 +755,25 @@ fn emit_result(
     input_bytes: usize,
     output_bytes: usize,
     ratio: f64,
+    resources: ResourceDelta,
 ) {
     let elapsed_s = (elapsed_ms / 1000.0).max(1e-12);
     let ops_per_sec = iterations as f64 / elapsed_s;
     let bytes_per_sec = input_bytes as f64 / elapsed_s;
+    let cpu_user_ms = resources
+        .cpu_user_ms
+        .map(|v| format!("{v:.3}"))
+        .unwrap_or_else(|| "null".to_string());
+    let cpu_system_ms = resources
+        .cpu_system_ms
+        .map(|v| format!("{v:.3}"))
+        .unwrap_or_else(|| "null".to_string());
+    let max_rss_kb = resources
+        .max_rss_kb
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
     println!(
-        "{{\"component\":\"{}\",\"variant\":\"{}\",\"payload_size\":{},\"iterations\":{},\"elapsed_ms\":{:.3},\"ops_per_sec\":{:.3},\"bytes_per_sec\":{:.3},\"input_bytes\":{},\"output_bytes\":{},\"ratio\":{:.6}}}",
+        "{{\"component\":\"{}\",\"variant\":\"{}\",\"payload_size\":{},\"iterations\":{},\"elapsed_ms\":{:.3},\"ops_per_sec\":{:.3},\"bytes_per_sec\":{:.3},\"input_bytes\":{},\"output_bytes\":{},\"ratio\":{:.6},\"cpu_user_ms\":{},\"cpu_system_ms\":{},\"max_rss_kb\":{}}}",
         component,
         variant,
         payload_size,
@@ -692,7 +783,10 @@ fn emit_result(
         bytes_per_sec,
         input_bytes,
         output_bytes,
-        ratio
+        ratio,
+        cpu_user_ms,
+        cpu_system_ms,
+        max_rss_kb
     );
 }
 

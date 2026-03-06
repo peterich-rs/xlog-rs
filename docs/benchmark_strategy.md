@@ -140,6 +140,8 @@ benchmark 的角色应拆成两层：
    - `move_old_cache_files`
    - `flush_via_delete_expired`
    - `delete_expired_files`
+5. 资源指标
+   - 组件基准输出 `cpu_user_ms / cpu_system_ms / max_rss_kb`
 
 这意味着 benchmark 体系已经不再只有端到端吞吐对比，也开始具备初步归因能力。
 
@@ -347,6 +349,6 @@ benchmark 体系达到“可信基线 + 基本可归因”至少需要满足：
 
 仍未完成（下一阶段重点）：
 
-1. 文件 I/O 微基准第三阶段：补资源指标（CPU/IO/内存）与更细粒度子阶段
+1. 文件 I/O 微基准第三阶段：补充 I/O 级吞吐/系统调用粒度指标与更细粒度子阶段
 2. 真实业务分布回放数据集接入（当前仍以合成 profile 为主）
 3. CI 周期化策略固化（各矩阵频率、规模上限、阻断阈值）
