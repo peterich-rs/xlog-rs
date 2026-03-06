@@ -13,11 +13,13 @@ Options:
   --messages <n>          Benchmark message count (default: 20000)
   --mode <async|sync>     Benchmark appender mode (default: async)
   --compress <zlib|zstd>  Benchmark compression mode (default: zlib)
+  --threads <n>           Benchmark worker threads (default: 1)
+  --flush-every <n>       Async flush cadence per thread (default: 0)
   --count <n>             Record count for phase2c2 fixture generation (default: 32)
   --skip-setup            Skip Python2 decoder setup for phase2c2
   --skip-phase2c2         Skip official decoder compatibility regression
   --skip-bindings         Skip JNI/UniFFI/NAPI cargo checks
-  --skip-bench            Skip Rust backend benchmark
+  --skip-bench            Skip backend benchmarks
   -h, --help              Show help
 USAGE
 }
@@ -29,6 +31,8 @@ out_dir=""
 messages=20000
 mode="async"
 compress="zlib"
+threads=1
+flush_every=0
 count=32
 skip_setup=0
 skip_phase2c2=0
@@ -51,6 +55,14 @@ while (($# > 0)); do
       ;;
     --compress)
       compress="${2:-}"
+      shift 2
+      ;;
+    --threads)
+      threads="${2:-}"
+      shift 2
+      ;;
+    --flush-every)
+      flush_every="${2:-}"
       shift 2
       ;;
     --count)
@@ -95,6 +107,14 @@ if [[ "$compress" != "zlib" && "$compress" != "zstd" ]]; then
 fi
 if ! [[ "$messages" =~ ^[0-9]+$ ]] || [[ "$messages" -eq 0 ]]; then
   echo "--messages must be a positive integer" >&2
+  exit 2
+fi
+if ! [[ "$threads" =~ ^[0-9]+$ ]] || [[ "$threads" -eq 0 ]]; then
+  echo "--threads must be a positive integer" >&2
+  exit 2
+fi
+if ! [[ "$flush_every" =~ ^[0-9]+$ ]]; then
+  echo "--flush-every must be a non-negative integer" >&2
   exit 2
 fi
 if ! [[ "$count" =~ ^[0-9]+$ ]] || [[ "$count" -eq 0 ]]; then
@@ -146,7 +166,7 @@ run_step() {
 }
 
 echo "[phase5] artifact_root=${out_dir}" | tee -a "$summary_file"
-echo "[phase5] bench messages=${messages}, mode=${mode}, compress=${compress}" | tee -a "$summary_file"
+echo "[phase5] bench messages=${messages}, mode=${mode}, compress=${compress}, threads=${threads}, flush_every=${flush_every}" | tee -a "$summary_file"
 
 if [[ "$skip_phase2c2" -eq 0 ]]; then
   phase2c2_cmd=(
@@ -175,13 +195,34 @@ if [[ "$skip_bench" -eq 0 ]]; then
       --prefix "phase5-rust" \
       --messages "$messages" \
       --mode "$mode" \
-      --compress "$compress"
+      --compress "$compress" \
+      --threads "$threads" \
+      --flush-every "$flush_every"
 
   if [[ "$last_exit_code" -eq 0 ]]; then
     metric_line="$(grep -E '^\{.*"throughput_mps".*\}$' "${logs_dir}/bench_rust.log" | tail -n 1 || true)"
     if [[ -n "$metric_line" ]]; then
       echo "$metric_line" >> "$metrics_file"
       echo "[phase5] metric rust: ${metric_line}" | tee -a "$summary_file"
+    fi
+  fi
+
+  run_step \
+    "bench_cpp" \
+    cargo run --release -p mars-xlog --example bench_backend --no-default-features --features cpp-backend -- \
+      --out-dir "${bench_dir}/cpp" \
+      --prefix "phase5-cpp" \
+      --messages "$messages" \
+      --mode "$mode" \
+      --compress "$compress" \
+      --threads "$threads" \
+      --flush-every "$flush_every"
+
+  if [[ "$last_exit_code" -eq 0 ]]; then
+    metric_line="$(grep -E '^\{.*"throughput_mps".*\}$' "${logs_dir}/bench_cpp.log" | tail -n 1 || true)"
+    if [[ -n "$metric_line" ]]; then
+      echo "$metric_line" >> "$metrics_file"
+      echo "[phase5] metric cpp: ${metric_line}" | tee -a "$summary_file"
     fi
   fi
 fi

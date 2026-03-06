@@ -11,6 +11,7 @@ crate-type = ["rlib"]
 libc = { workspace = true }
 thiserror = { workspace = true }
 mars-xlog-core = { path = "../xlog-core", version = "0.1.0", optional = true }
+mars-xlog-sys = { path = "../xlog-sys", version = "0.1.0", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"], optional = true }
@@ -20,6 +21,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 default = ["rust-backend"]
 # Rust 后端
 rust-backend = ["dep:mars-xlog-core", "dep:chrono"]
+# C++ backend (via mars-xlog-sys FFI)
+cpp-backend = ["dep:mars-xlog-sys"]
 # 控制是否启用 Rust 侧便捷宏
 macros = []
 tracing = ["dep:tracing", "dep:tracing-subscriber"]

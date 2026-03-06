@@ -2,6 +2,12 @@ use std::sync::Arc;
 
 use crate::{AppenderMode, FileIoAction, LogLevel, RawLogMeta, XlogConfig, XlogError};
 
+#[cfg(all(feature = "rust-backend", feature = "cpp-backend"))]
+compile_error!("enable only one backend feature at a time");
+
+#[cfg(not(any(feature = "rust-backend", feature = "cpp-backend")))]
+compile_error!("xlog requires either `rust-backend` or `cpp-backend`");
+
 #[cfg(any(
     target_os = "ios",
     target_os = "macos",
@@ -12,6 +18,8 @@ use crate::ConsoleFun;
 
 #[cfg(feature = "rust-backend")]
 mod rust;
+#[cfg(feature = "cpp-backend")]
+mod cpp;
 
 pub(crate) trait XlogBackend: Send + Sync {
     fn instance(&self) -> usize;
@@ -82,8 +90,8 @@ pub(crate) fn provider() -> &'static dyn XlogBackendProvider {
         return rust::provider();
     }
 
-    #[cfg(not(feature = "rust-backend"))]
+    #[cfg(feature = "cpp-backend")]
     {
-        compile_error!("xlog requires `rust-backend`");
+        return cpp::provider();
     }
 }
