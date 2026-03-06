@@ -54,19 +54,20 @@ impl PersistentBuffer {
         capacity: usize,
     ) -> Result<Self, BufferError> {
         let mut store = MmapStore::open_or_create(path, capacity)?;
-        let recovered = recover_blocks(store.as_slice());
-        let len = recovered.bytes.len();
+        let scan = scan_recovery(store.as_slice());
+        let len = scan.valid_len + usize::from(scan.recovered_pending_block);
+        let needs_repair = scan.recovered_pending_block || scan.dropped_nonzero_tail_bytes > 0;
 
-        {
+        if needs_repair {
             let data = store.as_mut_slice();
-            if len > 0 {
-                data[..len].copy_from_slice(&recovered.bytes);
+            if scan.recovered_pending_block {
+                data[scan.valid_len] = MAGIC_END;
             }
             if len < data.len() {
                 data[len..].fill(0);
             }
+            store.flush()?;
         }
-        store.flush()?;
 
         Ok(Self { store, len })
     }
@@ -257,7 +258,8 @@ impl PersistentBuffer {
             } else if next_len < data.len() {
                 data[next_len] = 0;
             }
-            let payload_len = u32::try_from(next_len - HEADER_LEN).map_err(|_| BufferError::BlockLenOverflow)?;
+            let payload_len =
+                u32::try_from(next_len - HEADER_LEN).map_err(|_| BufferError::BlockLenOverflow)?;
             data[5..9].copy_from_slice(&payload_len.to_le_bytes());
             update_end_hour_in_place(&mut data[..HEADER_LEN], end_hour)
                 .map_err(|_| BufferError::InvalidBlock)?;
@@ -340,7 +342,7 @@ pub fn recover_blocks(raw: &[u8]) -> RecoveryResult {
     }
 }
 
-fn scan_recovery(raw: &[u8]) -> RecoveryScan {
+pub fn scan_recovery(raw: &[u8]) -> RecoveryScan {
     let mut offset = 0usize;
     let mut recovered_pending_block = false;
 

@@ -600,12 +600,13 @@ P2/P3 执行后快照（2026-03-06，`artifacts/bench-compare/20260306-perf5`，
 | `20260306-perf6` | sync Rust | 192,058.91 | 4,968.84 | 18,347.00 | 当前可复现的 sync 参考结果 |
 | `20260306-perf7` | async Rust | 213,855.31 | 4,537.35 | 39,194.67 | `async mmap persist cadence` 调优后的 async 专项结果 |
 | `20260306-perf8` | async Rust | 256,989.09 | 3,772.17 | 36,416.67 | `async_state` 短锁 checkout + 锁外压缩/加密/engine 提交后的 async 专项结果 |
+| `20260306-perf9` | async Rust | 234,499.66 | 4,055.71 | 35,583.67 | `finalize/recover/oneshot` 边界复制与尾块处理收敛后的专项结果；仅记录，不替换主基线 |
 
 当前有效对齐结论（Rust 对保留 C++ 基线）：
 
 - async：以 `20260306-perf8` 为当前参考，Rust 吞吐约为 C++ 的 77.1%，平均延迟约 1.33x，p99 约 5.50x。
 - sync：以 `20260306-perf6` 为当前参考，Rust 吞吐约为 C++ 的 39.4%，平均延迟约 2.77x，p99 约 1.33x。
-- 说明：`20260306-perf8` 仅更新 async 热路径；sync 当前仍采用 `20260306-perf6` 作为阶段参考，避免混入无关环境波动。
+- 说明：`20260306-perf8` 仍作为 async 主参考；`20260306-perf9` 主要验证边界路径复制收敛，p99 略降但均值受环境波动影响，不提升为阶段基线。sync 当前仍采用 `20260306-perf6` 作为阶段参考。
 
 Phase 6 已完成项（仅保留仍有信息价值的条目）：
 
@@ -616,12 +617,12 @@ Phase 6 已完成项（仅保留仍有信息价值的条目）：
 5. formatter/compress/encrypt 热路径已复用 scratch buffer，async TEA 改为原位加密。
 6. async mmap 持久化已从固定小步长触发改为“更新次数 + 增量字节数 + 时间窗 + force flush”的组合策略。
 7. `RustBackend::async_state` 已改为短锁 checkout + 锁外压缩/加密/engine 提交，保留单 backend 顺序语义的同时收窄串行区。
+8. `PersistentBuffer` 启动恢复与 `oneshot_flush` 已改为 scan + slice 路径，避免整段 `recover_blocks()`/`read_exact()` 复制；async finalize 空尾块不再执行无意义 append。
 
 当前剩余差距（只保留主计划内仍值得做的项）：
 
-1. async：finalize/recover/oneshot 边界仍有剩余复制与尾块收敛成本。
-2. sync：轮转边界和 cache/log 切换边界仍有额外 metadata/path 探测。
-3. benchmark：仍缺少可直接同轮重跑的 C++ backend harness。
+1. sync：轮转边界和 cache/log 切换边界仍有额外 metadata/path 探测。
+2. benchmark：仍缺少可直接同轮重跑的 C++ backend harness。
 
 性能优化约束（必须遵守）：
 
@@ -638,7 +639,7 @@ Phase 6 已完成项（仅保留仍有信息价值的条目）：
 | 已完成 | sync 活跃文件句柄复用 + append target cache | `crates/xlog-core/src/file_manager.rs`、`crates/xlog-core/src/oneshot.rs` | `cargo test -p mars-xlog-core file_manager:: -- --nocapture` 通过；见 `20260306-perf6` |
 | 已完成 | async mmap persist cadence 调优 | `crates/xlog-core/src/appender_engine.rs` | `cargo test -p mars-xlog --lib -- --nocapture` 通过；见 `20260306-perf7` |
 | 已完成 | 收窄 `RustBackend::async_state` 串行区，改为短锁 checkout + 锁外压缩/加密/engine 提交 | `crates/xlog/src/backend/rust.rs` | `cargo test -p mars-xlog --lib -- --nocapture` 通过；见 `20260306-perf8` |
-| 待执行 | 压缩 finalize / recover / oneshot 边界的剩余复制与尾块处理 | `crates/xlog/src/backend/rust.rs`、`crates/xlog-core/src/buffer.rs`、`crates/xlog-core/src/oneshot.rs` | 目标：减少边界路径内存复制与尾块抖动 |
+| 已完成 | 收敛 finalize / recover / oneshot 边界复制与尾块处理 | `crates/xlog/src/backend/rust.rs`、`crates/xlog-core/src/buffer.rs`、`crates/xlog-core/src/oneshot.rs` | `cargo test -p mars-xlog-core --test mmap_recovery --test oneshot_flush -- --nocapture` 通过；见 `20260306-perf9` |
 | 待执行 | 继续减少 sync 轮转边界的 metadata/path 探测 | `crates/xlog-core/src/file_manager.rs` | 目标：提升 sync 吞吐稳定性 |
 | 待执行 | 补齐独立 C++ backend benchmark harness，恢复同轮 Rust/C++ 对照 | `crates/xlog/examples/bench_backend.rs`、`scripts/xlog/*`、`crates/xlog-sys/*` | 目标：不依赖历史产物，直接产出同参数 A/B 数据 |
 

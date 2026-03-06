@@ -180,14 +180,16 @@ impl AsyncPendingState {
         if !self.compressor.finish(compress_scratch) {
             return false;
         }
-        if !self.append_encrypted(
-            compress_scratch,
-            crypto_scratch,
-            cipher,
-            engine,
-            end_hour,
-            force_flush,
-        ) {
+        if !compress_scratch.is_empty()
+            && !self.append_encrypted(
+                compress_scratch,
+                crypto_scratch,
+                cipher,
+                engine,
+                end_hour,
+                force_flush,
+            )
+        {
             return false;
         }
         engine.finalize_async_pending(end_hour, force_flush).is_ok()
