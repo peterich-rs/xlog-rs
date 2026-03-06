@@ -73,6 +73,11 @@
    - 当前 `FileManager` 已把 keep-open 活跃文件改为 `BUFSIZ` 对齐的用户态缓冲，并在关闭、换文件、维护路径上显式冲刷。
    - 结果是 plain sync `1T` 已经反超 C++，`4T` 也提升到 C++ 的约 `87%`。这基本证明：sync 的“固定成本”阶段已经收敛，后续重点应转到多线程竞争，而不是继续放大边界路径问题。
 
+6. **[Sync Plain 4T] 活跃文件命中后继续缩短 runtime 热路径**
+   - 这条本轮也已经落地。针对 `cache_dir == none` 且 keep-open 命中活跃文件的 plain sync 路径，现在已绕过冗余 `target / last-append` bookkeeping，只保留最短追加路径。
+   - 专项 benchmark 里，plain sync `4T` 已经反超 C++；全量矩阵 rerun 里也进一步抬高了 sync plain 的基线。这说明继续压 `FileManager::runtime` 锁内工作量仍然是对的。
+   - 同时也说明：下一阶段如果还要继续做 sync，应该更聚焦于多线程竞争本身，而不是继续做路径选择或边界探测。
+
 ### 5.2 仍有价值，但要先做 profiling 再决定
 
 1. **[AppenderEngine::state] 继续收窄 engine 串行区**
@@ -84,8 +89,8 @@
    - 在当前阶段，先没有证据表明它比减少内存复制、减少目录扫描更值钱，因此只保留为实验项，不进入当前主线。
 
 3. **[FileManager] 继续减少轮转边界和 cache/log 切换边界探测**
-   - 这条仍然有价值，但优先级已经下调。新的多轮矩阵显示，Rust sync 在 plain steady-state 下也明显落后，而 rotate/cache 边界带来的额外损耗反而不是当前最大项。
-   - 所以下一步不应再把边界探测当成 `P0`，而应把它视为 steady-state 问题收敛后的后续项。
+   - 这条仍然有价值，但优先级已经进一步下调。最新全量矩阵 rerun 里，`rotate-only` 已经接近 C++，`cache-only` 甚至已经领先 C++，说明边界路径不再是当前主差距。
+   - 所以下一步不应再把边界探测当成 `P0`，而应把它视为 plain `4T` 和 async `1T` 收敛后的后续项。
 
 ### 5.3 当前价值不高，暂不进入主线
 
@@ -118,6 +123,6 @@
 下一步只保留两类内容：
 
 1. sync `4T` steady-state 继续收敛，优先压活跃文件写入串行区竞争。
-2. 基于新的 threaded benchmark，对 `AppenderEngine::state` 是否继续拆分做 profiling 决策。
+2. async `1T` 固定成本与单线程 p99 继续收敛，重点看 formatter / engine state / flush cadence。
 
 其余优化想法保留在文档中，但默认视为“实验项”或“后置项”，不再并行扩散实现范围。

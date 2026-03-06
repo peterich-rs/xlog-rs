@@ -1,0 +1,9 @@
+scenario	messages	mode	threads	flush_every	cache_days	max_file_size
+async_1t	50000	async	1	0	0	0
+async_4t	80000	async	4	0	0	0
+async_4t_flush256	80000	async	4	256	0	0
+sync_1t	16000	sync	1	0	0	0
+sync_4t	24000	sync	4	0	0	0
+sync_4t_rotate_only	24000	sync	4	0	0	4096
+sync_4t_cache_only	24000	sync	4	0	1	0
+sync_4t_boundary	24000	sync	4	0	1	4096
