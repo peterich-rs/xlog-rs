@@ -1,6 +1,8 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::sync::mpsc::{
     channel as std_channel, sync_channel, Receiver as StdReceiver, SendError, Sender as StdSender,
     SyncSender, TryRecvError, TrySendError,
@@ -10,6 +12,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::TimeZone;
+use crossbeam_queue::ArrayQueue;
 use mars_xlog_core::appender_engine::{AppenderEngine, EngineMode};
 use mars_xlog_core::buffer::{PersistentBuffer, DEFAULT_BUFFER_BLOCK_LEN};
 use mars_xlog_core::compress::{StreamCompressor, ZlibStreamCompressor, ZstdStreamCompressor};
@@ -72,6 +75,8 @@ struct AsyncFrontend {
     tx: SyncSender<AsyncFrontendCommand>,
     accepting: Arc<AtomicBool>,
     flush_queued: Arc<AtomicBool>,
+    line_pools: Arc<[ArrayQueue<String>]>,
+    producer_shard_mask: AtomicU32,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -88,6 +93,7 @@ enum AsyncFrontendCommand {
 
 struct AsyncWriteCommand {
     line: String,
+    pool_shard: usize,
     now_hour: u8,
     force_flush: bool,
     profile: Option<AsyncWriteFrontProfile>,
@@ -413,23 +419,59 @@ const ASYNC_WARNING_THRESHOLD_DEN: usize = 5;
 const ASYNC_FRONTEND_QUEUE_CAPACITY: usize = 65536;
 const ASYNC_FRONTEND_FULL_RETRY_BEFORE_BLOCK: usize = 4;
 const ASYNC_FRONTEND_WRITE_BATCH_MAX: usize = 128;
+const ASYNC_LINE_POOL_SHARDS: usize = 16;
+const ASYNC_LINE_POOL_MAX_BUFFERS_PER_SHARD: usize = 256;
+const ASYNC_LINE_POOL_MAX_CAPACITY: usize = 8 * 1024;
+const ASYNC_LINE_BUFFER_INIT_CAPACITY: usize = 512;
+const ASYNC_LINE_POOL_SHARD_SENTINEL: usize = usize::MAX;
+
+fn current_async_line_pool_shard() -> usize {
+    thread_local! {
+        static ASYNC_LINE_POOL_SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+    ASYNC_LINE_POOL_SHARD.with(|slot| {
+        let cached = slot.get();
+        if cached != usize::MAX {
+            return cached;
+        }
+        let shard = (current_tid().unsigned_abs() as usize) % ASYNC_LINE_POOL_SHARDS;
+        slot.set(shard);
+        shard
+    })
+}
 
 impl AsyncFrontend {
     fn new(engine: Arc<AppenderEngine>, config: XlogConfig, cipher: EcdhTeaCipher) -> Self {
         let (tx, rx) = sync_channel::<AsyncFrontendCommand>(ASYNC_FRONTEND_QUEUE_CAPACITY);
         let accepting = Arc::new(AtomicBool::new(true));
         let flush_queued = Arc::new(AtomicBool::new(false));
+        let line_pools = Arc::<[ArrayQueue<String>]>::from(
+            (0..ASYNC_LINE_POOL_SHARDS)
+                .map(|_| ArrayQueue::new(ASYNC_LINE_POOL_MAX_BUFFERS_PER_SHARD))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
         let worker_flush_queued = Arc::clone(&flush_queued);
+        let worker_line_pools = Arc::clone(&line_pools);
         let worker = thread::Builder::new()
             .name("xlog-rust-async-frontend".to_string())
             .spawn(move || {
-                run_async_frontend_worker(rx, worker_flush_queued, engine, config, cipher);
+                run_async_frontend_worker(
+                    rx,
+                    worker_flush_queued,
+                    worker_line_pools,
+                    engine,
+                    config,
+                    cipher,
+                );
             })
             .expect("spawn rust async frontend worker");
         Self {
             tx,
             accepting,
             flush_queued,
+            line_pools,
+            producer_shard_mask: AtomicU32::new(0),
             worker: Mutex::new(Some(worker)),
         }
     }
@@ -506,6 +548,31 @@ impl AsyncFrontend {
         self.accepting.store(enabled, Ordering::Release);
     }
 
+    fn take_line_buffer(&self, shard: usize) -> String {
+        if let Some(mut line) = self.line_pools[shard].pop() {
+            line.clear();
+            return line;
+        }
+        String::with_capacity(ASYNC_LINE_BUFFER_INIT_CAPACITY)
+    }
+
+    fn recycle_line_buffer(&self, shard: usize, mut line: String) {
+        if shard == ASYNC_LINE_POOL_SHARD_SENTINEL {
+            return;
+        }
+        if line.capacity() > ASYNC_LINE_POOL_MAX_CAPACITY {
+            return;
+        }
+        line.clear();
+        let _ = self.line_pools[shard].push(line);
+    }
+
+    fn should_use_pooled_line_path(&self, shard: usize) -> bool {
+        let bit = 1u32 << shard;
+        let mask = self.producer_shard_mask.fetch_or(bit, Ordering::AcqRel) | bit;
+        mask.count_ones() > 1
+    }
+
     fn shutdown(&self) {
         self.set_accepting(false);
         let (ack_tx, ack_rx) = std_channel::<()>();
@@ -522,6 +589,7 @@ impl AsyncFrontend {
 fn run_async_frontend_worker(
     rx: StdReceiver<AsyncFrontendCommand>,
     flush_queued: Arc<AtomicBool>,
+    line_pools: Arc<[ArrayQueue<String>]>,
     engine: Arc<AppenderEngine>,
     config: XlogConfig,
     cipher: EcdhTeaCipher,
@@ -539,8 +607,9 @@ fn run_async_frontend_worker(
         };
         match first {
             AsyncFrontendCommand::Write(cmd) => {
+                let mut cmd = cmd;
                 handle_async_frontend_write(
-                    cmd,
+                    &mut cmd,
                     &engine,
                     &config,
                     &cipher,
@@ -550,12 +619,14 @@ fn run_async_frontend_worker(
                     &mut crypto_scratch,
                     &mut block_scratch,
                 );
+                recycle_line_buffer_to_pool(line_pools.as_ref(), cmd.pool_shard, cmd.line);
                 let mut pending_control: Option<AsyncFrontendCommand> = None;
                 for _ in 0..ASYNC_FRONTEND_WRITE_BATCH_MAX.saturating_sub(1) {
                     match rx.try_recv() {
                         Ok(AsyncFrontendCommand::Write(next)) => {
+                            let mut next = next;
                             handle_async_frontend_write(
-                                next,
+                                &mut next,
                                 &engine,
                                 &config,
                                 &cipher,
@@ -564,6 +635,11 @@ fn run_async_frontend_worker(
                                 &mut compress_scratch,
                                 &mut crypto_scratch,
                                 &mut block_scratch,
+                            );
+                            recycle_line_buffer_to_pool(
+                                line_pools.as_ref(),
+                                next.pool_shard,
+                                next.line,
                             );
                         }
                         Ok(control) => {
@@ -635,9 +711,24 @@ fn handle_async_frontend_control(
     }
 }
 
+fn recycle_line_buffer_to_pool(
+    pools: &[ArrayQueue<String>],
+    shard: usize,
+    mut line: String,
+) {
+    if shard == ASYNC_LINE_POOL_SHARD_SENTINEL {
+        return;
+    }
+    if line.capacity() > ASYNC_LINE_POOL_MAX_CAPACITY {
+        return;
+    }
+    line.clear();
+    let _ = pools[shard].push(line);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_async_frontend_write(
-    cmd: AsyncWriteCommand,
+    cmd: &mut AsyncWriteCommand,
     engine: &AppenderEngine,
     config: &XlogConfig,
     cipher: &EcdhTeaCipher,
@@ -649,7 +740,7 @@ fn handle_async_frontend_write(
 ) {
     let mut stage = AsyncBuildStage::default();
     let mut profile_enabled = false;
-    if let Some(front) = cmd.profile {
+    if let Some(front) = cmd.profile.as_ref() {
         profile_enabled = true;
         stage.format_ns = front.format_ns;
         stage.checkout_ns = front.enqueue_ns;
@@ -662,7 +753,7 @@ fn handle_async_frontend_write(
             config,
             cipher,
             cmd.now_hour,
-            &cmd.line,
+            cmd.line.as_str(),
             block_scratch,
         ) {
             let _ = engine.write_block(block_scratch.as_slice(), cmd.force_flush);
@@ -728,7 +819,7 @@ fn handle_async_frontend_write(
             "[F][ sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len: {current_len}\n"
         ));
     }
-    let line = warning_line.as_deref().unwrap_or(&cmd.line);
+    let line = warning_line.as_deref().unwrap_or(cmd.line.as_str());
 
     state.header.end_hour = cmd.now_hour;
     let append_begin = profile_enabled.then(Instant::now);
@@ -1385,38 +1476,78 @@ impl RustBackend {
         let timestamp = std::time::SystemTime::now();
         let now_hour = local_hour_from_timestamp(timestamp);
         let profile_enabled = async_stage_profile_enabled();
-        let mut queued = false;
-        with_hot_path_scratch(|scratch| {
-            let format_begin = profile_enabled.then(Instant::now);
-            self.format_record_line_into(
-                &mut scratch.line,
-                level,
-                tag,
-                file,
-                func,
-                line,
-                msg,
-                pid,
-                tid,
-                maintid,
-                timestamp,
-            );
-            let format_ns = format_begin
-                .map(|begin| begin.elapsed().as_nanos() as u64)
-                .unwrap_or(0);
-            let cmd = AsyncWriteCommand {
-                line: scratch.line.clone(),
-                now_hour,
-                force_flush: level == LogLevel::Fatal,
-                profile: profile_enabled.then(|| AsyncWriteFrontProfile {
-                    format_ns,
-                    enqueue_ns: 0,
-                }),
-            };
-            queued = self.async_frontend.enqueue_write(cmd).is_ok();
-        });
+        let pool_shard = current_async_line_pool_shard();
+        if !self.async_frontend.should_use_pooled_line_path(pool_shard) {
+            let mut queued = false;
+            with_hot_path_scratch(|scratch| {
+                let format_begin = profile_enabled.then(Instant::now);
+                self.format_record_line_into(
+                    &mut scratch.line,
+                    level,
+                    tag,
+                    file,
+                    func,
+                    line,
+                    msg,
+                    pid,
+                    tid,
+                    maintid,
+                    timestamp,
+                );
+                let format_ns = format_begin
+                    .map(|begin| begin.elapsed().as_nanos() as u64)
+                    .unwrap_or(0);
+                let cmd = AsyncWriteCommand {
+                    line: scratch.line.clone(),
+                    pool_shard: ASYNC_LINE_POOL_SHARD_SENTINEL,
+                    now_hour,
+                    force_flush: level == LogLevel::Fatal,
+                    profile: profile_enabled.then(|| AsyncWriteFrontProfile {
+                        format_ns,
+                        enqueue_ns: 0,
+                    }),
+                };
+                queued = self.async_frontend.enqueue_write(cmd).is_ok();
+            });
 
-        if !queued {
+            if !queued {
+                self.write_async_line_inline(level, tag, file, func, line, msg, pid, tid, maintid);
+            }
+            return;
+        }
+
+        let mut line_buf = self.async_frontend.take_line_buffer(pool_shard);
+        let format_begin = profile_enabled.then(Instant::now);
+        self.format_record_line_into(
+            &mut line_buf,
+            level,
+            tag,
+            file,
+            func,
+            line,
+            msg,
+            pid,
+            tid,
+            maintid,
+            timestamp,
+        );
+        let format_ns = format_begin
+            .map(|begin| begin.elapsed().as_nanos() as u64)
+            .unwrap_or(0);
+        let cmd = AsyncWriteCommand {
+            line: line_buf,
+            pool_shard,
+            now_hour,
+            force_flush: level == LogLevel::Fatal,
+            profile: profile_enabled.then(|| AsyncWriteFrontProfile {
+                format_ns,
+                enqueue_ns: 0,
+            }),
+        };
+
+        if let Err(cmd) = self.async_frontend.enqueue_write(cmd) {
+            self.async_frontend
+                .recycle_line_buffer(cmd.pool_shard, cmd.line);
             self.write_async_line_inline(level, tag, file, func, line, msg, pid, tid, maintid);
         }
     }

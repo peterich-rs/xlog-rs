@@ -74,6 +74,35 @@
 3. 每次重跑后更新本节关键汇总值即可满足回归审查。
 4. 统一使用 `python3 scripts/xlog/analyze_bench.py --root <artifact_dir>` 生成汇总报告与对比表。
 
+## 1.3 Async P2 定向结果（2026-03-07）
+
+本轮只做 Rust 定向场景验证（`runs=3`），用于评估 async 链路 `P2`（producer 单线程走 clone，多 producer 自动切分片 buffer 池）的收益是否稳定。
+
+执行命令：
+
+1. `scripts/xlog/run_bench_matrix.sh --manifest scripts/xlog/bench_matrix_baseline.tsv --out-root /tmp/xlog-async-stage-profile-20260307-p2hybrid --runs 3 --backends rust --filter '^(async_1t|async_4t_flush256)$' --skip-build`
+
+对比基线：
+
+1. 参考基线为上一轮无池化版本（worker batch + flush merge），口径同样是 `runs=3`
+
+结果摘要（Rust）：
+
+1. `async_1t`
+   - throughput: `286008.780 -> 286113.772`（`+0.04%`）
+   - p99: `7125.333ns -> 7430.333ns`（`+4.28%`）
+   - p999: `41874.667ns -> 42208.000ns`（`+0.80%`）
+2. `async_4t_flush256`
+   - throughput: `242716.457 -> 247018.270`（`+1.77%`）
+   - p99: `57791.667ns -> 57652.333ns`（`-0.24%`）
+   - p999: `148180.667ns -> 147569.667ns`（`-0.41%`）
+
+当前结论：
+
+1. `P2` 在多线程 flush 场景（`async_4t_flush256`）有可复现增益。
+2. `async_1t` 吞吐基本持平，但 tail（p99/p999）略有回退，仍需下一轮继续压缩固定成本和尾延迟。
+3. 按“只提交脚本与结论、不提交原始产物”规则，本节仅保留统计结论，完整原始数据继续留在本地 artifacts。
+
 ## 2. 当前判断
 
 当前 benchmark 体系已经比 `artifacts/bench-compare/20260306-harness-matrix-rerun` 阶段完整得多，但仍然不能直接视为“性能归因体系已经完成”。
