@@ -8,6 +8,11 @@
 2. 对外发布不包含 C++ 版本的安装/默认依赖链
 3. 保留仓库内 legacy C++ 代码作为兼容性参考，而不是发布主线或 `mars-xlog` 依赖链
 
+正式 tag、版本号和自动发布流程见：
+
+1. [rust_release_process.md](/Users/zhangfan/develop/github.com/xlog-rs/docs/rust_release_process.md)
+2. [rust_quality_bar.md](/Users/zhangfan/develop/github.com/xlog-rs/docs/rust_quality_bar.md)
+
 非目标：
 
 1. 这一阶段不移除仓库内的 C++ 代码与 benchmark 参考
@@ -138,7 +143,7 @@
    - 发布包包含 `28` 个文件
 2. `cargo publish --dry-run -p mars-xlog-core --allow-dirty`
    - 通过
-3. `cargo test -p mars-xlog-core --test async_engine --test compress_roundtrip --test dump --test mmap_recovery --test oneshot_flush --test protocol_compat`
+3. `cargo test -p mars-xlog-core`
    - 通过
 4. `cargo rustdoc -p mars-xlog-core --lib -- -D missing-docs`
    - 通过
@@ -146,9 +151,29 @@
 因此 `mars-xlog-core` 当前状态可以描述为：
 
 1. Cargo 打包与 dry-run 发布路径可用
-2. 核心集成测试可用
+2. 完整测试集可用
 3. public API 文档覆盖已达到 release preflight 要求
 4. 当前可以进入正式发布准备阶段
+
+### 3.4.2 `mars-xlog` 当前 preflight 快照（2026-03-08）
+
+当前已确认的状态是：
+
+1. `cargo package -p mars-xlog --list`
+   - 通过
+2. `cargo rustdoc -p mars-xlog --lib --features macros,tracing -- -D missing-docs`
+   - 通过
+3. `cargo test -p mars-xlog --all-features`
+   - 通过
+4. `cargo publish --dry-run -p mars-xlog --allow-dirty`
+   - 当前会失败
+   - 失败原因不是包内容或代码错误，而是 `mars-xlog-core 0.1.0` 尚未存在于 crates.io
+
+因此这里需要明确：
+
+1. `mars-xlog` 当前不是“单步即可发布”的状态
+2. 标准发布顺序必须是先发布 `mars-xlog-core`，等待 crates.io index 可见，再发布 `mars-xlog`
+3. 这个依赖顺序已经是当前 release topology 的一部分，不能再把它当成偶发 dry-run 误差
 
 ### 3.5 仍存在 1 个语义级阻断项
 
@@ -273,12 +298,14 @@
 
 发布前应加上最小发布流水线：
 
-1. `cargo package --list`
-2. `cargo publish --dry-run -p mars-xlog-core`
-3. `cargo publish --dry-run -p mars-xlog`
-4. docs.rs 构建检查
-5. 关键示例编译检查
-6. 目标平台 smoke test
+1. `scripts/xlog/check_mars_xlog_core_release.sh`
+2. 正式发布 `mars-xlog-core`
+3. 等待 crates.io index 能解析 `mars-xlog-core` 当前版本
+4. `scripts/xlog/check_mars_xlog_release.sh`
+5. 正式发布 `mars-xlog`
+6. docs.rs 构建检查
+7. 关键示例编译检查
+8. 目标平台 smoke test
 
 同时要求：
 
@@ -299,21 +326,25 @@
 建议按下面顺序推进：
 
 1. 先定发布对象和 `publish = false` 范围
-2. 先发布 `mars-xlog-core`，再验证 `mars-xlog` 的 crates.io dry-run
-3. 补全 `mars-xlog-core` / `mars-xlog` 元数据与 README/docs.rs
-4. 收口 package contents
-5. 建立发布 CI
-6. 再决定是否发第一个 `Preview`
+2. 跑 `scripts/xlog/check_mars_xlog_core_release.sh`
+3. 先发布 `mars-xlog-core`
+4. 等待 crates.io API / index 能看到目标版本
+5. 再跑 `scripts/xlog/check_mars_xlog_release.sh`
+6. 补全 `mars-xlog-core` / `mars-xlog` 元数据与 README/docs.rs
+7. 收口 package contents
+8. 建立发布 CI
+9. 再决定是否发第一个 `Preview`
 
 ## 7. Preview 退出条件
 
 满足以下条件后，可以发第一个 Rust `Preview`：
 
-1. `mars-xlog-core` 和 `mars-xlog` 都能通过 `cargo publish --dry-run`
-2. 发布版不再要求用户引入 C++ backend
-3. 文档能明确说明当前语义边界和 known limitations
-4. 发布包内容已经收口
-5. benchmark / regression / 基础测试通过
+1. `mars-xlog-core` 已经发布，且 crates.io 能解析 `mars-xlog` 依赖的 `mars-xlog-core` 版本
+2. `scripts/xlog/check_mars_xlog_core_release.sh` 和 `scripts/xlog/check_mars_xlog_release.sh` 都通过
+3. 发布版不再要求用户引入 C++ backend
+4. 文档能明确说明当前语义边界和 known limitations
+5. 发布包内容已经收口
+6. benchmark / regression / 基础测试通过
 
 ## 8. GA 退出条件
 

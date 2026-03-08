@@ -1,0 +1,148 @@
+name: rust-ci
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/rust_ci.yml'
+      - '.github/workflows/rust_release.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/xlog/**'
+      - 'crates/xlog-core/**'
+      - 'scripts/xlog/**'
+      - 'docs/rust_quality_bar.md'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/rust_ci.yml'
+      - '.github/workflows/rust_release.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/xlog/**'
+      - 'crates/xlog-core/**'
+      - 'scripts/xlog/**'
+      - 'docs/rust_quality_bar.md'
+
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Run clippy on release-facing crates
+        run: cargo clippy -p mars-xlog-core -p mars-xlog --all-targets --all-features --locked -- -D warnings
+
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: xlog-core-all-targets
+            cmd: cargo check -p mars-xlog-core --all-targets --locked
+          - name: xlog-default
+            cmd: cargo check -p mars-xlog --all-targets --locked
+          - name: xlog-all-features
+            cmd: cargo check -p mars-xlog --all-targets --all-features --locked
+          - name: xlog-rust-backend-only
+            cmd: cargo check -p mars-xlog --all-targets --no-default-features --features rust-backend --locked
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Run cargo check (${{ matrix.name }})
+        run: ${{ matrix.cmd }}
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-14
+          - windows-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Run tests for release-facing crates
+        shell: bash
+        run: cargo test -p mars-xlog-core -p mars-xlog --all-features --locked
+
+  release-preflight:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Run release preflight scripts
+        shell: bash
+        run: |
+          scripts/xlog/check_mars_xlog_core_release.sh --skip-tests
+          scripts/xlog/check_mars_xlog_release.sh --skip-tests --skip-crates-io-check
+
+      - name: Upload release preflight artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-preflight-${{ github.run_id }}
+          path: artifacts/release
+          retention-days: 14
+          if-no-files-found: warn

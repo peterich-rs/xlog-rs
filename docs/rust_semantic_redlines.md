@@ -16,7 +16,7 @@
 
 1. 是否可以宣称 Rust 迁移已经稳定收口
 2. 是否可以把某轮 perf 优化视为可接受主线状态
-3. 是否可以进入纯 Rust 发布阶段
+3. 是否可以宣称已经进入纯 Rust `GA` / 稳定替代阶段
 4. 是否可以仅凭 benchmark 优势认定当前实现已经达标
 
 补充说明：
@@ -24,6 +24,12 @@
 1. benchmark 领先不能抵消语义阻断项
 2. 任何未被文档声明、测试覆盖、兼容性验证接受的行为变化，都应先按阻断项处理
 3. 如果某项行为要被正式改成新的语义，必须先更新规范、测试和兼容性结论，再讨论性能收益
+
+`Preview` 发布口径单独说明如下：
+
+1. `Preview` crates.io 发布不等价于“语义阻断项已经清零”
+2. 在阻断项未清零时，只能以 `Preview` / 预览版口径发布，不能写成 GA、稳定替代版或完全对齐 C++ 生产版
+3. `Preview` 发布前必须把 active blocker、使用约束和已知语义边界写进发布文档与 crate README
 
 ## 3. 处理原则
 
@@ -147,10 +153,11 @@
 
 当前可以明确下结论：
 
-1. “语义级阻断项为 0”仍然是项目硬门槛，没有被 benchmark 结果放宽
+1. “语义级阻断项为 0”仍然是 Rust `GA` / 稳定替代口径的硬门槛，没有被 benchmark 结果放宽
 2. 当前 Rust 侧 active blocker 已收敛到 `FileManager` 的文件所有权与 rollback 假设
-3. recovery / oneshot split-write framing 风险已不再是 active blocker，但必须防回归
-4. 另外还存在 2 项 C++ / Rust 共享的语义边界，文档和后续设计必须诚实描述
+3. 当前如果要发 crates.io，只能按 `Preview` 口径处理，不能把发布行为本身写成“语义已收口”
+4. recovery / oneshot split-write framing 风险已不再是 active blocker，但必须防回归
+5. 另外还存在 2 项 C++ / Rust 共享的语义边界，文档和后续设计必须诚实描述
 
 ## 9. 退出条件
 

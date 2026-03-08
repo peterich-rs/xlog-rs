@@ -11,7 +11,7 @@ Usage:
 Options:
   --out-dir <dir>     Artifact root (default: artifacts/release/<timestamp>-mars-xlog-core)
   --allow-dirty       Allow cargo package/publish dry-run on a dirty worktree
-  --skip-tests        Skip integration test suite
+  --skip-tests        Skip cargo test
   -h, --help          Show help
 USAGE
 }
@@ -87,12 +87,12 @@ echo "- worktree: \`$(git -C "$repo_root" status --short | wc -l | tr -d ' ')\` 
 echo "- allow_dirty: \`$allow_dirty\`" >> "$summary_file"
 echo >> "$summary_file"
 
-run_step package_list cargo package -p mars-xlog-core "${cargo_dirty_args[@]}" --list
+run_step package_list cargo package -p mars-xlog-core --locked "${cargo_dirty_args[@]}" --list
 if [[ "$last_exit_code" -eq 0 ]]; then
   cp "$out_dir/logs/package_list.log" "$out_dir/package_list.txt"
 fi
 
-run_step publish_dry_run cargo publish --dry-run -p mars-xlog-core "${cargo_dirty_args[@]}"
+run_step publish_dry_run cargo publish --dry-run -p mars-xlog-core --locked "${cargo_dirty_args[@]}"
 
 run_step rustdoc_missing_docs cargo rustdoc -p mars-xlog-core --lib -- -D missing-docs
 if [[ "$last_exit_code" -ne 0 ]]; then
@@ -105,15 +105,7 @@ if [[ "$last_exit_code" -ne 0 ]]; then
 fi
 
 if [[ "$skip_tests" -eq 0 ]]; then
-  run_step \
-    integration_tests \
-    cargo test -p mars-xlog-core \
-      --test async_engine \
-      --test compress_roundtrip \
-      --test dump \
-      --test mmap_recovery \
-      --test oneshot_flush \
-      --test protocol_compat
+  run_step tests cargo test -p mars-xlog-core
 fi
 
 echo >> "$summary_file"
