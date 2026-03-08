@@ -25,7 +25,3 @@ thiserror = "1.0.69"
 
 [build-dependencies]
 napi-build-ohos = { version = "1.0" }
-
-[profile.release]
-lto = true
-strip = true

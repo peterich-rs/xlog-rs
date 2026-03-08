@@ -1,0 +1,96 @@
+name: criterion-bench
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/criterion_bench.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/xlog/**'
+      - 'crates/xlog-core/**'
+      - 'scripts/xlog/**'
+      - 'benchmarks/criterion/**'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/criterion_bench.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/xlog/**'
+      - 'crates/xlog-core/**'
+      - 'scripts/xlog/**'
+      - 'benchmarks/criterion/**'
+
+concurrency:
+  group: criterion-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  criterion:
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Run Criterion benchmark and compare with committed baseline
+        id: criterion
+        shell: bash
+        run: |
+          set +e
+          mkdir -p artifacts/criterion
+
+          scripts/xlog/run_criterion_bench.sh \
+            --out-root artifacts/criterion/ci-current \
+            --baseline-name ci-current
+          bench_exit=$?
+
+          compare_exit=0
+          if [[ "$bench_exit" -eq 0 ]]; then
+            python3 scripts/xlog/check_bench_regression.py \
+              --kind criterion \
+              --baseline-root benchmarks/criterion/macos14-arm64 \
+              --current-root artifacts/criterion/ci-current \
+              --strict-missing
+            compare_exit=$?
+          fi
+
+          exit_code=$bench_exit
+          if [[ "$exit_code" -eq 0 && "$compare_exit" -ne 0 ]]; then
+            exit_code=$compare_exit
+          fi
+
+          echo "bench_exit=${bench_exit}" >> "$GITHUB_OUTPUT"
+          echo "compare_exit=${compare_exit}" >> "$GITHUB_OUTPUT"
+          echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$exit_code" -eq 0 ]]; then
+            echo "criterion benchmark regression: success" > artifacts/criterion/ci-current/status.txt
+          else
+            echo "criterion benchmark regression: failed" > artifacts/criterion/ci-current/status.txt
+          fi
+
+      - name: Upload Criterion artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-bench-${{ github.run_id }}
+          path: |
+            artifacts/criterion/ci-current
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Fail workflow when benchmark regression failed
+        if: steps.criterion.outputs.exit_code != '0'
+        run: |
+          echo "Criterion benchmark regression failed"
+          exit 1

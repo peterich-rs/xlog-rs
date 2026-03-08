@@ -2,25 +2,23 @@
 
 ## 1. 当前结论
 
-基于当前仓库代码和 benchmark 基线，Rust 迁移不能再简单描述为“语义完全收口，只剩性能对齐”。
+基于当前仓库代码和 2026-03-08 最新 benchmark 基线，Rust 迁移已经不能再描述为“功能基本完成，但性能仍系统性落后于 C++”。
 
 更准确的判断是：
 
-1. 协议、解码、压缩/加密、formatter、bindings 和大部分恢复路径已经完成迁移。
-2. benchmark 层面，Rust 已经不是系统性落后，多个场景已经达到或超过 C++。
-3. 但 benchmark 结果不会放宽项目红线，`语义级阻断项为 0` 仍是强制要求；当前 Rust 侧仍有高优先级语义 / 功能阻断项未收口。
+1. 协议、解码、压缩/加密、formatter、bindings 和 Rust backend 主路径已经完成迁移。
+2. benchmark 层面，Rust 已经在全量双端矩阵里取得明显领先，而不是“多数场景接近 C++”。
+3. benchmark 结果不会放宽项目红线；当前仍有语义级阻断项未清零，因此不能把项目描述成“只剩性能问题”。
 
 配套文档分工：
 
-1. 逐条代码级分析见 `docs/rust_core_performance_review.md`
+1. 代码级正确性与性能审查见 `docs/rust_core_performance_review.md`
 2. 语义红线与阻断项清单见 `docs/rust_semantic_redlines.md`
-3. benchmark 体系与扩展计划见 `docs/benchmark_strategy.md`
-
-本文只保留当前已经收敛后的项目级结论。
+3. benchmark 体系、基线与扩展计划见 `docs/benchmark_strategy.md`
 
 ## 2. 已确认稳定的对齐面
 
-以下内容当前仍可以视为已完成：
+以下内容当前可以视为已完成：
 
 1. 协议与可解码性
    - sync / async header/tailer
@@ -41,127 +39,151 @@
    - default appender / named instance
    - JNI / UniFFI / NAPI 覆盖当前 Rust API
 
-## 3. 当前高优先级阻断项
+## 3. 当前 benchmark 状态
 
-项目要求始终是 `语义级阻断项为 0`。当前实现尚未满足这条红线。
+最新全量双端矩阵基线：`artifacts/bench-compare/20260308-p0-full-matrix`
 
-需要优先收口的 Rust 侧阻断项主要有 2 类：
+核心结论：
 
-1. recovery / oneshot 零拷贝把 recovered block 和 `MAGIC_END` 分段写入，存在跨进程 framing 风险
-2. `FileManager` 的本地长度缓存与 rollback 更强地假设文件独占，外部 writer 干扰下可能错误截断
+1. 吞吐更优场景：Rust `31 / 31`
+2. 平均延迟更优场景：Rust `31 / 31`
+3. P99 更优场景：Rust `30 / 31`
+4. P999 更优场景：Rust `26 / 31`
+5. sync throughput ratio gmean：`4.278`
+6. async throughput ratio gmean：`1.412`
+
+这意味着：
+
+1. sync 已不再是主性能矛盾
+2. async 也不再是“整体不够用”，而是只剩局部 tail 和输出体积效率问题
+3. `async_4t_zstd3` 仍是唯一需要单独盯的 tail 场景
+4. async 小消息 zlib 场景的 `bytes/msg` 仍显著偏大
+
+最新 Rust Criterion 基线：`artifacts/criterion/20260308-p0-full-review`
+
+结构性结论：
+
+1. `core_formatter` 很稳定，约 `114ns ~ 126ns`
+2. `core_crypto` 很稳定，约 `164ns ~ 1233ns`
+3. 真正贵的是 async public write path，而不是 formatter/crypto
+4. `core_compress_decode/zstd_*` 仍高噪声，更适合作为诊断信号而不是 hard gate
+
+## 4. 当前高优先级阻断项
+
+项目红线始终是 `语义级阻断项为 0`。当前实现尚未满足这条要求。
+
+当前 active blocker 已收敛到 1 项：
+
+1. `FileManager` 的本地长度缓存与 rollback 更强依赖单写者独占
 
 另外还有 2 项必须诚实描述但不应再误写成“Rust 偏离 C++”的问题：
 
 1. 当前 sync / fatal 不能按“每条日志立即落文件”理解
 2. 清空 mmap 或删除 cache 前没有 durability barrier
 
-这几项不意味着整体迁移失败，但意味着当前不能把最近 perf 提交整体视为“低风险实现层优化”。
+需要明确：
 
-## 4. 当前实现与 C++ 的主要差异
+1. recovery / oneshot split-write framing 风险不应再继续列为当前 blocker
+2. 当前代码已经把 recovered block 与 `MAGIC_END` 连续写出，这项问题属于已修复、需防回归
 
-### 4.1 Sync
+## 5. 当前实现与 C++ 的主要差异
 
-当前和 C++ 的最关键差异已经不只是固定 syscall 成本，而是 sync 写入语义边界：
+### 5.1 Sync
 
-1. Rust sync steady-state 性能已经明显改善
-2. 主要串行点已经收敛到 `FileManager.runtime`
-3. 但当前 sync 路径本身就不应再按“每条日志立即写入文件”理解；这点 Rust 与 C++ 当前语义一致
+当前 sync 路径的最重要结论已经改变：
 
-因此，sync 后续工作首先要把文档语义写准确，再决定是否要在 Rust/C++ 两侧共同升级成更强保证。
+1. sync 性能已经明显领先 C++，不再需要把 `sync_4t` 当成主性能热点
+2. sync 侧后续优先级应从“继续追吞吐”转向“把语义边界写准确，并收口文件所有权假设”
+3. 与 C++ 的主要差异不再是基础写能力，而是当前 Rust 对本地缓存长度与活跃文件状态的依赖更重
 
-### 4.2 Async
+### 5.2 Async
 
 当前 async 路径已经证明：
 
-1. `async_4t` 吞吐不是系统性问题
-2. `async_4t_flush256` 已接近 C++
-3. 剩余主差距集中在 `async_1t` fixed cost 与 tail latency
+1. `checkout_async_state()` 不再是主成本来源
+2. 主成本集中在 `append` 阶段与 frontend queue backpressure
+3. 剩余性能差距集中在 `async_4t_zstd3` tail latency 与 async 小消息 `bytes/msg`
 
-当前 async 最值得关注的实现差异：
+因此，当前 async 后续工作不应继续围绕“fixed cost 是否系统性拖后腿”展开，而应围绕：
 
-1. 单 pending-state 模型仍然带来串行化固定成本
-2. `compress.rs` 仍有流式压缩双缓冲复制
-3. flush worker 的 `try_lock + sleep(1ms) + requeue` 更偏吞吐优先，而非 tail-latency 最优
+1. pending block 聚合行为
+2. 压缩 flush 粒度
+3. queue / backpressure 策略
+4. flush requeue 与 tail latency
 
-## 5. benchmark 角色
+## 6. benchmark 的角色
 
-benchmark 相关设计、矩阵、已落地能力和扩展顺序，统一放到 `docs/benchmark_strategy.md`。
+benchmark 相关 runner、矩阵、Criterion、CI baseline 与回归脚手架，统一见 `docs/benchmark_strategy.md`。
 
 当前只保留项目级判断：
 
-1. `sync_4t` 的多线程竞争仍是 sync 主热点
-2. `async_1t` 的 fixed cost 与 p99 仍是 async 主热点
+1. Rust 已经具备性能竞争力，不再系统性落后于 C++
+2. 当前主性能问题不是 sync 吞吐，而是 async 尾延迟、输出体积与可观测性
 3. 任何 benchmark 收益都不能抵消 `docs/rust_semantic_redlines.md` 中列出的语义阻断项
-
-## 6. 最近一轮代码变化带来的新判断
-
-当前分支最近一轮 perf 提交不能统一归为“低风险优化”。
-
-更准确的划分是：
-
-1. 低风险且方向正确
-   - formatter / crypto scratch buffer 复用
-   - sync 热路径移除非必要 engine 锁
-   - tid thread-local 缓存
-2. 有价值但带来明确语义取舍
-   - async mmap persist cadence 节流
-   - defer async flush when engine state is busy
-3. 高风险，需要重新审视
-   - recovery / oneshot 零拷贝分段写
-   - active file / cached length / rollback 路径
-   - sync keep-open 相关优化如果继续放大独占假设，也应按高风险处理
 
 ## 7. 当前最值得做的事情
 
-### 7.1 P0: 先修正文档和语义假设
+### 7.1 P0: async 结构化归因计数已落地
 
-必须先明确以下问题：
+当前已经可以在 `bench_backend --stage-profile` 里直接看到：
 
-1. sync 模式是否允许用户态缓冲
-2. fatal 是否必须等价于立即落文件
-3. recovery / oneshot 是否允许分段写 recovered block
-4. cache/log 搬运删除源文件前，是否要求目标端已 durable
+1. pending block finalization 次数
+2. 每块行数分布
+3. finalize 原因分布
+4. raw input / payload bytes per block
+5. frontend `block_send` ratio
+6. engine flush requeue 次数
 
-项目级要求不变：上面这些问题没有收口前，语义级阻断项就不能记为 `0`。
+这意味着下一步性能工作可以直接基于数据做定向优化，而不是继续先补观测面。
 
-### 7.2 P0: 在不扩大语义风险的前提下继续做性能收敛
+### 7.2 P0: 收口 active blocker
 
-下一步重点：
+下一步优先级最高的语义工作是：
 
-1. `FileManager.runtime` 继续缩短 plain sync 热路径职责
-2. `compress.rs` 双缓冲收敛
-3. formatter / 时间格式化 / 冗余时钟调用 profiling
+1. 明确 `.xlog` 是否允许多 writer 竞争写入
+2. 如果允许，就修复 `FileManager` 的本地长度缓存与 rollback 逻辑
+3. 如果不允许，就把单写者独占假设写进文档、测试和接入约束
 
 ### 7.3 当前不建议进入主线的方向
 
-这些方向暂时不建议进入主线：
+这些方向当前不建议优先进入主线：
 
-1. per-thread async pending block
-2. per-thread sync file handle / append-only 重构
-3. `MS_ASYNC` / `madvise` 一类 OS 级 mmap 调优
-4. lock-free / SIMD 大改
+1. 继续把 sync 吞吐当成第一性能目标
+2. per-thread async pending pipeline
+3. per-thread sync file handle / append-only 重构
+4. `MS_ASYNC` / `madvise` 一类 OS 级 mmap 调优
+5. lock-free / SIMD 大改
+6. 面向单机型 benchmark 结果的 runtime 特调
 
-原因不是这些方向永远没价值，而是它们当前都不是最短路径，且语义验证成本明显更高。
+原因很简单：这些方向要么已经不是当前主瓶颈，要么会明显扩大语义与验证成本。
+
+补充结论：
+
+1. 本轮已回看运行时代码，当前未发现按 `Apple / M2 / arm64 / x86_64` 做性能分支的逻辑
+2. 现有 async queue / batch / retry 常量属于通用策略常量，不应被解读为机型特调
+3. 后续进入主线的性能调整，必须要求跨设备方向一致
 
 ## 8. 对后续改动的最低测试要求
 
-后续性能优化不能只看 benchmark，至少必须绑定以下回归面：
+后续优化不能只看 benchmark，至少必须绑定以下回归面：
 
 1. async 语义与恢复
    - `cargo test -p mars-xlog-core --test async_engine`
-   - `cargo test -p mars-xlog-core --test mmap_recovery --test oneshot_flush`
+   - `cargo test -p mars-xlog-core --test mmap_recovery`
+   - `cargo test -p mars-xlog-core --test oneshot_flush`
 2. sync 文件路径与 rotation
    - `cargo test -p mars-xlog-core file_manager:: -- --nocapture`
 3. Rust backend 端到端
    - `cargo test -p mars-xlog --lib`
 4. benchmark
-   - sync 变更至少重跑 `sync_1t` / `sync_4t` / `sync_4t_rotate_only`
-   - async 变更至少重跑 `async_1t` / `async_4t` / `async_4t_flush256`
+   - async 改动至少重跑 `async_4t` / `async_4t_zstd3` / `async_4t_large_entropy`
+   - 写路径或压缩改动至少重跑 `cargo bench -p mars-xlog --bench criterion_write_path`
+   - 里程碑改动重跑全量双端矩阵
 
-另需补齐但当前尚缺的测试：
+另需持续保留的测试重点：
 
-1. sync fatal 即时可见性
-2. recovery / oneshot 多进程 interleaving
+1. recovery / oneshot contiguous append 防回归
+2. `FileManager` 外部 writer 干扰场景
 3. cache/log durability barrier
 
 ## 9. 当前 review 总结
@@ -169,8 +191,6 @@ benchmark 相关设计、矩阵、已落地能力和扩展顺序，统一放到 
 当前可以明确下结论：
 
 1. Rust 迁移的主体工作已经完成，项目整体不再处于“功能迁移阶段”。
-2. 但 `core` crate 当前仍存在高优先级语义风险，不能宣称“完全稳定收口”，更不能把语义级阻断项视为已清零。
-3. 后续 review 只需要继续回答三个问题：
-   - `sync_4t` 的串行区还能怎么缩
-   - `async_1t` 的 fixed cost 和 p99 还能怎么降
-   - 最近 perf 优化是否破坏了文档要求的语义边界
+2. benchmark 结果已经支持“Rust 具备外部接入和受控生产验证价值”的判断。
+3. 但 active semantic blocker 还没有清零，因此还不能把当前状态描述成“正式生产收口版”，更不能进入移除 C++ 依赖阶段。
+4. 当前主线工作应是“补 async observability + 收口 FileManager 语义风险 + 定向治理 async tail/bytes tradeoff”。

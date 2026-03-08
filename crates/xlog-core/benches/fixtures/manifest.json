@@ -1,0 +1,90 @@
+{
+  "seed": 3405691582,
+  "sizes": [
+    256,
+    1024,
+    4096
+  ],
+  "zlib_level": 6,
+  "zstd_level": 3,
+  "fixtures": [
+    {
+      "kind": "raw_payload",
+      "size": 256,
+      "sha256": "0b6dd7c34b74f1e66d1eb4484e6f50f6919a7307558ffd221152b00579453b4d"
+    },
+    {
+      "kind": "zlib_stream_l6",
+      "size": 256,
+      "file": "zlib_stream_l6_256.bin",
+      "bytes": 261,
+      "sha256": "24cd2de04c8e0022b2656d024fbbf3e7c9290a00dc4cf4a391d607c99f045f3d"
+    },
+    {
+      "kind": "zstd_stream_l3",
+      "size": 256,
+      "file": "zstd_stream_l3_256.bin",
+      "bytes": 265,
+      "sha256": "057b1d9117e347276bf6c6f861d44bc243d24047f2a176575f8ee52a28925534"
+    },
+    {
+      "kind": "zstd_chunk_l3",
+      "size": 256,
+      "file": "zstd_chunk_l3_256.bin",
+      "bytes": 292,
+      "sha256": "4205b3a7fb40fec551ed4d1ddf9c01e008831359971ad4d54c91954d918c79e1"
+    },
+    {
+      "kind": "raw_payload",
+      "size": 1024,
+      "sha256": "21d70f137183a3e8f65cd1a748da128289e589c0e114857d2bf076ac9a4684fc"
+    },
+    {
+      "kind": "zlib_stream_l6",
+      "size": 1024,
+      "file": "zlib_stream_l6_1024.bin",
+      "bytes": 1029,
+      "sha256": "67ac8794399ec5428cb6263826ac9e7e4685b3c8fa4f8de89c4d00e0ad34ae29"
+    },
+    {
+      "kind": "zstd_stream_l3",
+      "size": 1024,
+      "file": "zstd_stream_l3_1024.bin",
+      "bytes": 1033,
+      "sha256": "742ac735b7bbff28e5f645087e8b776a10029b3b1b9a9ef51b364d1394510095"
+    },
+    {
+      "kind": "zstd_chunk_l3",
+      "size": 1024,
+      "file": "zstd_chunk_l3_1024.bin",
+      "bytes": 1060,
+      "sha256": "237b4f9cb18d1586ce45429930e9e2a6ce4e968714ac32e06e9edfde6d1274fa"
+    },
+    {
+      "kind": "raw_payload",
+      "size": 4096,
+      "sha256": "d74a8a562446342ea8ab1f2b15340f6786beb2c05ad1d43268da6f2da246e186"
+    },
+    {
+      "kind": "zlib_stream_l6",
+      "size": 4096,
+      "file": "zlib_stream_l6_4096.bin",
+      "bytes": 4101,
+      "sha256": "08775732a7bbf4add18a7f16d75c3a7ccf33722dfadce2541af1f9b33baa56bf"
+    },
+    {
+      "kind": "zstd_stream_l3",
+      "size": 4096,
+      "file": "zstd_stream_l3_4096.bin",
+      "bytes": 4105,
+      "sha256": "252d2ff7bac5306214f559c6653275a89448f3922b868b7bee2e166f900e5a84"
+    },
+    {
+      "kind": "zstd_chunk_l3",
+      "size": 4096,
+      "file": "zstd_chunk_l3_4096.bin",
+      "bytes": 4132,
+      "sha256": "c118c4d1fe2ba41afa06cbade39c1c20019fcd13c44a2900a2c3a3e3ae11268c"
+    }
+  ]
+}

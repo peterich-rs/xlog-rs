@@ -1,8 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
-use std::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{
     channel as std_channel, sync_channel, Receiver as StdReceiver, SendError, Sender as StdSender,
     SyncSender, TryRecvError, TrySendError,
@@ -13,7 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::TimeZone;
 use crossbeam_queue::ArrayQueue;
-use mars_xlog_core::appender_engine::{AppenderEngine, EngineMode};
+use mars_xlog_core::appender_engine::{
+    AppenderEngine, AsyncFlushReason as EngineAsyncFlushReason, EngineMode,
+};
 use mars_xlog_core::buffer::{PersistentBuffer, DEFAULT_BUFFER_BLOCK_LEN};
 use mars_xlog_core::compress::{StreamCompressor, ZlibStreamCompressor, ZstdStreamCompressor};
 use mars_xlog_core::crypto::EcdhTeaCipher;
@@ -38,10 +38,16 @@ use mars_xlog_core::protocol::{
 use mars_xlog_core::record::LogLevel as CoreLogLevel;
 use mars_xlog_core::registry::InstanceRegistry;
 
+use super::stage_profile::{
+    async_stage_profile_enabled, record_async_block_send, record_async_dequeued,
+    record_async_enqueued, record_async_pending_block, record_async_queue_full,
+    record_async_stage_sample, record_sync_stage_sample, sync_stage_profile_enabled,
+    AsyncBuildStage, AsyncPendingFinalizeReason, AsyncStageSample, AsyncWriteFrontProfile,
+    SyncBuildStage, SyncStageSample,
+};
 use super::{XlogBackend, XlogBackendProvider};
 use crate::{
-    AppenderMode, CompressMode, FileIoAction, LogLevel, RawLogMeta, RustAsyncStageStats,
-    RustSyncStageStats, StageLatencyStats, XlogConfig, XlogError,
+    AppenderMode, CompressMode, FileIoAction, LogLevel, RawLogMeta, XlogConfig, XlogError,
 };
 
 #[cfg(any(
@@ -76,7 +82,6 @@ struct AsyncFrontend {
     accepting: Arc<AtomicBool>,
     flush_queued: Arc<AtomicBool>,
     line_pools: Arc<[ArrayQueue<String>]>,
-    producer_shard_mask: AtomicU32,
     full_retry_before_block: usize,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -86,10 +91,18 @@ enum AsyncFrontendCommand {
     Flush {
         sync: bool,
         ack: Option<StdSender<()>>,
+        reason: AsyncFlushControlReason,
     },
     Stop {
         ack: StdSender<()>,
     },
+}
+
+#[cfg_attr(not(feature = "bench-internals"), allow(dead_code))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum AsyncFlushControlReason {
+    Explicit,
+    FlushEvery,
 }
 
 struct AsyncWriteCommand {
@@ -98,11 +111,6 @@ struct AsyncWriteCommand {
     now_hour: u8,
     force_flush: bool,
     profile: Option<AsyncWriteFrontProfile>,
-}
-
-struct AsyncWriteFrontProfile {
-    format_ns: u64,
-    enqueue_ns: u64,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -135,6 +143,8 @@ impl AsyncCompressor {
 struct AsyncPendingState {
     header: LogHeader,
     payload_len: usize,
+    line_count: u64,
+    raw_input_bytes: u64,
     compressor: AsyncCompressor,
     crypt_tail: Vec<u8>,
     flush_epoch: u64,
@@ -212,14 +222,19 @@ impl AsyncPendingState {
         if !self.compressor.compress_chunk(chunk, compress_scratch) {
             return false;
         }
-        self.append_encrypted(
+        let appended = self.append_encrypted(
             compress_scratch,
             crypto_scratch,
             cipher,
             engine,
             end_hour,
             force_flush,
-        )
+        );
+        if appended {
+            self.line_count = self.line_count.saturating_add(1);
+            self.raw_input_bytes = self.raw_input_bytes.saturating_add(chunk.len() as u64);
+        }
+        appended
     }
 
     fn finalize(
@@ -296,6 +311,60 @@ impl AsyncPendingState {
     }
 }
 
+impl AsyncFlushControlReason {
+    fn profiler_reason(self) -> AsyncPendingFinalizeReason {
+        match self {
+            AsyncFlushControlReason::Explicit => AsyncPendingFinalizeReason::ExplicitFlush,
+            AsyncFlushControlReason::FlushEvery => AsyncPendingFinalizeReason::FlushEvery,
+        }
+    }
+
+    fn engine_reason(self) -> EngineAsyncFlushReason {
+        match self {
+            AsyncFlushControlReason::Explicit | AsyncFlushControlReason::FlushEvery => {
+                EngineAsyncFlushReason::Explicit
+            }
+        }
+    }
+}
+
+fn profiler_reason_from_engine(reason: EngineAsyncFlushReason) -> AsyncPendingFinalizeReason {
+    match reason {
+        EngineAsyncFlushReason::Threshold => AsyncPendingFinalizeReason::Threshold,
+        EngineAsyncFlushReason::Explicit => AsyncPendingFinalizeReason::ExplicitFlush,
+        EngineAsyncFlushReason::Timeout => AsyncPendingFinalizeReason::Timeout,
+        EngineAsyncFlushReason::Stop => AsyncPendingFinalizeReason::Stop,
+        EngineAsyncFlushReason::Unknown => AsyncPendingFinalizeReason::Unknown,
+    }
+}
+
+fn record_pending_block_profile(state: &AsyncPendingState, reason: AsyncPendingFinalizeReason) {
+    record_async_pending_block(
+        state.line_count,
+        state.raw_input_bytes,
+        state.payload_len as u64,
+        reason,
+    );
+}
+
+fn discard_stale_pending_block(
+    pending: &mut Option<AsyncPendingState>,
+    engine_epoch: u64,
+    engine_reason: EngineAsyncFlushReason,
+) {
+    let stale = pending
+        .as_ref()
+        .map(|state| state.flush_epoch != engine_epoch)
+        .unwrap_or(false);
+    if !stale {
+        return;
+    }
+    if let Some(state) = pending.as_ref() {
+        record_pending_block_profile(state, profiler_reason_from_engine(engine_reason));
+    }
+    *pending = None;
+}
+
 struct HotPathScratch {
     line: String,
     block: Vec<u8>,
@@ -343,87 +412,15 @@ thread_local! {
     });
 }
 
-#[derive(Copy, Clone)]
-struct SyncStageSample {
-    total_ns: u64,
-    format_ns: u64,
-    block_ns: u64,
-    engine_write_ns: u64,
-}
-
-#[derive(Default)]
-struct SyncBuildStage {
-    format_ns: u64,
-    block_ns: u64,
-}
-
-#[derive(Copy, Clone)]
-struct AsyncStageSample {
-    total_ns: u64,
-    format_ns: u64,
-    checkout_ns: u64,
-    checkout_lock_ns: u64,
-    checkout_wait_ns: u64,
-    begin_pending_ns: u64,
-    append_ns: u64,
-    force_flush_ns: u64,
-}
-
-#[derive(Default)]
-struct AsyncBuildStage {
-    format_ns: u64,
-    checkout_ns: u64,
-    checkout_lock_ns: u64,
-    checkout_wait_ns: u64,
-    begin_pending_ns: u64,
-    append_ns: u64,
-    force_flush_ns: u64,
-}
-
-struct SyncStageProfiler {
-    enabled: AtomicBool,
-    samples: Mutex<Vec<SyncStageSample>>,
-}
-
-impl SyncStageProfiler {
-    fn new() -> Self {
-        Self {
-            enabled: AtomicBool::new(false),
-            samples: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-struct AsyncStageProfiler {
-    enabled: AtomicBool,
-    samples: Mutex<Vec<AsyncStageSample>>,
-    queue_full_count: AtomicU64,
-    block_send_count: AtomicU64,
-    block_send_ns: AtomicU64,
-    queue_depth_current: AtomicUsize,
-    queue_depth_high_watermark: AtomicUsize,
-}
-
-impl AsyncStageProfiler {
-    fn new() -> Self {
-        Self {
-            enabled: AtomicBool::new(false),
-            samples: Mutex::new(Vec::new()),
-            queue_full_count: AtomicU64::new(0),
-            block_send_count: AtomicU64::new(0),
-            block_send_ns: AtomicU64::new(0),
-            queue_depth_current: AtomicUsize::new(0),
-            queue_depth_high_watermark: AtomicUsize::new(0),
-        }
-    }
+#[cfg(feature = "bench-internals")]
+thread_local! {
+    static NEXT_ASYNC_FLUSH_HINT_FLUSH_EVERY: Cell<bool> = const { Cell::new(false) };
 }
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 static GLOBAL_MAX_FILE_SIZE: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_MAX_ALIVE_TIME: AtomicI64 = AtomicI64::new(0);
 static GLOBAL_CONSOLE_OPEN: AtomicBool = AtomicBool::new(false);
-static SYNC_STAGE_PROFILER: OnceLock<SyncStageProfiler> = OnceLock::new();
-static ASYNC_STAGE_PROFILER: OnceLock<AsyncStageProfiler> = OnceLock::new();
 
 const ASYNC_WARNING_THRESHOLD_NUM: usize = 4;
 const ASYNC_WARNING_THRESHOLD_DEN: usize = 5;
@@ -436,6 +433,30 @@ const ASYNC_LINE_POOL_MAX_BUFFERS_PER_SHARD: usize = 256;
 const ASYNC_LINE_POOL_MAX_CAPACITY: usize = 8 * 1024;
 const ASYNC_LINE_BUFFER_INIT_CAPACITY: usize = 512;
 const ASYNC_LINE_POOL_SHARD_SENTINEL: usize = usize::MAX;
+
+#[cfg(feature = "bench-internals")]
+fn mark_next_async_flush_hint_flush_every() {
+    NEXT_ASYNC_FLUSH_HINT_FLUSH_EVERY.with(|flag| flag.set(true));
+}
+
+#[cfg(feature = "bench-internals")]
+fn take_async_flush_control_reason(sync: bool) -> AsyncFlushControlReason {
+    if sync {
+        return AsyncFlushControlReason::Explicit;
+    }
+    NEXT_ASYNC_FLUSH_HINT_FLUSH_EVERY.with(|flag| {
+        if flag.replace(false) {
+            AsyncFlushControlReason::FlushEvery
+        } else {
+            AsyncFlushControlReason::Explicit
+        }
+    })
+}
+
+#[cfg(not(feature = "bench-internals"))]
+fn take_async_flush_control_reason(_sync: bool) -> AsyncFlushControlReason {
+    AsyncFlushControlReason::Explicit
+}
 
 fn current_async_line_pool_shard() -> usize {
     thread_local! {
@@ -487,7 +508,6 @@ impl AsyncFrontend {
             accepting,
             flush_queued,
             line_pools,
-            producer_shard_mask: AtomicU32::new(0),
             full_retry_before_block,
             worker: Mutex::new(Some(worker)),
         }
@@ -506,7 +526,7 @@ impl AsyncFrontend {
             match self.tx.try_send(AsyncFrontendCommand::Write(cmd)) {
                 Ok(()) => {
                     if enqueue_begin.is_some() {
-                        record_async_enqueued();
+                        record_async_enqueued(ASYNC_FRONTEND_QUEUE_CAPACITY);
                     }
                     return Ok(());
                 }
@@ -526,7 +546,7 @@ impl AsyncFrontend {
                             Ok(()) => {
                                 if let Some(begin) = block_begin {
                                     record_async_block_send(begin.elapsed().as_nanos() as u64);
-                                    record_async_enqueued();
+                                    record_async_enqueued(ASYNC_FRONTEND_QUEUE_CAPACITY);
                                 }
                                 Ok(())
                             }
@@ -546,7 +566,7 @@ impl AsyncFrontend {
         }
     }
 
-    fn request_flush(&self, sync: bool) -> bool {
+    fn request_flush(&self, sync: bool, reason: AsyncFlushControlReason) -> bool {
         if sync {
             let (ack_tx, ack_rx) = std_channel::<()>();
             if self
@@ -554,6 +574,7 @@ impl AsyncFrontend {
                 .send(AsyncFrontendCommand::Flush {
                     sync: true,
                     ack: Some(ack_tx),
+                    reason,
                 })
                 .is_err()
             {
@@ -568,6 +589,7 @@ impl AsyncFrontend {
         match self.tx.try_send(AsyncFrontendCommand::Flush {
             sync: false,
             ack: None,
+            reason,
         }) {
             Ok(()) => true,
             Err(TrySendError::Disconnected(_)) => {
@@ -603,13 +625,6 @@ impl AsyncFrontend {
         line.clear();
         let _ = self.line_pools[shard].push(line);
     }
-
-    fn should_use_pooled_line_path(&self, shard: usize) -> bool {
-        let bit = 1u32 << shard;
-        let mask = self.producer_shard_mask.fetch_or(bit, Ordering::AcqRel) | bit;
-        mask.count_ones() > 1
-    }
-
     fn shutdown(&self) {
         self.set_accepting(false);
         let (ack_tx, ack_rx) = std_channel::<()>();
@@ -734,10 +749,17 @@ fn handle_async_frontend_control(
     crypto_scratch: &mut Vec<u8>,
 ) -> bool {
     match cmd {
-        AsyncFrontendCommand::Flush { sync, ack } => {
+        AsyncFrontendCommand::Flush { sync, ack, reason } => {
             flush_queued.store(false, Ordering::Release);
-            worker_finalize_pending(engine, cipher, pending, compress_scratch, crypto_scratch);
-            let _ = engine.flush(sync);
+            worker_finalize_pending(
+                engine,
+                cipher,
+                pending,
+                compress_scratch,
+                crypto_scratch,
+                reason.profiler_reason(),
+            );
+            let _ = engine.flush_with_reason(sync, reason.engine_reason());
             if let Some(ack) = ack {
                 let _ = ack.send(());
             }
@@ -745,8 +767,15 @@ fn handle_async_frontend_control(
         }
         AsyncFrontendCommand::Stop { ack } => {
             flush_queued.store(false, Ordering::Release);
-            worker_finalize_pending(engine, cipher, pending, compress_scratch, crypto_scratch);
-            let _ = engine.flush(true);
+            worker_finalize_pending(
+                engine,
+                cipher,
+                pending,
+                compress_scratch,
+                crypto_scratch,
+                AsyncPendingFinalizeReason::Stop,
+            );
+            let _ = engine.flush_with_reason(true, EngineAsyncFlushReason::Stop);
             let _ = ack.send(());
             true
         }
@@ -754,11 +783,7 @@ fn handle_async_frontend_control(
     }
 }
 
-fn recycle_line_buffer_to_pool(
-    pools: &[ArrayQueue<String>],
-    shard: usize,
-    mut line: String,
-) {
+fn recycle_line_buffer_to_pool(pools: &[ArrayQueue<String>], shard: usize, mut line: String) {
     if shard == ASYNC_LINE_POOL_SHARD_SENTINEL {
         return;
     }
@@ -824,14 +849,8 @@ fn handle_async_frontend_write(
         return;
     }
 
-    let engine_epoch = engine.async_flush_epoch();
-    if pending
-        .as_ref()
-        .map(|s| s.flush_epoch != engine_epoch)
-        .unwrap_or(false)
-    {
-        *pending = None;
-    }
+    let (engine_epoch, engine_flush_reason) = engine.async_flush_state();
+    discard_stale_pending_block(pending, engine_epoch, engine_flush_reason);
 
     if pending.is_none() {
         let Some(new_state) =
@@ -881,7 +900,7 @@ fn handle_async_frontend_write(
     if !appended {
         *pending = None;
         let force_flush_begin = profile_enabled.then(Instant::now);
-        let _ = engine.flush(true);
+        let _ = engine.flush_with_reason(true, EngineAsyncFlushReason::Explicit);
         if let Some(begin) = force_flush_begin {
             stage.force_flush_ns = begin.elapsed().as_nanos() as u64;
         }
@@ -914,6 +933,7 @@ fn worker_finalize_pending(
     pending: &mut Option<AsyncPendingState>,
     compress_scratch: &mut Vec<u8>,
     crypto_scratch: &mut Vec<u8>,
+    reason: AsyncPendingFinalizeReason,
 ) {
     let Some(state) = pending.as_mut() else {
         return;
@@ -927,9 +947,12 @@ fn worker_finalize_pending(
         now_hour,
         false,
     );
+    if finalized {
+        record_pending_block_profile(state, reason);
+    }
     *pending = None;
     if !finalized && engine.mode() == EngineMode::Async {
-        let _ = engine.flush(true);
+        let _ = engine.flush_with_reason(true, EngineAsyncFlushReason::Explicit);
     }
 }
 
@@ -965,6 +988,8 @@ fn new_async_pending_state_for(
             },
         },
         payload_len: 0,
+        line_count: 0,
+        raw_input_bytes: 0,
         compressor,
         crypt_tail: Vec::with_capacity(8),
         flush_epoch,
@@ -1005,103 +1030,6 @@ fn build_sync_block_from_formatted_line(
     true
 }
 
-fn sync_stage_profiler() -> &'static SyncStageProfiler {
-    SYNC_STAGE_PROFILER.get_or_init(SyncStageProfiler::new)
-}
-
-fn async_stage_profiler() -> &'static AsyncStageProfiler {
-    ASYNC_STAGE_PROFILER.get_or_init(AsyncStageProfiler::new)
-}
-
-fn sync_stage_profile_enabled() -> bool {
-    sync_stage_profiler().enabled.load(Ordering::Relaxed)
-}
-
-fn async_stage_profile_enabled() -> bool {
-    async_stage_profiler().enabled.load(Ordering::Relaxed)
-}
-
-fn record_sync_stage_sample(sample: SyncStageSample) {
-    let profiler = sync_stage_profiler();
-    if !profiler.enabled.load(Ordering::Relaxed) {
-        return;
-    }
-    if let Ok(mut samples) = profiler.samples.lock() {
-        samples.push(sample);
-    }
-}
-
-fn record_async_stage_sample(sample: AsyncStageSample) {
-    let profiler = async_stage_profiler();
-    if !profiler.enabled.load(Ordering::Relaxed) {
-        return;
-    }
-    if let Ok(mut samples) = profiler.samples.lock() {
-        samples.push(sample);
-    }
-}
-
-fn record_async_queue_full() {
-    let profiler = async_stage_profiler();
-    if !profiler.enabled.load(Ordering::Relaxed) {
-        return;
-    }
-    profiler.queue_full_count.fetch_add(1, Ordering::Relaxed);
-}
-
-fn record_async_block_send(block_ns: u64) {
-    let profiler = async_stage_profiler();
-    if !profiler.enabled.load(Ordering::Relaxed) {
-        return;
-    }
-    profiler.block_send_count.fetch_add(1, Ordering::Relaxed);
-    profiler.block_send_ns.fetch_add(block_ns, Ordering::Relaxed);
-}
-
-fn record_async_enqueued() {
-    let profiler = async_stage_profiler();
-    if !profiler.enabled.load(Ordering::Relaxed) {
-        return;
-    }
-
-    let depth = profiler
-        .queue_depth_current
-        .fetch_add(1, Ordering::AcqRel)
-        .saturating_add(1);
-    let depth_for_high = depth.min(ASYNC_FRONTEND_QUEUE_CAPACITY);
-    let mut current_max = profiler.queue_depth_high_watermark.load(Ordering::Acquire);
-    while depth_for_high > current_max {
-        match profiler.queue_depth_high_watermark.compare_exchange_weak(
-            current_max,
-            depth_for_high,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => break,
-            Err(v) => current_max = v,
-        }
-    }
-}
-
-fn record_async_dequeued() {
-    let profiler = async_stage_profiler();
-    if !profiler.enabled.load(Ordering::Relaxed) {
-        return;
-    }
-    let mut current = profiler.queue_depth_current.load(Ordering::Acquire);
-    while current > 0 {
-        match profiler.queue_depth_current.compare_exchange_weak(
-            current,
-            current - 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => break,
-            Err(v) => current = v,
-        }
-    }
-}
-
 fn local_hour_from_timestamp(timestamp: SystemTime) -> u8 {
     if let Ok(since_epoch) = timestamp.duration_since(UNIX_EPOCH) {
         let epoch_secs = since_epoch.as_secs();
@@ -1125,129 +1053,49 @@ fn local_hour_from_timestamp(timestamp: SystemTime) -> u8 {
     chrono::Timelike::hour(&chrono::Local::now()) as u8
 }
 
-fn stage_stats(values: &mut [u64]) -> StageLatencyStats {
-    if values.is_empty() {
-        return StageLatencyStats::default();
-    }
-    values.sort_unstable();
-    let len = values.len();
-    let sum = values
-        .iter()
-        .fold(0u128, |acc, &v| acc.saturating_add(v as u128));
-    StageLatencyStats {
-        avg_ns: sum as f64 / len as f64,
-        p50_ns: percentile_from_sorted(values, 500),
-        p95_ns: percentile_from_sorted(values, 950),
-        p99_ns: percentile_from_sorted(values, 990),
-        max_ns: *values.last().unwrap_or(&0),
-    }
-}
-
-fn percentile_from_sorted(sorted: &[u64], per_mille: usize) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let last = sorted.len().saturating_sub(1);
-    let idx = ((last as u128 * per_mille as u128) / 1000u128) as usize;
-    sorted[idx.min(last)]
-}
-
+#[cfg(feature = "bench-internals")]
 pub(super) fn set_sync_stage_profile_enabled(enabled: bool) {
-    let profiler = sync_stage_profiler();
-    profiler.enabled.store(enabled, Ordering::Relaxed);
-    if let Ok(mut samples) = profiler.samples.lock() {
-        samples.clear();
-    }
+    super::stage_profile::set_sync_stage_profile_enabled(enabled);
 }
 
-pub(super) fn take_sync_stage_stats() -> Option<RustSyncStageStats> {
-    let profiler = sync_stage_profiler();
-    let mut samples = profiler.samples.lock().ok()?;
-    if samples.is_empty() {
-        return None;
-    }
-    let snapshot = std::mem::take(&mut *samples);
-    drop(samples);
-
-    let mut total = Vec::with_capacity(snapshot.len());
-    let mut format = Vec::with_capacity(snapshot.len());
-    let mut block = Vec::with_capacity(snapshot.len());
-    let mut engine = Vec::with_capacity(snapshot.len());
-    for sample in snapshot {
-        total.push(sample.total_ns);
-        format.push(sample.format_ns);
-        block.push(sample.block_ns);
-        engine.push(sample.engine_write_ns);
-    }
-
-    Some(RustSyncStageStats {
-        samples: total.len(),
-        total: stage_stats(total.as_mut_slice()),
-        format: stage_stats(format.as_mut_slice()),
-        block: stage_stats(block.as_mut_slice()),
-        engine_write: stage_stats(engine.as_mut_slice()),
-    })
+#[cfg(feature = "bench-internals")]
+pub(super) fn take_sync_stage_stats() -> Option<crate::bench::RustSyncStageStats> {
+    super::stage_profile::take_sync_stage_stats()
 }
 
+#[cfg(feature = "bench-internals")]
 pub(super) fn set_async_stage_profile_enabled(enabled: bool) {
-    let profiler = async_stage_profiler();
-    profiler.enabled.store(enabled, Ordering::Relaxed);
-    if let Ok(mut samples) = profiler.samples.lock() {
-        samples.clear();
-    }
-    profiler.queue_full_count.store(0, Ordering::Relaxed);
-    profiler.block_send_count.store(0, Ordering::Relaxed);
-    profiler.block_send_ns.store(0, Ordering::Relaxed);
-    profiler.queue_depth_current.store(0, Ordering::Relaxed);
-    profiler
-        .queue_depth_high_watermark
-        .store(0, Ordering::Relaxed);
+    super::stage_profile::set_async_stage_profile_enabled(enabled);
+    let _ = take_async_flush_requeue_count_total();
 }
 
-pub(super) fn take_async_stage_stats() -> Option<RustAsyncStageStats> {
-    let profiler = async_stage_profiler();
-    let mut samples = profiler.samples.lock().ok()?;
-    if samples.is_empty() {
-        return None;
-    }
-    let snapshot = std::mem::take(&mut *samples);
-    drop(samples);
+#[cfg(feature = "bench-internals")]
+pub(super) fn mark_async_flush_hint_flush_every() {
+    mark_next_async_flush_hint_flush_every();
+}
 
-    let mut total = Vec::with_capacity(snapshot.len());
-    let mut format = Vec::with_capacity(snapshot.len());
-    let mut checkout = Vec::with_capacity(snapshot.len());
-    let mut checkout_lock = Vec::with_capacity(snapshot.len());
-    let mut checkout_wait = Vec::with_capacity(snapshot.len());
-    let mut begin_pending = Vec::with_capacity(snapshot.len());
-    let mut append = Vec::with_capacity(snapshot.len());
-    let mut force_flush = Vec::with_capacity(snapshot.len());
-    for sample in snapshot {
-        total.push(sample.total_ns);
-        format.push(sample.format_ns);
-        checkout.push(sample.checkout_ns);
-        checkout_lock.push(sample.checkout_lock_ns);
-        checkout_wait.push(sample.checkout_wait_ns);
-        begin_pending.push(sample.begin_pending_ns);
-        append.push(sample.append_ns);
-        force_flush.push(sample.force_flush_ns);
-    }
+#[cfg(feature = "bench-internals")]
+pub(super) fn take_async_stage_stats() -> Option<crate::bench::RustAsyncStageStats> {
+    let mut stats = super::stage_profile::take_async_stage_stats()?;
+    stats.flush_requeue_count = take_async_flush_requeue_count_total();
+    Some(stats)
+}
 
-    Some(RustAsyncStageStats {
-        samples: total.len(),
-        total: stage_stats(total.as_mut_slice()),
-        format: stage_stats(format.as_mut_slice()),
-        checkout: stage_stats(checkout.as_mut_slice()),
-        checkout_lock: stage_stats(checkout_lock.as_mut_slice()),
-        checkout_wait: stage_stats(checkout_wait.as_mut_slice()),
-        begin_pending: stage_stats(begin_pending.as_mut_slice()),
-        append: stage_stats(append.as_mut_slice()),
-        force_flush: stage_stats(force_flush.as_mut_slice()),
-        queue_full_count: profiler.queue_full_count.load(Ordering::Relaxed),
-        block_send_count: profiler.block_send_count.load(Ordering::Relaxed),
-        block_send_ns: profiler.block_send_ns.load(Ordering::Relaxed),
-        queue_depth_high_watermark: profiler.queue_depth_high_watermark.load(Ordering::Relaxed)
-            as u64,
-    })
+#[cfg(feature = "bench-internals")]
+fn take_async_flush_requeue_count_total() -> u64 {
+    let mut total = 0u64;
+    let mut default_id = None;
+    if let Some(default) = registry().default_instance() {
+        default_id = Some(default.id);
+        total = total.saturating_add(default.engine.take_async_flush_requeue_count());
+    }
+    registry().for_each_live(|backend| {
+        if default_id == Some(backend.id) {
+            return;
+        }
+        total = total.saturating_add(backend.engine.take_async_flush_requeue_count());
+    });
+    total
 }
 
 fn registry() -> &'static InstanceRegistry<RustBackend> {
@@ -1593,45 +1441,6 @@ impl RustBackend {
         let now_hour = local_hour_from_timestamp(timestamp);
         let profile_enabled = async_stage_profile_enabled();
         let pool_shard = current_async_line_pool_shard();
-        if !self.async_frontend.should_use_pooled_line_path(pool_shard) {
-            let mut queued = false;
-            with_hot_path_scratch(|scratch| {
-                let format_begin = profile_enabled.then(Instant::now);
-                self.format_record_line_into(
-                    &mut scratch.line,
-                    level,
-                    tag,
-                    file,
-                    func,
-                    line,
-                    msg,
-                    pid,
-                    tid,
-                    maintid,
-                    timestamp,
-                );
-                let format_ns = format_begin
-                    .map(|begin| begin.elapsed().as_nanos() as u64)
-                    .unwrap_or(0);
-                let cmd = AsyncWriteCommand {
-                    line: scratch.line.clone(),
-                    pool_shard: ASYNC_LINE_POOL_SHARD_SENTINEL,
-                    now_hour,
-                    force_flush: level == LogLevel::Fatal,
-                    profile: profile_enabled.then(|| AsyncWriteFrontProfile {
-                        format_ns,
-                        enqueue_ns: 0,
-                    }),
-                };
-                queued = self.async_frontend.enqueue_write(cmd).is_ok();
-            });
-
-            if !queued {
-                self.write_async_line_inline(level, tag, file, func, line, msg, pid, tid, maintid);
-            }
-            return;
-        }
-
         let mut line_buf = self.async_frontend.take_line_buffer(pool_shard);
         let format_begin = profile_enabled.then(Instant::now);
         self.format_record_line_into(
@@ -1683,7 +1492,7 @@ impl RustBackend {
     ) {
         let timestamp = std::time::SystemTime::now();
         let now_hour = local_hour_from_timestamp(timestamp);
-        let engine_epoch = self.engine.async_flush_epoch();
+        let (engine_epoch, engine_flush_reason) = self.engine.async_flush_state();
         let capacity = self.engine.buffer_capacity();
         let profile_enabled = async_stage_profile_enabled();
 
@@ -1729,13 +1538,11 @@ impl RustBackend {
                 }
                 stage.checkout_lock_ns = checked_out.checkout_lock_ns();
                 stage.checkout_wait_ns = checked_out.checkout_wait_ns();
-                let stale = checked_out
-                    .pending()
-                    .map(|s| s.flush_epoch != engine_epoch)
-                    .unwrap_or(false);
-                if stale {
-                    checked_out.set_pending(None);
-                }
+                discard_stale_pending_block(
+                    &mut checked_out.pending,
+                    engine_epoch,
+                    engine_flush_reason,
+                );
                 if checked_out.pending().is_none() {
                     let Some(new_state) = self.new_async_pending_state(now_hour, engine_epoch)
                     else {
@@ -1795,7 +1602,9 @@ impl RustBackend {
                     } else {
                         None
                     };
-                    let _ = self.engine.flush(true);
+                    let _ = self
+                        .engine
+                        .flush_with_reason(true, EngineAsyncFlushReason::Explicit);
                     if let Some(begin) = force_flush_begin {
                         stage.force_flush_ns = begin.elapsed().as_nanos() as u64;
                     }
@@ -1817,7 +1626,7 @@ impl RustBackend {
         });
     }
 
-    fn finalize_async_pending(&self) {
+    fn finalize_async_pending(&self, reason: AsyncPendingFinalizeReason) {
         let now_hour = local_hour_from_timestamp(std::time::SystemTime::now());
         with_hot_path_scratch(|scratch| {
             let mut checked_out = self.checkout_async_state(false);
@@ -1832,11 +1641,16 @@ impl RustBackend {
                 now_hour,
                 false,
             );
+            if finalized {
+                record_pending_block_profile(state, reason);
+            }
             checked_out.set_pending(None);
             let needs_force_flush = !finalized && self.engine.mode() == EngineMode::Async;
             drop(checked_out);
             if needs_force_flush {
-                let _ = self.engine.flush(true);
+                let _ = self
+                    .engine
+                    .flush_with_reason(true, EngineAsyncFlushReason::Explicit);
             }
         });
     }
@@ -2044,8 +1858,10 @@ impl XlogBackend for RustBackend {
         match (current, mode) {
             (EngineMode::Async, AppenderMode::Sync) => {
                 self.async_frontend.set_accepting(false);
-                let _ = self.async_frontend.request_flush(true);
-                self.finalize_async_pending();
+                let _ = self
+                    .async_frontend
+                    .request_flush(true, AsyncFlushControlReason::Explicit);
+                self.finalize_async_pending(AsyncPendingFinalizeReason::ExplicitFlush);
                 let _ = self.engine.set_mode(EngineMode::Sync);
             }
             (EngineMode::Sync, AppenderMode::Async) => {
@@ -2061,13 +1877,16 @@ impl XlogBackend for RustBackend {
     }
 
     fn flush(&self, sync: bool) {
+        let control_reason = take_async_flush_control_reason(sync);
         if self.engine.mode() == EngineMode::Async {
-            if self.async_frontend.request_flush(sync) {
+            if self.async_frontend.request_flush(sync, control_reason) {
                 return;
             }
-            self.finalize_async_pending();
+            self.finalize_async_pending(control_reason.profiler_reason());
         }
-        let _ = self.engine.flush(sync);
+        let _ = self
+            .engine
+            .flush_with_reason(sync, control_reason.engine_reason());
     }
 
     fn set_console_log_open(&self, open: bool) {

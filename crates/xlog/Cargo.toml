@@ -27,3 +27,13 @@ cpp-backend = ["dep:mars-xlog-sys"]
 # 控制是否启用 Rust 侧便捷宏
 macros = []
 tracing = ["dep:tracing", "dep:tracing-subscriber"]
+# benchmark / profiling internals used by local harnesses only
+bench-internals = []
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[[bench]]
+name = "criterion_write_path"
+harness = false

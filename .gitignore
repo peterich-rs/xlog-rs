@@ -7,9 +7,8 @@ crates/xlog-uniffi/.gradle/
 crates/xlog-uniffi/build/
 crates/xlog-uniffi/gradle/wrapper/gradle-*.zip
 
-# Benchmark/phase artifacts are local-only and should not be versioned.
-artifacts/bench-compare/
-artifacts/phase5/
+# Benchmark artifacts are local-only and should never be versioned.
+artifacts/
 
 # Python cache
 __pycache__/

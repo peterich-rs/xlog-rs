@@ -20,6 +20,8 @@ use crate::ConsoleFun;
 mod cpp;
 #[cfg(feature = "rust-backend")]
 mod rust;
+#[cfg(feature = "rust-backend")]
+mod stage_profile;
 
 pub(crate) trait XlogBackend: Send + Sync {
     fn instance(&self) -> usize;
@@ -96,38 +98,27 @@ pub(crate) fn provider() -> &'static dyn XlogBackendProvider {
     }
 }
 
-#[cfg(feature = "rust-backend")]
+#[cfg(all(feature = "rust-backend", feature = "bench-internals"))]
 pub(crate) fn set_rust_sync_stage_profile_enabled(enabled: bool) {
     rust::set_sync_stage_profile_enabled(enabled);
 }
 
-#[cfg(not(feature = "rust-backend"))]
-pub(crate) fn set_rust_sync_stage_profile_enabled(_enabled: bool) {}
-
-#[cfg(feature = "rust-backend")]
+#[cfg(all(feature = "rust-backend", feature = "bench-internals"))]
 pub(crate) fn set_rust_async_stage_profile_enabled(enabled: bool) {
     rust::set_async_stage_profile_enabled(enabled);
 }
 
-#[cfg(not(feature = "rust-backend"))]
-pub(crate) fn set_rust_async_stage_profile_enabled(_enabled: bool) {}
+#[cfg(all(feature = "rust-backend", feature = "bench-internals"))]
+pub(crate) fn mark_rust_async_flush_hint_flush_every() {
+    rust::mark_async_flush_hint_flush_every();
+}
 
-#[cfg(feature = "rust-backend")]
-pub(crate) fn take_rust_sync_stage_stats() -> Option<crate::RustSyncStageStats> {
+#[cfg(all(feature = "rust-backend", feature = "bench-internals"))]
+pub(crate) fn take_rust_sync_stage_stats() -> Option<crate::bench::RustSyncStageStats> {
     rust::take_sync_stage_stats()
 }
 
-#[cfg(not(feature = "rust-backend"))]
-pub(crate) fn take_rust_sync_stage_stats() -> Option<crate::RustSyncStageStats> {
-    None
-}
-
-#[cfg(feature = "rust-backend")]
-pub(crate) fn take_rust_async_stage_stats() -> Option<crate::RustAsyncStageStats> {
+#[cfg(all(feature = "rust-backend", feature = "bench-internals"))]
+pub(crate) fn take_rust_async_stage_stats() -> Option<crate::bench::RustAsyncStageStats> {
     rust::take_async_stage_stats()
-}
-
-#[cfg(not(feature = "rust-backend"))]
-pub(crate) fn take_rust_async_stage_stats() -> Option<crate::RustAsyncStageStats> {
-    None
 }

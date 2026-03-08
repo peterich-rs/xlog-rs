@@ -21,9 +21,14 @@ fs2 = "0.4"
 crossbeam-channel = "0.5"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 hex = "0.4"
 tempfile = "3"
 filetime = "0.2"
+
+[[bench]]
+name = "criterion_components"
+harness = false
 
 [build-dependencies]
 cc = "1"

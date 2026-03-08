@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -34,6 +34,15 @@ pub enum EngineMode {
     Sync,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum AsyncFlushReason {
+    Unknown,
+    Threshold,
+    Explicit,
+    Timeout,
+    Stop,
+}
+
 #[derive(Debug, Error)]
 pub enum AppenderEngineError {
     #[error("buffer error: {0}")]
@@ -63,6 +72,7 @@ enum EngineCommand {
     Flush {
         move_file: bool,
         ack: Option<Sender<()>>,
+        reason: AsyncFlushReason,
     },
     Stop {
         ack: Sender<()>,
@@ -79,6 +89,8 @@ pub struct AppenderEngine {
     tx: Sender<EngineCommand>,
     pending_async_flush: Arc<AtomicBool>,
     async_flush_epoch: Arc<AtomicU64>,
+    async_flush_reason: Arc<AtomicU8>,
+    async_flush_requeue_count: Arc<AtomicU64>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -132,9 +144,15 @@ impl AppenderEngine {
         let worker_tx = tx.clone();
         let pending_async_flush = Arc::new(AtomicBool::new(false));
         let async_flush_epoch = Arc::new(AtomicU64::new(0));
+        let async_flush_reason = Arc::new(AtomicU8::new(async_flush_reason_to_u8(
+            AsyncFlushReason::Unknown,
+        )));
+        let async_flush_requeue_count = Arc::new(AtomicU64::new(0));
         let worker_state = Arc::clone(&state);
         let worker_pending_flag = Arc::clone(&pending_async_flush);
         let worker_flush_epoch = Arc::clone(&async_flush_epoch);
+        let worker_flush_reason = Arc::clone(&async_flush_reason);
+        let worker_flush_requeue_count = Arc::clone(&async_flush_requeue_count);
         let worker = thread::Builder::new()
             .name("xlog-appender-engine".to_string())
             .spawn(move || {
@@ -144,6 +162,8 @@ impl AppenderEngine {
                     worker_tx,
                     worker_pending_flag,
                     worker_flush_epoch,
+                    worker_flush_reason,
+                    worker_flush_requeue_count,
                     flush_timeout,
                 )
             })
@@ -159,6 +179,8 @@ impl AppenderEngine {
             tx,
             pending_async_flush,
             async_flush_epoch,
+            async_flush_reason,
+            async_flush_requeue_count,
             worker: Mutex::new(Some(worker)),
         }
     }
@@ -170,7 +192,7 @@ impl AppenderEngine {
     pub fn set_mode(&self, mode: EngineMode) -> Result<(), AppenderEngineError> {
         let old = i32_to_mode(self.mode.swap(mode_to_i32(mode), Ordering::Relaxed));
         if old == EngineMode::Async && mode == EngineMode::Sync {
-            self.request_flush(true, true)?;
+            self.request_flush(true, true, AsyncFlushReason::Explicit)?;
         }
         Ok(())
     }
@@ -264,7 +286,7 @@ impl AppenderEngine {
                 };
 
                 if should_flush {
-                    self.request_flush(false, true)?;
+                    self.request_flush(false, true, AsyncFlushReason::Threshold)?;
                 }
             }
         }
@@ -333,7 +355,7 @@ impl AppenderEngine {
         };
 
         if should_flush {
-            self.request_flush(false, true)?;
+            self.request_flush(false, true, AsyncFlushReason::Threshold)?;
         }
         Ok(())
     }
@@ -362,7 +384,7 @@ impl AppenderEngine {
             state.last_async_buffer_mutation_at = Instant::now();
         }
         if force_flush {
-            self.request_flush(false, true)?;
+            self.request_flush(false, true, AsyncFlushReason::Threshold)?;
         }
         Ok(())
     }
@@ -390,6 +412,21 @@ impl AppenderEngine {
 
     pub fn async_flush_epoch(&self) -> u64 {
         self.async_flush_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn async_flush_state(&self) -> (u64, AsyncFlushReason) {
+        loop {
+            let epoch_before = self.async_flush_epoch.load(Ordering::Acquire);
+            let reason = u8_to_async_flush_reason(self.async_flush_reason.load(Ordering::Acquire));
+            let epoch_after = self.async_flush_epoch.load(Ordering::Acquire);
+            if epoch_before == epoch_after {
+                return (epoch_after, reason);
+            }
+        }
+    }
+
+    pub fn take_async_flush_requeue_count(&self) -> u64 {
+        self.async_flush_requeue_count.swap(0, Ordering::AcqRel)
     }
 
     pub fn write_async_pending(
@@ -422,28 +459,42 @@ impl AppenderEngine {
         };
 
         if should_flush {
-            self.request_flush(false, true)?;
+            self.request_flush(false, true, AsyncFlushReason::Threshold)?;
         }
         Ok(())
     }
 
     pub fn flush(&self, sync: bool) -> Result<(), AppenderEngineError> {
+        self.flush_with_reason(sync, AsyncFlushReason::Explicit)
+    }
+
+    pub fn flush_with_reason(
+        &self,
+        sync: bool,
+        reason: AsyncFlushReason,
+    ) -> Result<(), AppenderEngineError> {
         if self.mode() == EngineMode::Sync {
             if sync {
                 self.file_manager.flush_active_file_buffer()?;
             }
             return Ok(());
         }
-        self.request_flush(sync, !sync)
+        self.request_flush(sync, !sync, reason)
     }
 
-    fn request_flush(&self, sync: bool, move_file: bool) -> Result<(), AppenderEngineError> {
+    fn request_flush(
+        &self,
+        sync: bool,
+        move_file: bool,
+        reason: AsyncFlushReason,
+    ) -> Result<(), AppenderEngineError> {
         if sync {
             let (ack_tx, ack_rx) = bounded(1);
             self.tx
                 .send(EngineCommand::Flush {
                     move_file,
                     ack: Some(ack_tx),
+                    reason,
                 })
                 .map_err(|_| AppenderEngineError::ChannelClosed)?;
             ack_rx
@@ -459,6 +510,7 @@ impl AppenderEngine {
             .send(EngineCommand::Flush {
                 move_file,
                 ack: None,
+                reason,
             })
             .map_err(|_| {
                 self.pending_async_flush.store(false, Ordering::Release);
@@ -486,12 +538,18 @@ fn run_worker_loop(
     tx: Sender<EngineCommand>,
     pending_async_flush: Arc<AtomicBool>,
     async_flush_epoch: Arc<AtomicU64>,
+    async_flush_reason: Arc<AtomicU8>,
+    async_flush_requeue_count: Arc<AtomicU64>,
     flush_timeout: Duration,
 ) {
     let poll_interval = flush_timeout.min(EXPIRED_SWEEP_INTERVAL);
     loop {
         match rx.recv_timeout(poll_interval) {
-            Ok(EngineCommand::Flush { move_file, ack }) => {
+            Ok(EngineCommand::Flush {
+                move_file,
+                ack,
+                reason,
+            }) => {
                 let flushed = if ack.is_some() {
                     pending_async_flush.store(false, Ordering::Release);
                     state
@@ -510,16 +568,19 @@ fn run_worker_loop(
                                 .unwrap_or(false)
                         }
                         Err(_) => {
+                            async_flush_requeue_count.fetch_add(1, Ordering::Relaxed);
                             thread::sleep(ASYNC_FLUSH_RETRY_DELAY);
                             let _ = tx.send(EngineCommand::Flush {
                                 move_file,
                                 ack: None,
+                                reason,
                             });
                             continue;
                         }
                     }
                 };
                 if flushed {
+                    async_flush_reason.store(async_flush_reason_to_u8(reason), Ordering::Release);
                     async_flush_epoch.fetch_add(1, Ordering::AcqRel);
                 }
                 if let Some(ack) = ack {
@@ -538,6 +599,10 @@ fn run_worker_loop(
                     })
                     .unwrap_or(false);
                 if flushed {
+                    async_flush_reason.store(
+                        async_flush_reason_to_u8(AsyncFlushReason::Stop),
+                        Ordering::Release,
+                    );
                     async_flush_epoch.fetch_add(1, Ordering::AcqRel);
                 }
                 let _ = ack.send(());
@@ -550,6 +615,10 @@ fn run_worker_loop(
                     .and_then(|mut s| handle_timeout_locked(&mut s, flush_timeout).map_err(|_| ()))
                     .unwrap_or(false);
                 if flushed {
+                    async_flush_reason.store(
+                        async_flush_reason_to_u8(AsyncFlushReason::Timeout),
+                        Ordering::Release,
+                    );
                     async_flush_epoch.fetch_add(1, Ordering::AcqRel);
                 }
             }
@@ -584,9 +653,12 @@ fn flush_pending_locked(
         if write_startup_mmap_tips {
             if let Some(begin) = build_sync_tip_block(sample_header, "~~~~~ begin of mmap ~~~~~\n")
             {
-                state
-                    .file_manager
-                    .append_log_bytes(&begin, state.max_file_size, false, keep_open)?;
+                state.file_manager.append_log_bytes(
+                    &begin,
+                    state.max_file_size,
+                    false,
+                    keep_open,
+                )?;
             }
         }
 
@@ -645,8 +717,7 @@ fn mark_async_mmap_persisted(state: &mut EngineState) {
 }
 
 fn async_buffer_flush_threshold(capacity: usize) -> usize {
-    let threshold = capacity
-        .saturating_mul(ASYNC_BUFFER_FLUSH_THRESHOLD_NUM)
+    let threshold = capacity.saturating_mul(ASYNC_BUFFER_FLUSH_THRESHOLD_NUM)
         / ASYNC_BUFFER_FLUSH_THRESHOLD_DEN.max(1);
     threshold.max(1)
 }
@@ -736,4 +807,24 @@ fn current_mark_info() -> String {
         current_tid(),
         now.format("%Y-%m-%d %z %H:%M:%S")
     )
+}
+
+fn async_flush_reason_to_u8(reason: AsyncFlushReason) -> u8 {
+    match reason {
+        AsyncFlushReason::Unknown => 0,
+        AsyncFlushReason::Threshold => 1,
+        AsyncFlushReason::Explicit => 2,
+        AsyncFlushReason::Timeout => 3,
+        AsyncFlushReason::Stop => 4,
+    }
+}
+
+fn u8_to_async_flush_reason(value: u8) -> AsyncFlushReason {
+    match value {
+        1 => AsyncFlushReason::Threshold,
+        2 => AsyncFlushReason::Explicit,
+        3 => AsyncFlushReason::Timeout,
+        4 => AsyncFlushReason::Stop,
+        _ => AsyncFlushReason::Unknown,
+    }
 }

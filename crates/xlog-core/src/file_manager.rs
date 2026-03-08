@@ -11,8 +11,8 @@ use thiserror::Error;
 
 const LOG_EXT: &str = "xlog";
 const CACHE_AVAILABLE_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
-// Keep-open sync path benefits from fewer flushes under multi-thread contention.
-// 64KiB keeps p99 spikes from flush events below 1% in typical sync_4t workloads.
+// Keep-open sync path benefits from a moderate userspace append buffer under
+// contention without turning flush bursts into a new tail-latency problem.
 const ACTIVE_APPEND_BUFFER_CAPACITY: usize = 64 * 1024;
 const FILE_COPY_BUFFER_SIZE: usize = 128 * 1024;
 
