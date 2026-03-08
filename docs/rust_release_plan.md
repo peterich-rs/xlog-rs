@@ -125,6 +125,31 @@
 1. 需要继续用 `cargo package --list` 和 dry-run 校验发布包内容
 2. 发布顺序仍要求先有 `mars-xlog-core`，再发布 `mars-xlog`
 
+### 3.4.1 `mars-xlog-core` 当前 preflight 快照（2026-03-08）
+
+当前已经建立了可重复执行的本地 preflight：
+
+1. `scripts/xlog/check_mars_xlog_core_release.sh`
+
+当前快照结果：
+
+1. `cargo package -p mars-xlog-core --list`
+   - 通过
+   - 发布包包含 `28` 个文件
+2. `cargo publish --dry-run -p mars-xlog-core --allow-dirty`
+   - 通过
+3. `cargo test -p mars-xlog-core --test async_engine --test compress_roundtrip --test dump --test mmap_recovery --test oneshot_flush --test protocol_compat`
+   - 通过
+4. `cargo rustdoc -p mars-xlog-core --lib -- -D missing-docs`
+   - 失败
+   - 当前共有 `239` 个 public API 文档缺失错误
+
+因此 `mars-xlog-core` 当前状态可以描述为：
+
+1. Cargo 打包与 dry-run 发布路径可用
+2. 核心集成测试可用
+3. 正式发布质量仍被 public API 文档覆盖阻断
+
 ### 3.5 仍存在 1 个语义级阻断项
 
 当前 active blocker 见 [rust_semantic_redlines.md](/Users/zhangfan/develop/github.com/xlog-rs/docs/rust_semantic_redlines.md)：
@@ -210,6 +235,7 @@
 
 1. workspace `repository` 已改到当前仓库 `https://github.com/fannnzhang/xlog-rs`
 2. 如果最终发布包名称调整，`documentation` 地址还需要再同步一次
+3. `mars-xlog-core` 还没有达到 `-D missing-docs` 级别的文档覆盖，当前应把它视为 release blocker，而不是单纯的文档优化项
 
 ### 5.3 P0: 收口发布包内容
 
@@ -236,6 +262,12 @@
 3. 当前 active semantic blocker 对使用约束的影响
 4. `bench-internals` 不是公共稳定 API
 5. `mars-xlog-core` 是否承诺稳定公共 API，还是仅作为 `mars-xlog` 的依赖实现
+
+对 `mars-xlog-core` 而言，当前更具体的收口顺序应是：
+
+1. 先补 `appender_engine / buffer / protocol / record / registry` 的公开类型与方法文档
+2. 再补 `compress / crypto / file_manager / oneshot` 的公开错误类型、常量和行为边界说明
+3. 最后再用 `cargo rustdoc -p mars-xlog-core --lib -- -D missing-docs` 作为 release 通过条件
 
 ### 5.5 P1: 发布 CI 与验证流程
 
