@@ -26,6 +26,7 @@ thread_local! {
     });
 }
 
+/// Returns the last path component from a full source path.
 pub fn extract_file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
@@ -104,6 +105,7 @@ fn append_cached_time_prefix(out: &mut String, epoch_second: i64) -> bool {
     })
 }
 
+/// Formats a record into the reusable output buffer.
 pub fn format_record_into(out: &mut String, record: &LogRecord, body: &str) {
     format_record_parts_into(
         out,
@@ -120,6 +122,10 @@ pub fn format_record_into(out: &mut String, record: &LogRecord, body: &str) {
     );
 }
 
+/// Formats a record from its individual fields into the reusable output buffer.
+///
+/// The output matches the legacy xlog single-line text formatter and truncates the
+/// body to the legacy size limits without splitting UTF-8 code points.
 pub fn format_record_parts_into(
     out: &mut String,
     level: crate::record::LogLevel,

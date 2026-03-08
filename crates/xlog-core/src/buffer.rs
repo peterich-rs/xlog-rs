@@ -5,50 +5,77 @@ use thiserror::Error;
 use crate::mmap_store::{MmapStore, MmapStoreError};
 use crate::protocol::{update_end_hour_in_place, LogHeader, HEADER_LEN, MAGIC_END};
 
+/// Default mmap buffer size used by the async write path.
 pub const DEFAULT_BUFFER_BLOCK_LEN: usize = 150 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Recovered bytes and recovery-side metadata produced from raw mmap contents.
 pub struct RecoveryResult {
+    /// Recovered xlog bytes, including an appended tail marker when a pending
+    /// block could be salvaged.
     pub bytes: Vec<u8>,
+    /// Whether recovery turned a tail-less pending block into a complete block.
     pub recovered_pending_block: bool,
+    /// Number of non-zero bytes that were ignored after the valid prefix.
     pub dropped_nonzero_tail_bytes: usize,
 }
 
 impl RecoveryResult {
+    /// Return `true` when recovery did not need to repair or drop any data.
     pub fn is_clean(&self) -> bool {
         !self.recovered_pending_block && self.dropped_nonzero_tail_bytes == 0
     }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Lightweight recovery scan metadata without materializing recovered bytes.
 pub struct RecoveryScan {
+    /// Length of the valid prefix already present in the mmap contents.
     pub valid_len: usize,
+    /// Whether the valid prefix ended with a recoverable pending block.
     pub recovered_pending_block: bool,
+    /// Number of trailing non-zero bytes that were ignored as torn/dirty tail data.
     pub dropped_nonzero_tail_bytes: usize,
 }
 
 #[derive(Debug, Error)]
+/// Errors returned by [`PersistentBuffer`] and buffer recovery helpers.
 pub enum BufferError {
     #[error("mmap store error: {0}")]
+    /// Opening, resizing, or flushing the underlying mmap file failed.
     Mmap(#[from] MmapStoreError),
     #[error("block is larger than buffer capacity: {block_len} > {capacity}")]
-    BlockTooLarge { block_len: usize, capacity: usize },
+    /// The requested block or pending image exceeds the configured capacity.
+    BlockTooLarge {
+        /// Size in bytes of the block that could not fit.
+        block_len: usize,
+        /// Total mmap capacity available for persisted bytes.
+        capacity: usize,
+    },
     #[error("invalid xlog block")]
+    /// The supplied bytes do not form a structurally valid xlog block.
     InvalidBlock,
     #[error("block length does not fit in usize")]
+    /// The encoded payload length overflowed host pointer size arithmetic.
     BlockLenOverflow,
 }
 
+/// Mmap-backed buffer used by the async runtime and oneshot recovery flows.
 pub struct PersistentBuffer {
     store: MmapStore,
     len: usize,
 }
 
 impl PersistentBuffer {
+    /// Open a buffer at `path` using [`DEFAULT_BUFFER_BLOCK_LEN`].
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BufferError> {
         Self::open_with_capacity(path, DEFAULT_BUFFER_BLOCK_LEN)
     }
 
+    /// Open a buffer at `path` with an explicit mmap capacity.
+    ///
+    /// Existing contents are scanned and repaired in place when they end with a
+    /// recoverable pending block or dirty tail bytes.
     pub fn open_with_capacity(
         path: impl Into<PathBuf>,
         capacity: usize,
@@ -72,34 +99,45 @@ impl PersistentBuffer {
         Ok(Self { store, len })
     }
 
+    /// Return the on-disk path of the mmap file.
     pub fn path(&self) -> &Path {
         self.store.path()
     }
 
+    /// Return the currently used byte length.
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Return the valid byte prefix currently stored in the buffer.
     pub fn as_bytes(&self) -> &[u8] {
         &self.store.as_slice()[..self.len]
     }
 
+    /// Return the total mmap capacity in bytes.
     pub fn capacity(&self) -> usize {
         self.store.len()
     }
 
+    /// Return `true` when the buffer currently contains no valid bytes.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// Scan the current valid prefix and report recovery metadata.
     pub fn recovery_scan(&self) -> RecoveryScan {
         scan_recovery(self.as_bytes())
     }
 
+    /// Append a validated full xlog block and flush the mmap immediately.
     pub fn append_block(&mut self, block: &[u8]) -> Result<bool, BufferError> {
         self.append_block_with_flush(block, true)
     }
 
+    /// Append a validated full xlog block.
+    ///
+    /// Returns `Ok(false)` when the block is valid but there is not enough
+    /// remaining capacity.
     pub fn append_block_with_flush(
         &mut self,
         block: &[u8],
@@ -134,10 +172,15 @@ impl PersistentBuffer {
         Ok(true)
     }
 
+    /// Replace the valid prefix with `bytes` and flush the mmap immediately.
     pub fn replace_bytes(&mut self, bytes: &[u8]) -> Result<(), BufferError> {
         self.replace_bytes_with_flush(bytes, true)
     }
 
+    /// Replace the valid prefix with `bytes`.
+    ///
+    /// Trailing bytes are only cleared when the new prefix shrinks, which avoids
+    /// repeatedly zeroing the full mmap during async pending updates.
     pub fn replace_bytes_with_flush(
         &mut self,
         bytes: &[u8],
@@ -171,12 +214,14 @@ impl PersistentBuffer {
         Ok(())
     }
 
+    /// Return all valid bytes and clear the buffer.
     pub fn take_all(&mut self) -> Result<Vec<u8>, BufferError> {
         let out = self.store.as_slice()[..self.len].to_vec();
         self.clear()?;
         Ok(out)
     }
 
+    /// Zero only the currently used portion of the mmap and reset the length.
     pub fn clear_used_with_flush(&mut self, flush: bool) -> Result<(), BufferError> {
         let old_len = self.len;
         {
@@ -194,6 +239,7 @@ impl PersistentBuffer {
         Ok(())
     }
 
+    /// Initialize a new pending async block with its encoded header.
     pub fn begin_pending_block_with_flush(
         &mut self,
         header: &LogHeader,
@@ -224,6 +270,10 @@ impl PersistentBuffer {
         Ok(())
     }
 
+    /// Replace the tail of the current pending block with new payload bytes.
+    ///
+    /// `truncate_bytes` removes previously buffered payload bytes before `bytes`
+    /// are appended. The header length and end hour are updated in place.
     pub fn append_to_pending_with_flush(
         &mut self,
         truncate_bytes: usize,
@@ -271,6 +321,7 @@ impl PersistentBuffer {
         Ok(())
     }
 
+    /// Finalize the current pending block by appending [`MAGIC_END`].
     pub fn finalize_pending_block_with_flush(
         &mut self,
         end_hour: u8,
@@ -306,6 +357,7 @@ impl PersistentBuffer {
         Ok(())
     }
 
+    /// Zero the entire mmap region and reset the valid length to zero.
     pub fn clear(&mut self) -> Result<(), BufferError> {
         self.store.as_mut_slice().fill(0);
         self.len = 0;
@@ -328,6 +380,10 @@ impl PersistentBuffer {
     }
 }
 
+/// Recover valid xlog bytes from raw mmap contents.
+///
+/// When the tail marker is missing but the header length still points to a
+/// complete payload, a synthetic [`MAGIC_END`] is appended.
 pub fn recover_blocks(raw: &[u8]) -> RecoveryResult {
     let scan = scan_recovery(raw);
     let mut out = raw[..scan.valid_len].to_vec();
@@ -342,6 +398,7 @@ pub fn recover_blocks(raw: &[u8]) -> RecoveryResult {
     }
 }
 
+/// Scan raw mmap contents and report how much of the prefix is recoverable.
 pub fn scan_recovery(raw: &[u8]) -> RecoveryScan {
     let mut offset = 0usize;
     let mut recovered_pending_block = false;
@@ -400,6 +457,8 @@ pub fn scan_recovery(raw: &[u8]) -> RecoveryScan {
     }
 }
 
+/// Validate that `block` is a complete xlog block with a matching header length
+/// and trailing [`MAGIC_END`].
 pub fn validate_block(block: &[u8]) -> Result<(), BufferError> {
     if block.len() < HEADER_LEN + 1 {
         return Err(BufferError::InvalidBlock);

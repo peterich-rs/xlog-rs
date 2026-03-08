@@ -7,6 +7,7 @@ use chrono::{Datelike, Local, Timelike};
 
 const MAX_DUMP_LENGTH: usize = 4096;
 
+/// Renders a bounded hex + ASCII memory dump for debugging output.
 pub fn memory_dump(buffer: &[u8]) -> String {
     if buffer.is_empty() {
         return String::new();
@@ -35,6 +36,7 @@ pub fn memory_dump(buffer: &[u8]) -> String {
     out
 }
 
+/// Writes a raw dump file under `log_dir` and returns a short preview string.
 pub fn dump_to_file(log_dir: &str, buffer: &[u8]) -> String {
     if log_dir.is_empty() || buffer.is_empty() {
         return String::new();

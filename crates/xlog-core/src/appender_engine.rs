@@ -29,29 +29,43 @@ const EXPIRED_SWEEP_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const CACHE_MOVE_INTERVAL: Duration = Duration::from_secs(3 * 60);
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Runtime mode used by [`AppenderEngine`].
 pub enum EngineMode {
+    /// Buffer blocks in mmap/cache state and let the worker flush them later.
     Async,
+    /// Persist blocks directly on the caller thread.
     Sync,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Reason attached to an async flush request or observed flush epoch.
 pub enum AsyncFlushReason {
+    /// No concrete reason was recorded.
     Unknown,
+    /// Async buffer crossed the internal flush threshold.
     Threshold,
+    /// Caller requested a flush explicitly.
     Explicit,
+    /// Worker flushed due to timeout while data remained pending.
     Timeout,
+    /// Worker is shutting down and draining remaining data.
     Stop,
 }
 
 #[derive(Debug, Error)]
+/// Errors returned by [`AppenderEngine`] operations.
 pub enum AppenderEngineError {
     #[error("buffer error: {0}")]
+    /// The mmap-backed buffer rejected the requested mutation.
     Buffer(#[from] BufferError),
     #[error("file manager error: {0}")]
+    /// File append, rotate, move, or flush work failed.
     FileManager(#[from] FileManagerError),
     #[error("engine worker channel closed")]
+    /// The background worker is no longer available.
     ChannelClosed,
     #[error("invalid engine mode for this operation")]
+    /// The requested API was used in the wrong [`EngineMode`].
     InvalidMode,
 }
 
@@ -79,6 +93,10 @@ enum EngineCommand {
     },
 }
 
+/// Shared write engine used by the Rust runtime.
+///
+/// The engine owns the mmap-backed async buffer, the active file manager, and
+/// the worker thread that drains async state into `.xlog` files.
 pub struct AppenderEngine {
     mode: AtomicI32,
     file_manager: FileManager,
@@ -95,6 +113,7 @@ pub struct AppenderEngine {
 }
 
 impl AppenderEngine {
+    /// Create a new engine using the default async flush timeout.
     pub fn new(
         file_manager: FileManager,
         buffer: PersistentBuffer,
@@ -112,6 +131,10 @@ impl AppenderEngine {
         )
     }
 
+    /// Create a new engine with an explicit async flush timeout.
+    ///
+    /// `max_alive_time` is clamped to the minimum retention floor enforced by
+    /// the historical Mars behavior.
     pub fn new_with_flush_timeout(
         file_manager: FileManager,
         buffer: PersistentBuffer,
@@ -185,10 +208,15 @@ impl AppenderEngine {
         }
     }
 
+    /// Return the current engine mode.
     pub fn mode(&self) -> EngineMode {
         i32_to_mode(self.mode.load(Ordering::Relaxed))
     }
 
+    /// Switch the engine between async and sync modes.
+    ///
+    /// Switching from async to sync forces a synchronous drain first so the
+    /// caller does not leave buffered async data behind.
     pub fn set_mode(&self, mode: EngineMode) -> Result<(), AppenderEngineError> {
         let old = i32_to_mode(self.mode.swap(mode_to_i32(mode), Ordering::Relaxed));
         if old == EngineMode::Async && mode == EngineMode::Sync {
@@ -197,6 +225,7 @@ impl AppenderEngine {
         Ok(())
     }
 
+    /// Update the max logfile size used by subsequent appends and rotations.
     pub fn set_max_file_size(&self, max_file_size: u64) {
         self.max_file_size.store(max_file_size, Ordering::Relaxed);
         if let Ok(mut state) = self.state.lock() {
@@ -204,6 +233,7 @@ impl AppenderEngine {
         }
     }
 
+    /// Update the max logfile age, ignoring values below the built-in minimum.
     pub fn set_max_alive_time(&self, alive_seconds: i64) {
         if alive_seconds < MIN_LOG_ALIVE_SECONDS {
             return;
@@ -214,29 +244,39 @@ impl AppenderEngine {
         }
     }
 
+    /// Return the current max logfile size.
     pub fn max_file_size(&self) -> u64 {
         self.max_file_size.load(Ordering::Relaxed)
     }
 
+    /// Return the configured log directory as a UTF-8 lossy string.
     pub fn log_dir(&self) -> Option<String> {
         Some(self.file_manager.log_dir().to_string_lossy().to_string())
     }
 
+    /// Return the configured cache directory as a UTF-8 lossy string.
     pub fn cache_dir(&self) -> Option<String> {
         self.file_manager
             .cache_dir()
             .map(|p| p.to_string_lossy().to_string())
     }
 
+    /// List logfile paths covered by a timespan query.
     pub fn filepaths_from_timespan(&self, timespan: i32, prefix: &str) -> Vec<String> {
         self.file_manager.filepaths_from_timespan(timespan, prefix)
     }
 
+    /// Build candidate logfile names for a timespan query.
     pub fn make_logfile_name(&self, timespan: i32, prefix: &str) -> Vec<String> {
         self.file_manager
             .make_logfile_name(timespan, prefix, self.max_file_size())
     }
 
+    /// Write one fully-formed xlog block.
+    ///
+    /// In sync mode the block is appended to the active file immediately. In
+    /// async mode the block is appended to the mmap-backed buffer and may
+    /// trigger a worker flush when thresholds are exceeded.
     pub fn write_block(&self, block: &[u8], force_flush: bool) -> Result<(), AppenderEngineError> {
         validate_block(block)?;
 
@@ -293,6 +333,9 @@ impl AppenderEngine {
         Ok(())
     }
 
+    /// Start a new async pending block by writing its header into the buffer.
+    ///
+    /// This API is only valid when the engine is in [`EngineMode::Async`].
     pub fn begin_async_pending(&self, header: &LogHeader) -> Result<(), AppenderEngineError> {
         if self.mode() != EngineMode::Async {
             return Err(AppenderEngineError::InvalidMode);
@@ -314,6 +357,11 @@ impl AppenderEngine {
         Ok(())
     }
 
+    /// Replace the tail of the current async pending block with `chunk`.
+    ///
+    /// `truncate_bytes` removes previously buffered payload bytes before the new
+    /// bytes are appended. The header's payload length and end hour are updated
+    /// in place.
     pub fn append_async_chunk(
         &self,
         truncate_bytes: usize,
@@ -360,6 +408,7 @@ impl AppenderEngine {
         Ok(())
     }
 
+    /// Finalize the current async pending block by appending the tail marker.
     pub fn finalize_async_pending(
         &self,
         end_hour: u8,
@@ -389,6 +438,7 @@ impl AppenderEngine {
         Ok(())
     }
 
+    /// Return `(used_len, capacity)` for the async buffer, or `None` in sync mode.
     pub fn async_buffer_stats(&self) -> Option<(usize, usize)> {
         if self.mode() != EngineMode::Async {
             return None;
@@ -399,6 +449,7 @@ impl AppenderEngine {
             .map(|s| (s.buffer.len(), s.buffer.capacity()))
     }
 
+    /// Snapshot the current async buffer contents, or `None` in sync mode.
     pub fn async_buffer_snapshot(&self) -> Option<Vec<u8>> {
         if self.mode() != EngineMode::Async {
             return None;
@@ -406,14 +457,17 @@ impl AppenderEngine {
         self.state.lock().ok().map(|s| s.buffer.as_bytes().to_vec())
     }
 
+    /// Return the fixed capacity of the backing async buffer.
     pub fn buffer_capacity(&self) -> usize {
         self.buffer_capacity
     }
 
+    /// Return the latest observed async flush epoch.
     pub fn async_flush_epoch(&self) -> u64 {
         self.async_flush_epoch.load(Ordering::Acquire)
     }
 
+    /// Return a stable `(epoch, reason)` snapshot for the latest async flush.
     pub fn async_flush_state(&self) -> (u64, AsyncFlushReason) {
         loop {
             let epoch_before = self.async_flush_epoch.load(Ordering::Acquire);
@@ -425,10 +479,15 @@ impl AppenderEngine {
         }
     }
 
+    /// Take and reset the number of async flush requeues observed by the worker.
     pub fn take_async_flush_requeue_count(&self) -> u64 {
         self.async_flush_requeue_count.swap(0, Ordering::AcqRel)
     }
 
+    /// Replace the async pending bytes wholesale.
+    ///
+    /// This is used by higher-level runtimes that already built a pending block
+    /// image and want the engine to own persistence/flush decisions.
     pub fn write_async_pending(
         &self,
         pending_bytes: &[u8],
@@ -464,10 +523,15 @@ impl AppenderEngine {
         Ok(())
     }
 
+    /// Flush pending data using the default explicit flush reason.
     pub fn flush(&self, sync: bool) -> Result<(), AppenderEngineError> {
         self.flush_with_reason(sync, AsyncFlushReason::Explicit)
     }
 
+    /// Flush pending data and record the supplied async flush reason.
+    ///
+    /// In sync mode, `sync = true` flushes the active file buffer directly.
+    /// In async mode, `sync = true` waits for the worker acknowledgement.
     pub fn flush_with_reason(
         &self,
         sync: bool,

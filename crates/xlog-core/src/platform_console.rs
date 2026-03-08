@@ -32,20 +32,32 @@ use crate::formatter::extract_file_name;
 use crate::platform_tid::{current_tid, main_tid};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Severity used for platform console forwarding.
 pub enum ConsoleLevel {
+    /// Verbose diagnostic output.
     Verbose,
+    /// Debug output for development and troubleshooting.
     Debug,
+    /// Informational output for normal events.
     Info,
+    /// Warning output for recoverable issues.
     Warn,
+    /// Error output for failures that do not immediately abort the process.
     Error,
+    /// Fatal output for unrecoverable failures.
     Fatal,
+    /// Console forwarding disabled.
     None,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Apple console sink selection used by [`set_apple_console_fun`].
 pub enum AppleConsoleFun {
+    /// Use `printf`-style console output.
     Printf = 0,
+    /// Use Foundation `NSLog`.
     NsLog = 1,
+    /// Use unified logging via `os_log`.
     OsLog = 2,
 }
 
@@ -63,6 +75,7 @@ static APPLE_CONSOLE_FUN: AtomicU8 = AtomicU8::new(AppleConsoleFun::OsLog as u8)
     target_os = "tvos",
     target_os = "watchos"
 ))]
+/// Select the Apple console sink used for subsequent console writes.
 pub fn set_apple_console_fun(fun: AppleConsoleFun) {
     APPLE_CONSOLE_FUN.store(fun as u8, Ordering::Relaxed);
 }
@@ -73,8 +86,14 @@ pub fn set_apple_console_fun(fun: AppleConsoleFun) {
     target_os = "tvos",
     target_os = "watchos"
 )))]
+/// No-op on non-Apple targets.
 pub fn set_apple_console_fun(_fun: AppleConsoleFun) {}
 
+/// Forward one formatted log line to the platform console when supported.
+///
+/// Empty messages are ignored. Android uses `__android_log_write`, Apple
+/// targets use the configured [`AppleConsoleFun`], and other targets print to
+/// stdout.
 pub fn write_console_line(
     level: ConsoleLevel,
     tag: &str,

@@ -2,51 +2,79 @@ use std::sync::atomic::{AtomicU16, Ordering};
 
 use thiserror::Error;
 
+/// Byte length of one encoded xlog header.
 pub const HEADER_LEN: usize = 1 + 2 + 1 + 1 + 4 + 64;
+/// Byte length of the trailing end marker.
 pub const TAILER_LEN: usize = 1;
+/// Tail marker terminating a complete xlog block.
 pub const MAGIC_END: u8 = 0x00;
 
+/// Magic byte for sync + zlib + encrypted blocks.
 pub const MAGIC_SYNC_ZLIB_START: u8 = 0x06;
+/// Magic byte for sync + zlib + plaintext blocks.
 pub const MAGIC_SYNC_NO_CRYPT_ZLIB_START: u8 = 0x08;
+/// Magic byte for async + zlib + encrypted blocks.
 pub const MAGIC_ASYNC_ZLIB_START: u8 = 0x07;
+/// Magic byte for async + zlib + plaintext blocks.
 pub const MAGIC_ASYNC_NO_CRYPT_ZLIB_START: u8 = 0x09;
 
+/// Magic byte for sync + zstd + encrypted blocks.
 pub const MAGIC_SYNC_ZSTD_START: u8 = 0x0A;
+/// Magic byte for sync + zstd + plaintext blocks.
 pub const MAGIC_SYNC_NO_CRYPT_ZSTD_START: u8 = 0x0B;
+/// Magic byte for async + zstd + encrypted blocks.
 pub const MAGIC_ASYNC_ZSTD_START: u8 = 0x0C;
+/// Magic byte for async + zstd + plaintext blocks.
 pub const MAGIC_ASYNC_NO_CRYPT_ZSTD_START: u8 = 0x0D;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Compression family encoded into the xlog magic byte.
 pub enum CompressionKind {
+    /// zlib-framed payloads.
     Zlib,
+    /// zstd-framed payloads.
     Zstd,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Append path encoded into the xlog magic byte.
 pub enum AppendMode {
+    /// Synchronous write path.
     Sync,
+    /// Asynchronous buffered write path.
     Async,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Decoded header for one xlog block.
 pub struct LogHeader {
+    /// Magic byte describing compression, append mode, and crypto usage.
     pub magic: u8,
+    /// Sequence number. Async blocks increment and skip zero; sync blocks use zero.
     pub seq: u16,
+    /// Begin hour in local time.
     pub begin_hour: u8,
+    /// End hour in local time.
     pub end_hour: u8,
+    /// Payload byte length, excluding header and tail marker.
     pub len: u32,
+    /// Optional client public key bytes used by encrypted logs.
     pub client_pubkey: [u8; 64],
 }
 
 #[derive(Debug, Error)]
+/// Errors returned by header decode/mutation helpers.
 pub enum ProtocolError {
     #[error("invalid header length")]
+    /// The provided buffer is shorter than [`HEADER_LEN`].
     InvalidHeaderLen,
     #[error("invalid magic byte: {0:#x}")]
+    /// The header used a start magic byte outside the supported xlog set.
     InvalidMagic(u8),
 }
 
 impl LogHeader {
+    /// Encode this header into the on-disk xlog header layout.
     pub fn encode(self) -> [u8; HEADER_LEN] {
         let mut out = [0u8; HEADER_LEN];
         out[0] = self.magic;
@@ -58,6 +86,7 @@ impl LogHeader {
         out
     }
 
+    /// Decode one xlog header from the start of `buf`.
     pub fn decode(buf: &[u8]) -> Result<Self, ProtocolError> {
         if buf.len() < HEADER_LEN {
             return Err(ProtocolError::InvalidHeaderLen);
@@ -80,6 +109,7 @@ impl LogHeader {
     }
 }
 
+/// Select the xlog magic byte for a `(compression, append mode, crypto)` tuple.
 pub fn select_magic(compress: CompressionKind, mode: AppendMode, crypt: bool) -> u8 {
     match (compress, mode, crypt) {
         (CompressionKind::Zlib, AppendMode::Sync, true) => MAGIC_SYNC_ZLIB_START,
@@ -93,6 +123,7 @@ pub fn select_magic(compress: CompressionKind, mode: AppendMode, crypt: bool) ->
     }
 }
 
+/// Return whether `magic` is one of the supported xlog start markers.
 pub fn magic_start_is_valid(magic: u8) -> bool {
     matches!(
         magic,
@@ -107,6 +138,9 @@ pub fn magic_start_is_valid(magic: u8) -> bool {
     )
 }
 
+/// Add `add_len` to the payload length stored in an encoded header.
+///
+/// Returns the new payload length.
 pub fn update_log_len_in_place(buf: &mut [u8], add_len: u32) -> Result<u32, ProtocolError> {
     if buf.len() < HEADER_LEN {
         return Err(ProtocolError::InvalidHeaderLen);
@@ -117,6 +151,7 @@ pub fn update_log_len_in_place(buf: &mut [u8], add_len: u32) -> Result<u32, Prot
     Ok(next)
 }
 
+/// Update the encoded end-hour field inside an existing header.
 pub fn update_end_hour_in_place(buf: &mut [u8], hour: u8) -> Result<(), ProtocolError> {
     if buf.len() < HEADER_LEN {
         return Err(ProtocolError::InvalidHeaderLen);
@@ -125,6 +160,7 @@ pub fn update_end_hour_in_place(buf: &mut [u8], hour: u8) -> Result<(), Protocol
     Ok(())
 }
 
+/// Async sequence generator matching Mars xlog semantics.
 pub struct SeqGenerator {
     seq: AtomicU16,
 }
@@ -138,13 +174,16 @@ impl Default for SeqGenerator {
 }
 
 impl SeqGenerator {
+    /// Create a generator with a fixed initial sequence state.
     pub fn with_seed(seed: u16) -> Self {
         Self {
             seq: AtomicU16::new(seed),
         }
     }
 
-    /// Matches C++ behavior for async logs: increment, and skip 0.
+    /// Generate the next async sequence number.
+    ///
+    /// Matches the historical C++ behavior: increment first, then skip `0`.
     pub fn next_async(&self) -> u16 {
         let mut next = self.seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         if next == 0 {
@@ -157,6 +196,7 @@ impl SeqGenerator {
         next
     }
 
+    /// Return the fixed sync sequence number used by Mars xlog.
     pub fn sync_seq() -> u16 {
         0
     }

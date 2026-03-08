@@ -4,19 +4,27 @@ use flate2::Compression;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+/// Errors raised by the compression and decompression helpers.
 pub enum CompressError {
+    /// Raw-deflate compression failed.
     #[error("zlib compress failed: {0}")]
     Zlib(String),
+    /// zstd compression failed.
     #[error("zstd compress failed: {0}")]
     Zstd(String),
+    /// Raw-deflate decompression failed.
     #[error("zlib decompress failed: {0}")]
     ZlibDecompress(String),
+    /// zstd frame decompression failed.
     #[error("zstd decompress failed: {0}")]
     ZstdDecompress(String),
 }
 
+/// Stateful compressor used by the async writer to emit one logical stream.
 pub trait StreamCompressor {
+    /// Compresses one input chunk and appends newly emitted bytes to `output`.
     fn compress_chunk(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), CompressError>;
+    /// Finalizes the stream and appends any remaining encoded bytes to `output`.
     fn flush(&mut self, output: &mut Vec<u8>) -> Result<(), CompressError>;
 }
 
@@ -27,6 +35,7 @@ pub struct ZlibStreamCompressor {
 }
 
 impl ZlibStreamCompressor {
+    /// Creates a raw-deflate stream compressor with the requested compression level.
     pub fn new(level: i32) -> Self {
         let level = level.clamp(0, 9) as u32;
         Self {
@@ -79,6 +88,7 @@ pub struct ZstdChunkCompressor {
 }
 
 impl ZstdChunkCompressor {
+    /// Creates a compressor that encodes each input chunk as a separate zstd frame.
     pub fn new(level: i32) -> Self {
         Self { level }
     }
@@ -107,6 +117,7 @@ pub struct ZstdStreamCompressor {
 }
 
 impl ZstdStreamCompressor {
+    /// Creates a streaming zstd compressor configured to match Mars async settings.
     pub fn new(level: i32) -> Result<Self, CompressError> {
         let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), level)
             .map_err(|e| CompressError::Zstd(e.to_string()))?;
@@ -156,6 +167,7 @@ impl StreamCompressor for ZstdStreamCompressor {
     }
 }
 
+/// Decompresses raw-deflate data produced by the zlib stream compressor.
 pub fn decompress_raw_zlib(input: &[u8]) -> Result<Vec<u8>, CompressError> {
     let mut decoder = flate2::read::DeflateDecoder::new(input);
     let mut out = Vec::new();
@@ -165,6 +177,7 @@ pub fn decompress_raw_zlib(input: &[u8]) -> Result<Vec<u8>, CompressError> {
     Ok(out)
 }
 
+/// Decompresses one or more concatenated zstd frames into a single byte buffer.
 pub fn decompress_zstd_frames(input: &[u8]) -> Result<Vec<u8>, CompressError> {
     let mut reader = std::io::Cursor::new(input);
     let mut decoder = zstd::stream::Decoder::new(&mut reader)

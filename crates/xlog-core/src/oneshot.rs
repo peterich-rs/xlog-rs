@@ -14,17 +14,31 @@ use crate::protocol::{
 };
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Result code returned by [`oneshot_flush`].
 pub enum FileIoAction {
+    /// No file action was taken.
     None = 0,
+    /// The recovered bytes were flushed successfully.
     Success = 1,
+    /// No mmap file was present or it contained no recoverable bytes.
     Unnecessary = 2,
+    /// Opening the mmap file failed.
     OpenFailed = 3,
+    /// Reading or mapping the mmap file failed.
     ReadFailed = 4,
+    /// Writing recovered bytes to the logfile failed.
     WriteFailed = 5,
+    /// Reserved for parity with historical file-action result codes.
     CloseFailed = 6,
+    /// Removing the consumed mmap file failed.
     RemoveFailed = 7,
 }
 
+/// Drain another process's mmap buffer into the active logfile exactly once.
+///
+/// This is the Rust equivalent of Mars xlog's oneshot recovery path. It reads
+/// the raw mmap bytes, recovers a pending block when possible, appends optional
+/// begin/end marker blocks, and removes the mmap file after a successful drain.
 pub fn oneshot_flush(
     file_manager: &FileManager,
     mmap_capacity: usize,

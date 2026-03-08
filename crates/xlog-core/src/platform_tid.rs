@@ -1,5 +1,6 @@
 use std::sync::OnceLock;
 
+/// Return the current platform thread id, or `-1` on unsupported targets.
 pub fn current_tid() -> i64 {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -33,6 +34,10 @@ pub fn current_tid() -> i64 {
     }
 }
 
+/// Return the platform "main thread id" used by Mars-compatible metadata.
+///
+/// On Linux/Android this follows the historical Mars behavior and returns the
+/// process id. On Apple targets the first observed thread id is memoized.
 pub fn main_tid() -> i64 {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {

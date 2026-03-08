@@ -8,16 +8,21 @@ use thiserror::Error;
 const TEA_BLOCK_LEN: usize = 8;
 
 #[derive(Debug, Error)]
+/// Errors raised while preparing or using the ECDH + TEA compatibility cipher.
 pub enum CryptoError {
+    /// The configured server public key was not 64 bytes of uncompressed hex data.
     #[error("server public key must be 128 hex chars")]
     InvalidServerPubkeyLength,
+    /// Decoding the configured server public key hex failed.
     #[error("invalid server public key hex: {0}")]
     InvalidServerPubkeyHex(#[from] FromHexError),
+    /// The provided key bytes were not valid secp256k1 key material.
     #[error("invalid secp256k1 key material")]
     InvalidKeyMaterial,
 }
 
 #[derive(Debug, Clone)]
+/// Compatibility cipher that derives a TEA key from an ECDH shared secret.
 pub struct EcdhTeaCipher {
     enabled: bool,
     tea_key: [u32; 4],
@@ -35,10 +40,14 @@ impl Default for EcdhTeaCipher {
 }
 
 impl EcdhTeaCipher {
+    /// Returns a disabled cipher that leaves all inputs unchanged.
     pub fn disabled() -> Self {
         Self::default()
     }
 
+    /// Creates a cipher from a remote server public key expressed as raw hex.
+    ///
+    /// An empty string keeps encryption disabled for parity with legacy callers.
     pub fn new(server_pubkey_hex: &str) -> Result<Self, CryptoError> {
         if server_pubkey_hex.is_empty() {
             return Ok(Self::disabled());
@@ -47,6 +56,7 @@ impl EcdhTeaCipher {
         Self::from_secret_key(server_pubkey_hex, secret)
     }
 
+    /// Creates a cipher from a caller-supplied private key and server public key.
     pub fn new_with_private_key(
         server_pubkey_hex: &str,
         private_key: [u8; 32],
@@ -89,14 +99,17 @@ impl EcdhTeaCipher {
         })
     }
 
+    /// Returns whether async encryption is enabled.
     pub fn enabled(&self) -> bool {
         self.enabled
     }
 
+    /// Returns the client public key sent to the decoder peer.
     pub fn client_pubkey(&self) -> [u8; 64] {
         self.client_pubkey
     }
 
+    /// Returns the derived TEA key as four little-endian words.
     pub fn tea_key_words(&self) -> [u32; 4] {
         self.tea_key
     }
@@ -117,6 +130,7 @@ impl EcdhTeaCipher {
         out
     }
 
+    /// Encrypts whole 8-byte blocks in place and leaves any trailing bytes unchanged.
     pub fn encrypt_async_in_place(&self, input: &mut [u8]) {
         if !self.enabled {
             return;
@@ -140,6 +154,7 @@ fn decode_uncompressed_pubkey(server_pubkey_hex: &str) -> Result<PublicKey, Cryp
     PublicKey::from_sec1_bytes(&sec1).map_err(|_| CryptoError::InvalidKeyMaterial)
 }
 
+/// Encrypts data in-place with the TEA block cipher using 16 rounds.
 pub fn tea_encrypt_in_place(data: &mut [u8], key: &[u32; 4]) {
     for chunk in data.chunks_exact_mut(TEA_BLOCK_LEN) {
         let mut v0 = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
@@ -166,6 +181,7 @@ pub fn tea_encrypt_in_place(data: &mut [u8], key: &[u32; 4]) {
     }
 }
 
+/// Decrypts data in-place with the TEA block cipher using 16 rounds.
 pub fn tea_decrypt_in_place(data: &mut [u8], key: &[u32; 4]) {
     for chunk in data.chunks_exact_mut(TEA_BLOCK_LEN) {
         let mut v0 = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);

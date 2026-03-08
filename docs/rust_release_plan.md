@@ -141,14 +141,14 @@
 3. `cargo test -p mars-xlog-core --test async_engine --test compress_roundtrip --test dump --test mmap_recovery --test oneshot_flush --test protocol_compat`
    - 通过
 4. `cargo rustdoc -p mars-xlog-core --lib -- -D missing-docs`
-   - 失败
-   - 当前共有 `239` 个 public API 文档缺失错误
+   - 通过
 
 因此 `mars-xlog-core` 当前状态可以描述为：
 
 1. Cargo 打包与 dry-run 发布路径可用
 2. 核心集成测试可用
-3. 正式发布质量仍被 public API 文档覆盖阻断
+3. public API 文档覆盖已达到 release preflight 要求
+4. 当前可以进入正式发布准备阶段
 
 ### 3.5 仍存在 1 个语义级阻断项
 
@@ -235,7 +235,7 @@
 
 1. workspace `repository` 已改到当前仓库 `https://github.com/fannnzhang/xlog-rs`
 2. 如果最终发布包名称调整，`documentation` 地址还需要再同步一次
-3. `mars-xlog-core` 还没有达到 `-D missing-docs` 级别的文档覆盖，当前应把它视为 release blocker，而不是单纯的文档优化项
+3. `mars-xlog-core` 已达到 `-D missing-docs` 级别的文档覆盖，后续文档工作以 API 可读性和示例完善为主
 
 ### 5.3 P0: 收口发布包内容
 
@@ -267,7 +267,7 @@
 
 1. 先补 `appender_engine / buffer / protocol / record / registry` 的公开类型与方法文档
 2. 再补 `compress / crypto / file_manager / oneshot` 的公开错误类型、常量和行为边界说明
-3. 最后再用 `cargo rustdoc -p mars-xlog-core --lib -- -D missing-docs` 作为 release 通过条件
+3. 继续保留 `cargo rustdoc -p mars-xlog-core --lib -- -D missing-docs` 作为 release preflight 条件
 
 ### 5.5 P1: 发布 CI 与验证流程
 

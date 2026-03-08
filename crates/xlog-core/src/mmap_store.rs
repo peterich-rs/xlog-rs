@@ -6,29 +6,42 @@ use memmap2::MmapMut;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+/// Errors returned by [`MmapStore`] operations.
 pub enum MmapStoreError {
     #[error("invalid mmap capacity: {0}")]
+    /// The requested mmap capacity was zero.
     InvalidCapacity(usize),
     #[error("create parent directory failed for {0}: {1}")]
+    /// Creating the parent directory for the mmap file failed.
     CreateParent(PathBuf, #[source] std::io::Error),
     #[error("open mmap file failed for {0}: {1}")]
+    /// Opening or creating the mmap file failed.
     OpenFile(PathBuf, #[source] std::io::Error),
     #[error("resize mmap file failed for {0}: {1}")]
+    /// Resizing the mmap file to the requested capacity failed.
     ResizeFile(PathBuf, #[source] std::io::Error),
     #[error("preallocate mmap file failed for {0}: {1}")]
+    /// Writing zeroes to fully back the mmap file failed.
     PreallocateFile(PathBuf, #[source] std::io::Error),
     #[error("memory-map file failed for {0}: {1}")]
+    /// Creating a mutable memory map over the file failed.
     MapFile(PathBuf, #[source] std::io::Error),
     #[error("flush mmap file failed for {0}: {1}")]
+    /// Flushing the mmap contents to storage failed.
     Flush(PathBuf, #[source] std::io::Error),
 }
 
+/// Thin wrapper around a fixed-size mutable file-backed memory map.
 pub struct MmapStore {
     path: PathBuf,
     mmap: MmapMut,
 }
 
 impl MmapStore {
+    /// Open or create a file-backed mutable mmap with the requested capacity.
+    ///
+    /// New or resized files are explicitly zero-filled to avoid sparse-file
+    /// behavior that could otherwise trigger SIGBUS on later access.
     pub fn open_or_create(
         path: impl Into<PathBuf>,
         capacity: usize,
@@ -69,22 +82,27 @@ impl MmapStore {
         Ok(Self { path, mmap })
     }
 
+    /// Return the on-disk path backing this mmap.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Return the mmap length in bytes.
     pub fn len(&self) -> usize {
         self.mmap.len()
     }
 
+    /// Borrow the full mmap as an immutable byte slice.
     pub fn as_slice(&self) -> &[u8] {
         &self.mmap
     }
 
+    /// Borrow the full mmap as a mutable byte slice.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.mmap
     }
 
+    /// Flush pending mmap mutations to the backing file.
     pub fn flush(&mut self) -> Result<(), MmapStoreError> {
         self.mmap
             .flush()

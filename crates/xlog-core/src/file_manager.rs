@@ -17,30 +17,42 @@ const ACTIVE_APPEND_BUFFER_CAPACITY: usize = 64 * 1024;
 const FILE_COPY_BUFFER_SIZE: usize = 128 * 1024;
 
 #[derive(Debug, Error)]
+/// Errors produced while selecting log targets or mutating log/cache files.
 pub enum FileManagerError {
+    /// The configured log directory path was empty.
     #[error("log_dir must be non-empty")]
     EmptyLogDir,
+    /// The configured log file prefix was empty.
     #[error("name_prefix must be non-empty")]
     EmptyNamePrefix,
+    /// Creating a required directory failed.
     #[error("create directory failed for {0}: {1}")]
     CreateDir(PathBuf, #[source] std::io::Error),
+    /// Listing a directory failed.
     #[error("read directory failed for {0}: {1}")]
     ReadDir(PathBuf, #[source] std::io::Error),
+    /// Reading file metadata failed.
     #[error("file metadata failed for {0}: {1}")]
     Metadata(PathBuf, #[source] std::io::Error),
+    /// Opening a file for read or append failed.
     #[error("open file failed for {0}: {1}")]
     OpenFile(PathBuf, #[source] std::io::Error),
+    /// Writing file data or flushing buffered bytes failed.
     #[error("write file failed for {0}: {1}")]
     WriteFile(PathBuf, #[source] std::io::Error),
+    /// Reading file data failed.
     #[error("read file failed for {0}: {1}")]
     ReadFile(PathBuf, #[source] std::io::Error),
+    /// Removing a file failed.
     #[error("remove file failed for {0}: {1}")]
     RemoveFile(PathBuf, #[source] std::io::Error),
+    /// Removing a directory tree failed.
     #[error("remove directory failed for {0}: {1}")]
     RemoveDir(PathBuf, #[source] std::io::Error),
 }
 
 #[derive(Debug, Clone)]
+/// Resolves daily log file paths and appends encoded log frames to them.
 pub struct FileManager {
     log_dir: PathBuf,
     cache_dir: Option<PathBuf>,
@@ -90,6 +102,7 @@ struct AppendTargetCache {
 }
 
 impl FileManager {
+    /// Creates a file manager for the given log and optional cache directories.
     pub fn new(
         log_dir: PathBuf,
         cache_dir: Option<PathBuf>,
@@ -118,27 +131,33 @@ impl FileManager {
         })
     }
 
+    /// Returns the primary directory that stores flushed log files.
     pub fn log_dir(&self) -> &Path {
         &self.log_dir
     }
 
+    /// Returns the cache directory used for temporary log files, if enabled.
     pub fn cache_dir(&self) -> Option<&Path> {
         self.cache_dir.as_deref()
     }
 
+    /// Returns the configured file-name prefix used for new log files.
     pub fn name_prefix(&self) -> &str {
         &self.name_prefix
     }
 
+    /// Returns the number of days a cache file may remain before being moved.
     pub fn cache_days(&self) -> i32 {
         self.cache_days
     }
 
+    /// Returns the mmap sidecar path associated with this file set.
     pub fn mmap_path(&self) -> PathBuf {
         let base = self.cache_dir.as_ref().unwrap_or(&self.log_dir);
         base.join(format!("{}.mmap3", self.name_prefix))
     }
 
+    /// Lists existing log files for the given day offset and prefix.
     pub fn filepaths_from_timespan(&self, timespan: i32, prefix: &str) -> Vec<String> {
         let file_prefix = make_date_prefix(prefix, timespan);
 
@@ -150,6 +169,11 @@ impl FileManager {
         out
     }
 
+    /// Returns candidate log file paths for the given day offset and size policy.
+    ///
+    /// When a cache directory is configured, existing cache and log targets are both
+    /// returned. If no file exists yet, the primary log-file path is returned as the
+    /// location a new append would create.
     pub fn make_logfile_name(
         &self,
         timespan: i32,
@@ -179,6 +203,7 @@ impl FileManager {
         out
     }
 
+    /// Appends one encoded log frame to the active target file.
     pub fn append_log_bytes(
         &self,
         bytes: &[u8],
@@ -189,6 +214,11 @@ impl FileManager {
         self.append_log_slices(&[bytes], max_file_size, move_file, keep_open)
     }
 
+    /// Appends multiple encoded log frame slices to the active target file.
+    ///
+    /// `move_file` allows cache files to be merged into the primary log directory when
+    /// the cache policy no longer applies. `keep_open` reuses a buffered file handle on
+    /// the plain log path to reduce reopen overhead on hot sync append paths.
     pub fn append_log_slices(
         &self,
         slices: &[&[u8]],
@@ -281,6 +311,10 @@ impl FileManager {
         }
     }
 
+    /// Moves eligible cache files into the primary log directory.
+    ///
+    /// Files newer than `cache_days` are left in place. When no cache directory is
+    /// configured, this is a no-op.
     pub fn move_old_cache_files(&self, _max_file_size: u64) -> Result<(), FileManagerError> {
         let Some(cache_dir) = &self.cache_dir else {
             return Ok(());
@@ -330,6 +364,7 @@ impl FileManager {
         Ok(())
     }
 
+    /// Deletes log and cache files whose modification time exceeds `max_alive_seconds`.
     pub fn delete_expired_files(&self, max_alive_seconds: i64) -> Result<(), FileManagerError> {
         if max_alive_seconds <= 0 {
             return Ok(());
@@ -343,6 +378,7 @@ impl FileManager {
         Ok(())
     }
 
+    /// Flushes any buffered bytes held by the keep-open append path.
     pub fn flush_active_file_buffer(&self) -> Result<(), FileManagerError> {
         self.flush_active_file_if_needed()
     }
