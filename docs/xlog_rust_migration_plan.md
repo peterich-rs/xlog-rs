@@ -11,6 +11,7 @@
 1. 代码级性能与正确性审查见 `docs/rust_core_performance_review.md`
 2. 语义红线与阻断项清单见 `docs/rust_semantic_redlines.md`
 3. benchmark 体系、基线与扩展计划见 `docs/benchmark_strategy.md`
+4. Rust 发布范围、阻断项与执行顺序见 `docs/rust_release_plan.md`
 
 ## 2. 当前项目状态
 
