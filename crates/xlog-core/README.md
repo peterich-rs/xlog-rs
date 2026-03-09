@@ -14,6 +14,10 @@ It includes:
 This crate exists primarily as an implementation layer for the top-level Rust
 API. Most external Rust users should start with `mars-xlog` instead.
 
+## MSRV
+
+`mars-xlog-core` currently targets Rust 1.85 or newer.
+
 ## Stability
 
 `mars-xlog-core` is useful for internal composition and advanced integration,
