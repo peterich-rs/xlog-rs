@@ -1019,6 +1019,14 @@ fn end_measurement(start: Instant, start_res: Option<ResourceSnapshot>) -> (f64,
 }
 
 #[cfg(unix)]
+fn micros_to_i64(value: libc::suseconds_t) -> i64 {
+    #[allow(clippy::unnecessary_cast)]
+    {
+        value as i64
+    }
+}
+
+#[cfg(unix)]
 fn capture_resource_snapshot() -> Option<ResourceSnapshot> {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
@@ -1030,12 +1038,12 @@ fn capture_resource_snapshot() -> Option<ResourceSnapshot> {
         .ru_utime
         .tv_sec
         .saturating_mul(1_000_000)
-        .saturating_add(usage.ru_utime.tv_usec as i64);
+        .saturating_add(micros_to_i64(usage.ru_utime.tv_usec));
     let sys_us = usage
         .ru_stime
         .tv_sec
         .saturating_mul(1_000_000)
-        .saturating_add(usage.ru_stime.tv_usec as i64);
+        .saturating_add(micros_to_i64(usage.ru_stime.tv_usec));
 
     let raw_max_rss = usage.ru_maxrss;
     #[cfg(target_os = "macos")]
