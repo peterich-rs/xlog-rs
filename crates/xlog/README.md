@@ -12,6 +12,10 @@ It provides:
 
 This crate is the intended entry point for Rust users.
 
+## MSRV
+
+`mars-xlog` currently targets Rust 1.85 or newer.
+
 ## Quick start
 
 ```rust

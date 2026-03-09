@@ -713,19 +713,29 @@ mod tests {
 
     #[test]
     fn async_pending_block_stats_include_reason_counts() {
-        set_async_stage_profile_enabled(true);
-        record_async_stage_sample(AsyncStageSample {
-            total_ns: 100,
-            format_ns: 10,
-            checkout_ns: 10,
-            checkout_lock_ns: 0,
-            checkout_wait_ns: 0,
-            begin_pending_ns: 10,
-            append_ns: 70,
-            force_flush_ns: 0,
-        });
-        record_async_pending_block(4, 400, 120, AsyncPendingFinalizeReason::FlushEvery);
-        record_async_pending_block(8, 800, 200, AsyncPendingFinalizeReason::Threshold);
+        let profiler = async_stage_profiler();
+        profiler.enabled.store(false, Ordering::Relaxed);
+        profiler.reset();
+        profiler.total.record(100);
+        profiler.format.record(10);
+        profiler.checkout.record(10);
+        profiler.checkout_lock.record(0);
+        profiler.checkout_wait.record(0);
+        profiler.begin_pending.record(10);
+        profiler.append.record(70);
+        profiler.force_flush.record(0);
+        profiler.pending_block_lines.record(4);
+        profiler.pending_block_raw_input_bytes.record(400);
+        profiler.pending_block_payload_bytes.record(120);
+        profiler
+            .pending_block_reason_flush_every
+            .fetch_add(1, Ordering::Relaxed);
+        profiler.pending_block_lines.record(8);
+        profiler.pending_block_raw_input_bytes.record(800);
+        profiler.pending_block_payload_bytes.record(200);
+        profiler
+            .pending_block_reason_threshold
+            .fetch_add(1, Ordering::Relaxed);
 
         let stats = take_async_stage_stats().expect("async stats");
         assert_eq!(stats.pending_blocks.finalized_blocks, 2);

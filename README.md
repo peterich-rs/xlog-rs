@@ -22,6 +22,7 @@ This workspace provides a Rust-native implementation of Tencent Mars `xlog`. The
 - `mars-xlog-sys`: legacy raw FFI + native build (C/C++/ObjC++) crate.
 
 ## Build notes
+- Published Rust crates currently target Rust 1.85 or newer.
 - Default workspace build (`cargo build`) uses the Rust backend and does not require C++14/Boost toolchains.
 - `mars-xlog-sys` is excluded from workspace `default-members`; build it explicitly when needed:
   - `cargo build -p mars-xlog-sys`

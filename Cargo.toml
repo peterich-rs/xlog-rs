@@ -22,7 +22,7 @@ license = "MIT"
 authors = ["xlog-rs contributors"]
 homepage = "https://github.com/fannnzhang/xlog-rs"
 repository = "https://github.com/fannnzhang/xlog-rs"
-rust-version = "1.92"
+rust-version = "1.85"
 
 [workspace.dependencies]
 libc = "0.2"
