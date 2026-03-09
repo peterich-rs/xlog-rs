@@ -106,3 +106,50 @@ fn oneshot_flush_rejects_truncated_mmap_file() {
         .collect();
     assert!(files.is_empty());
 }
+
+#[test]
+fn oneshot_flush_ignores_zero_filled_mmap() {
+    let log_dir = tempfile::tempdir().unwrap();
+    let manager =
+        FileManager::new(log_dir.path().to_path_buf(), None, "oneshot".to_string(), 0).unwrap();
+
+    fs::write(manager.mmap_path(), vec![0u8; DEFAULT_BUFFER_BLOCK_LEN]).unwrap();
+
+    assert_eq!(
+        oneshot_flush(&manager, DEFAULT_BUFFER_BLOCK_LEN, 0),
+        FileIoAction::Unnecessary
+    );
+    assert!(manager.mmap_path().exists());
+    let files: Vec<_> = fs::read_dir(log_dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("xlog"))
+        .collect();
+    assert!(files.is_empty());
+}
+
+#[test]
+fn oneshot_flush_ignores_dirty_but_unrecoverable_mmap() {
+    let log_dir = tempfile::tempdir().unwrap();
+    let manager =
+        FileManager::new(log_dir.path().to_path_buf(), None, "oneshot".to_string(), 0).unwrap();
+
+    let mut raw = vec![0u8; DEFAULT_BUFFER_BLOCK_LEN];
+    raw[..8].copy_from_slice(b"not-xlog");
+    fs::write(manager.mmap_path(), &raw).unwrap();
+
+    assert_eq!(
+        oneshot_flush(&manager, DEFAULT_BUFFER_BLOCK_LEN, 0),
+        FileIoAction::Unnecessary
+    );
+    assert!(manager.mmap_path().exists());
+
+    let files: Vec<_> = fs::read_dir(log_dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("xlog"))
+        .collect();
+    assert!(files.is_empty());
+}

@@ -207,3 +207,65 @@ pub fn tea_decrypt_in_place(data: &mut [u8], key: &[u32; 4]) {
         chunk[4..8].copy_from_slice(&v1.to_le_bytes());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{tea_decrypt_in_place, CryptoError, EcdhTeaCipher};
+
+    const SAMPLE_PUBKEY: &str =
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+
+    #[test]
+    fn disabled_cipher_is_a_noop() {
+        let cipher = EcdhTeaCipher::disabled();
+        let plain = b"hello world";
+        let mut in_place = plain.to_vec();
+
+        assert!(!cipher.enabled());
+        assert_eq!(cipher.client_pubkey(), [0; 64]);
+        assert_eq!(cipher.encrypt_sync(plain), plain);
+        assert_eq!(cipher.encrypt_async(plain), plain);
+
+        cipher.encrypt_async_in_place(&mut in_place);
+        assert_eq!(in_place, plain);
+        assert!(!EcdhTeaCipher::new("").unwrap().enabled());
+    }
+
+    #[test]
+    fn constructor_rejects_invalid_key_material() {
+        assert!(matches!(
+            EcdhTeaCipher::new_with_private_key("abcd", [7u8; 32]),
+            Err(CryptoError::InvalidServerPubkeyLength)
+        ));
+        assert!(matches!(
+            EcdhTeaCipher::new_with_private_key(&"z".repeat(128), [7u8; 32]),
+            Err(CryptoError::InvalidServerPubkeyHex(_))
+        ));
+        assert!(matches!(
+            EcdhTeaCipher::new_with_private_key(&"00".repeat(64), [7u8; 32]),
+            Err(CryptoError::InvalidKeyMaterial)
+        ));
+        assert!(matches!(
+            EcdhTeaCipher::new_with_private_key(SAMPLE_PUBKEY, [0u8; 32]),
+            Err(CryptoError::InvalidKeyMaterial)
+        ));
+    }
+
+    #[test]
+    fn async_encryption_preserves_partial_tail_bytes() {
+        let cipher = EcdhTeaCipher::new_with_private_key(SAMPLE_PUBKEY, [7u8; 32]).unwrap();
+        let original = b"abcdefghXYZ".to_vec();
+        let mut encrypted_in_place = original.clone();
+
+        cipher.encrypt_async_in_place(&mut encrypted_in_place);
+        assert_ne!(&encrypted_in_place[..8], &original[..8]);
+        assert_eq!(&encrypted_in_place[8..], &original[8..]);
+
+        tea_decrypt_in_place(&mut encrypted_in_place[..8], &cipher.tea_key_words());
+        assert_eq!(encrypted_in_place, original);
+
+        let mut encrypted = cipher.encrypt_async(&original);
+        tea_decrypt_in_place(&mut encrypted[..8], &cipher.tea_key_words());
+        assert_eq!(encrypted, original);
+    }
+}

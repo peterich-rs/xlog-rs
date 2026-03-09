@@ -904,3 +904,93 @@ fn u8_to_async_flush_reason(value: u8) -> AsyncFlushReason {
         _ => AsyncFlushReason::Unknown,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        async_buffer_flush_threshold, async_flush_reason_to_u8, build_sync_tip_block, i32_to_mode,
+        mode_to_i32, u8_to_async_flush_reason, AsyncFlushReason, EngineMode,
+    };
+    use crate::protocol::{
+        select_magic, AppendMode, CompressionKind, LogHeader, HEADER_LEN, MAGIC_END,
+    };
+
+    #[test]
+    fn mode_and_async_flush_reason_roundtrip() {
+        for mode in [EngineMode::Async, EngineMode::Sync] {
+            assert_eq!(i32_to_mode(mode_to_i32(mode)), mode);
+        }
+        assert_eq!(i32_to_mode(99), EngineMode::Async);
+
+        for reason in [
+            AsyncFlushReason::Unknown,
+            AsyncFlushReason::Threshold,
+            AsyncFlushReason::Explicit,
+            AsyncFlushReason::Timeout,
+            AsyncFlushReason::Stop,
+        ] {
+            assert_eq!(
+                u8_to_async_flush_reason(async_flush_reason_to_u8(reason)),
+                reason
+            );
+        }
+        assert_eq!(u8_to_async_flush_reason(255), AsyncFlushReason::Unknown);
+    }
+
+    #[test]
+    fn async_buffer_flush_threshold_has_non_zero_floor() {
+        assert_eq!(async_buffer_flush_threshold(0), 1);
+        assert_eq!(async_buffer_flush_threshold(1), 1);
+        assert_eq!(async_buffer_flush_threshold(9), 3);
+    }
+
+    #[test]
+    fn build_sync_tip_block_preserves_crypto_profile() {
+        let mut pubkey = [0u8; 64];
+        for (idx, byte) in pubkey.iter_mut().enumerate() {
+            *byte = idx as u8;
+        }
+
+        let crypt_block = build_sync_tip_block(
+            Some(LogHeader {
+                magic: select_magic(CompressionKind::Zstd, AppendMode::Async, true),
+                seq: 7,
+                begin_hour: 1,
+                end_hour: 1,
+                len: 0,
+                client_pubkey: pubkey,
+            }),
+            "tip",
+        )
+        .unwrap();
+        let crypt_header = LogHeader::decode(&crypt_block[..HEADER_LEN]).unwrap();
+        assert_eq!(
+            crypt_header.magic,
+            select_magic(CompressionKind::Zstd, AppendMode::Sync, true)
+        );
+        assert_eq!(crypt_header.client_pubkey, pubkey);
+        assert_eq!(&crypt_block[HEADER_LEN..HEADER_LEN + 3], b"tip");
+        assert_eq!(crypt_block.last().copied(), Some(MAGIC_END));
+
+        let plain_block = build_sync_tip_block(
+            Some(LogHeader {
+                magic: select_magic(CompressionKind::Zlib, AppendMode::Async, false),
+                seq: 9,
+                begin_hour: 2,
+                end_hour: 2,
+                len: 0,
+                client_pubkey: pubkey,
+            }),
+            "tip",
+        )
+        .unwrap();
+        let plain_header = LogHeader::decode(&plain_block[..HEADER_LEN]).unwrap();
+        assert_eq!(
+            plain_header.magic,
+            select_magic(CompressionKind::Zlib, AppendMode::Sync, false)
+        );
+        assert_eq!(plain_header.client_pubkey, [0; 64]);
+
+        assert!(build_sync_tip_block(None, "tip").is_none());
+    }
+}

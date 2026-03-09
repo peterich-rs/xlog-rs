@@ -201,3 +201,63 @@ impl SeqGenerator {
         0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        update_end_hour_in_place, update_log_len_in_place, LogHeader, ProtocolError, SeqGenerator,
+        HEADER_LEN, MAGIC_ASYNC_NO_CRYPT_ZLIB_START,
+    };
+
+    #[test]
+    fn decode_rejects_short_buffers_and_invalid_magic() {
+        assert!(matches!(
+            LogHeader::decode(&[0u8; HEADER_LEN - 1]),
+            Err(ProtocolError::InvalidHeaderLen)
+        ));
+
+        let mut bytes = [0u8; HEADER_LEN];
+        bytes[0] = 0x05;
+        assert!(matches!(
+            LogHeader::decode(&bytes),
+            Err(ProtocolError::InvalidMagic(0x05))
+        ));
+    }
+
+    #[test]
+    fn in_place_updates_reject_short_buffers_and_saturate_length() {
+        let mut short = [0u8; HEADER_LEN - 1];
+        assert!(matches!(
+            update_log_len_in_place(&mut short, 1),
+            Err(ProtocolError::InvalidHeaderLen)
+        ));
+        assert!(matches!(
+            update_end_hour_in_place(&mut short, 1),
+            Err(ProtocolError::InvalidHeaderLen)
+        ));
+
+        let mut bytes = LogHeader {
+            magic: MAGIC_ASYNC_NO_CRYPT_ZLIB_START,
+            seq: 1,
+            begin_hour: 2,
+            end_hour: 2,
+            len: u32::MAX - 1,
+            client_pubkey: [0; 64],
+        }
+        .encode();
+        assert_eq!(update_log_len_in_place(&mut bytes, 10).unwrap(), u32::MAX);
+        update_end_hour_in_place(&mut bytes, 9).unwrap();
+        let decoded = LogHeader::decode(&bytes).unwrap();
+        assert_eq!(decoded.len, u32::MAX);
+        assert_eq!(decoded.end_hour, 9);
+    }
+
+    #[test]
+    fn seq_generator_wraps_without_emitting_zero() {
+        let seq = SeqGenerator::with_seed(u16::MAX - 1);
+        assert_eq!(seq.next_async(), u16::MAX);
+        assert_eq!(seq.next_async(), 1);
+        assert_eq!(seq.next_async(), 2);
+        assert_eq!(SeqGenerator::sync_seq(), 0);
+    }
+}

@@ -133,3 +133,56 @@ fn preallocate_by_zero_write(file: &mut File, capacity: usize) -> std::io::Resul
     file.flush()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{MmapStore, MmapStoreError};
+
+    #[test]
+    fn zero_capacity_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("buffer.mmap");
+        assert!(matches!(
+            MmapStore::open_or_create(path, 0),
+            Err(MmapStoreError::InvalidCapacity(0))
+        ));
+    }
+
+    #[test]
+    fn open_create_zero_fills_and_persists_mutations() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested").join("buffer.mmap");
+
+        let mut store = MmapStore::open_or_create(&path, 16).unwrap();
+        assert_eq!(store.path(), path.as_path());
+        assert_eq!(store.len(), 16);
+        assert!(!store.is_empty());
+        assert!(store.as_slice().iter().all(|&byte| byte == 0));
+
+        store.as_mut_slice()[..4].copy_from_slice(b"mars");
+        store.flush().unwrap();
+        drop(store);
+
+        let reopened = MmapStore::open_or_create(&path, 16).unwrap();
+        assert_eq!(&reopened.as_slice()[..4], b"mars");
+    }
+
+    #[test]
+    fn resizing_existing_map_rezeros_the_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("buffer.mmap");
+
+        let mut store = MmapStore::open_or_create(&path, 8).unwrap();
+        store.as_mut_slice()[..4].copy_from_slice(b"data");
+        store.flush().unwrap();
+        drop(store);
+
+        let resized = MmapStore::open_or_create(&path, 12).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 12);
+        assert!(resized.as_slice().iter().all(|&byte| byte == 0));
+    }
+}

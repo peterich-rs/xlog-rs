@@ -188,3 +188,55 @@ pub fn decompress_zstd_frames(input: &[u8]) -> Result<Vec<u8>, CompressError> {
         .map_err(|e| CompressError::ZstdDecompress(e.to_string()))?;
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        decompress_raw_zlib, decompress_zstd_frames, CompressError, StreamCompressor,
+        ZstdChunkCompressor, ZstdStreamCompressor,
+    };
+
+    #[test]
+    fn zstd_chunk_roundtrips_concatenated_frames() {
+        let mut compressor = ZstdChunkCompressor::new(3);
+        let mut encoded = Vec::new();
+
+        compressor.compress_chunk(b"mars", &mut encoded).unwrap();
+        compressor.compress_chunk(b" xlog", &mut encoded).unwrap();
+        compressor.flush(&mut encoded).unwrap();
+
+        assert_eq!(decompress_zstd_frames(&encoded).unwrap(), b"mars xlog");
+    }
+
+    #[test]
+    fn zstd_stream_rejects_compress_after_finish_and_double_flush_is_noop() {
+        let mut compressor = ZstdStreamCompressor::new(3).unwrap();
+        let mut encoded = Vec::new();
+
+        compressor.compress_chunk(b"hello", &mut encoded).unwrap();
+        compressor.flush(&mut encoded).unwrap();
+        let finished = encoded.clone();
+
+        let err = compressor
+            .compress_chunk(b"world", &mut encoded)
+            .unwrap_err();
+        assert!(
+            matches!(err, CompressError::Zstd(message) if message.contains("already finished"))
+        );
+
+        compressor.flush(&mut encoded).unwrap();
+        assert_eq!(encoded, finished);
+    }
+
+    #[test]
+    fn invalid_decompression_maps_to_specific_error_variants() {
+        assert!(matches!(
+            decompress_raw_zlib(b"not-a-deflate-stream"),
+            Err(CompressError::ZlibDecompress(_))
+        ));
+        assert!(matches!(
+            decompress_zstd_frames(b"not-a-zstd-frame"),
+            Err(CompressError::ZstdDecompress(_))
+        ));
+    }
+}

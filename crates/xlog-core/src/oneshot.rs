@@ -170,3 +170,110 @@ fn current_mark_info() -> String {
         now.format("%Y-%m-%d %z %H:%M:%S")
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{build_sync_tip_block, magic_profile};
+    use crate::protocol::{
+        select_magic, AppendMode, CompressionKind, LogHeader, HEADER_LEN,
+        MAGIC_ASYNC_NO_CRYPT_ZLIB_START, MAGIC_ASYNC_NO_CRYPT_ZSTD_START, MAGIC_ASYNC_ZLIB_START,
+        MAGIC_ASYNC_ZSTD_START, MAGIC_END, MAGIC_SYNC_NO_CRYPT_ZLIB_START,
+        MAGIC_SYNC_NO_CRYPT_ZSTD_START, MAGIC_SYNC_ZLIB_START, MAGIC_SYNC_ZSTD_START,
+    };
+
+    #[test]
+    fn magic_profile_maps_all_supported_magic_variants() {
+        assert_eq!(
+            magic_profile(MAGIC_SYNC_ZLIB_START),
+            Some((CompressionKind::Zlib, true))
+        );
+        assert_eq!(
+            magic_profile(MAGIC_ASYNC_ZLIB_START),
+            Some((CompressionKind::Zlib, true))
+        );
+        assert_eq!(
+            magic_profile(MAGIC_SYNC_NO_CRYPT_ZLIB_START),
+            Some((CompressionKind::Zlib, false))
+        );
+        assert_eq!(
+            magic_profile(MAGIC_ASYNC_NO_CRYPT_ZLIB_START),
+            Some((CompressionKind::Zlib, false))
+        );
+        assert_eq!(
+            magic_profile(MAGIC_SYNC_ZSTD_START),
+            Some((CompressionKind::Zstd, true))
+        );
+        assert_eq!(
+            magic_profile(MAGIC_ASYNC_ZSTD_START),
+            Some((CompressionKind::Zstd, true))
+        );
+        assert_eq!(
+            magic_profile(MAGIC_SYNC_NO_CRYPT_ZSTD_START),
+            Some((CompressionKind::Zstd, false))
+        );
+        assert_eq!(
+            magic_profile(MAGIC_ASYNC_NO_CRYPT_ZSTD_START),
+            Some((CompressionKind::Zstd, false))
+        );
+        assert_eq!(magic_profile(0), None);
+    }
+
+    #[test]
+    fn build_sync_tip_block_preserves_crypto_profile_for_encrypted_headers() {
+        let sample = LogHeader {
+            magic: select_magic(CompressionKind::Zstd, AppendMode::Async, true),
+            seq: 42,
+            begin_hour: 1,
+            end_hour: 1,
+            len: 3,
+            client_pubkey: [7; 64],
+        };
+
+        let block = build_sync_tip_block(Some(sample), "tip").unwrap();
+        let header = LogHeader::decode(&block[..HEADER_LEN]).unwrap();
+
+        assert_eq!(
+            header.magic,
+            select_magic(CompressionKind::Zstd, AppendMode::Sync, true)
+        );
+        assert_eq!(header.client_pubkey, [7; 64]);
+        assert_eq!(&block[HEADER_LEN..block.len() - 1], b"tip");
+        assert_eq!(block[block.len() - 1], MAGIC_END);
+    }
+
+    #[test]
+    fn build_sync_tip_block_zeroes_pubkey_for_plaintext_headers() {
+        let sample = LogHeader {
+            magic: select_magic(CompressionKind::Zlib, AppendMode::Async, false),
+            seq: 7,
+            begin_hour: 1,
+            end_hour: 1,
+            len: 5,
+            client_pubkey: [9; 64],
+        };
+
+        let block = build_sync_tip_block(Some(sample), "plain").unwrap();
+        let header = LogHeader::decode(&block[..HEADER_LEN]).unwrap();
+
+        assert_eq!(
+            header.magic,
+            select_magic(CompressionKind::Zlib, AppendMode::Sync, false)
+        );
+        assert_eq!(header.client_pubkey, [0; 64]);
+    }
+
+    #[test]
+    fn build_sync_tip_block_rejects_missing_or_unknown_sample_headers() {
+        assert!(build_sync_tip_block(None, "tip").is_none());
+
+        let sample = LogHeader {
+            magic: 0,
+            seq: 1,
+            begin_hour: 1,
+            end_hour: 1,
+            len: 3,
+            client_pubkey: [0; 64],
+        };
+        assert!(build_sync_tip_block(Some(sample), "tip").is_none());
+    }
+}

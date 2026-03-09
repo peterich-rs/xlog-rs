@@ -1311,10 +1311,13 @@ fn file_mtime(path: &Path) -> Result<SystemTime, FileManagerError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::fs::OpenOptions;
+    use std::time::{Duration, SystemTime};
 
     use super::{build_path_for_index, day_key, ActiveAppendFile, AppendTargetCache, FileManager};
     use chrono::{Datelike, Local};
+    use filetime::{set_file_mtime, FileTime};
 
     #[test]
     fn filepaths_from_timespan_keeps_log_then_cache_order() {
@@ -1481,6 +1484,37 @@ mod tests {
     }
 
     #[test]
+    fn append_moves_existing_cache_file_into_log_when_caching_is_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("log");
+        let cache_dir = root.path().join("cache");
+        let manager = FileManager::new(
+            log_dir.clone(),
+            Some(cache_dir.clone()),
+            "demo".to_string(),
+            0,
+        )
+        .unwrap();
+
+        let now = Local::now();
+        let day = day_key(now);
+        let cache_path = build_path_for_index(&cache_dir, "demo", day, 0);
+        std::fs::write(&cache_path, b"cached-").unwrap();
+
+        manager.append_log_bytes(b"tail", 0, true, false).unwrap();
+
+        assert!(!cache_path.exists());
+        let log_path = build_path_for_index(&log_dir, "demo", day, 0);
+        assert_eq!(std::fs::read(&log_path).unwrap(), b"cached-tail");
+
+        let runtime = manager.runtime.lock().unwrap();
+        let cache_target = runtime.cache_target.as_ref().unwrap();
+        assert_eq!(cache_target.path, cache_path);
+        assert!(!cache_target.local_exists);
+        assert_eq!(cache_target.local_len, 0);
+    }
+
+    #[test]
     fn append_recreates_missing_parent_dir_on_open() {
         let root = tempfile::tempdir().unwrap();
         let log_dir = root.path().join("log");
@@ -1496,5 +1530,91 @@ mod tests {
             .unwrap()
             .path();
         assert_eq!(std::fs::read(entry).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn move_old_cache_files_only_moves_eligible_logs() {
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("log");
+        let cache_dir = root.path().join("cache");
+        let manager = FileManager::new(
+            log_dir.clone(),
+            Some(cache_dir.clone()),
+            "demo".to_string(),
+            1,
+        )
+        .unwrap();
+
+        let old_cache_log = cache_dir.join("demo_legacy.xlog");
+        let recent_cache_log = cache_dir.join("demo_recent.xlog");
+        let ignored_file = cache_dir.join("notes.txt");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(&old_cache_log, b"old-cache").unwrap();
+        fs::write(&recent_cache_log, b"recent-cache").unwrap();
+        fs::write(&ignored_file, b"skip").unwrap();
+
+        let old =
+            FileTime::from_system_time(SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60));
+        let recent =
+            FileTime::from_system_time(SystemTime::now() - Duration::from_secs(6 * 60 * 60));
+        set_file_mtime(&old_cache_log, old).unwrap();
+        set_file_mtime(&recent_cache_log, recent).unwrap();
+
+        manager.move_old_cache_files(0).unwrap();
+
+        assert!(!old_cache_log.exists());
+        assert_eq!(
+            fs::read(log_dir.join("demo_legacy.xlog")).unwrap(),
+            b"old-cache"
+        );
+        assert!(recent_cache_log.exists());
+        assert!(ignored_file.exists());
+    }
+
+    #[test]
+    fn delete_expired_files_removes_old_logs_and_day_dirs_only() {
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("log");
+        let cache_dir = root.path().join("cache");
+        let manager = FileManager::new(
+            log_dir.clone(),
+            Some(cache_dir.clone()),
+            "demo".to_string(),
+            1,
+        )
+        .unwrap();
+
+        fs::create_dir_all(&log_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+
+        let old_log = log_dir.join("demo_old.xlog");
+        let old_other = log_dir.join("keep.txt");
+        let recent_log = cache_dir.join("demo_recent.xlog");
+        let old_day_dir = cache_dir.join("20240101");
+        let other_dir = cache_dir.join("misc");
+
+        fs::write(&old_log, b"old-log").unwrap();
+        fs::write(&old_other, b"other").unwrap();
+        fs::write(&recent_log, b"recent-log").unwrap();
+        fs::create_dir_all(&old_day_dir).unwrap();
+        fs::write(old_day_dir.join("nested.txt"), b"nested").unwrap();
+        fs::create_dir_all(&other_dir).unwrap();
+
+        let old =
+            FileTime::from_system_time(SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60));
+        let recent = FileTime::from_system_time(SystemTime::now() - Duration::from_secs(30 * 60));
+        set_file_mtime(&old_log, old).unwrap();
+        set_file_mtime(&old_other, old).unwrap();
+        set_file_mtime(&recent_log, recent).unwrap();
+        set_file_mtime(&old_day_dir, old).unwrap();
+        set_file_mtime(&other_dir, old).unwrap();
+
+        manager.delete_expired_files(24 * 60 * 60).unwrap();
+
+        assert!(!old_log.exists());
+        assert!(old_other.exists());
+        assert!(recent_log.exists());
+        assert!(!old_day_dir.exists());
+        assert!(other_dir.exists());
     }
 }

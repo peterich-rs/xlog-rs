@@ -481,7 +481,7 @@ pub fn validate_block(block: &[u8]) -> Result<(), BufferError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{recover_blocks, PersistentBuffer};
+    use super::{recover_blocks, validate_block, BufferError, PersistentBuffer};
     use crate::protocol::{select_magic, AppendMode, CompressionKind, LogHeader, MAGIC_END};
 
     fn make_block(payload: &[u8]) -> Vec<u8> {
@@ -552,5 +552,78 @@ mod tests {
         buffer.clear_used_with_flush(false).unwrap();
         assert!(buffer.is_empty());
         assert!(buffer.as_bytes().is_empty());
+    }
+
+    #[test]
+    fn take_all_returns_bytes_and_clears_underlying_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("buffer.mmap4");
+        let mut buffer = PersistentBuffer::open_with_capacity(path, 256).unwrap();
+
+        let block = make_block(b"take-all");
+        buffer.append_block_with_flush(&block, false).unwrap();
+
+        let taken = buffer.take_all().unwrap();
+        assert_eq!(taken, block);
+        assert!(buffer.is_empty());
+        assert!(buffer.store.as_slice()[..taken.len()]
+            .iter()
+            .all(|b| *b == 0));
+    }
+
+    #[test]
+    fn replace_bytes_shrink_clears_stale_tail_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("buffer.mmap5");
+        let mut buffer = PersistentBuffer::open_with_capacity(path, 256).unwrap();
+
+        buffer.replace_bytes_with_flush(b"abcdef", false).unwrap();
+        buffer.replace_bytes_with_flush(b"xy", false).unwrap();
+
+        assert_eq!(buffer.as_bytes(), b"xy");
+        assert_eq!(&buffer.store.as_slice()[..6], b"xy\0\0\0\0");
+    }
+
+    #[test]
+    fn pending_block_operations_reject_invalid_state() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("buffer.mmap6");
+        let mut buffer = PersistentBuffer::open_with_capacity(path, 256).unwrap();
+
+        assert!(matches!(
+            buffer.append_to_pending_with_flush(0, b"payload", 7, false),
+            Err(BufferError::InvalidBlock)
+        ));
+        assert!(matches!(
+            buffer.finalize_pending_block_with_flush(7, false),
+            Err(BufferError::InvalidBlock)
+        ));
+    }
+
+    #[test]
+    fn validate_block_rejects_missing_tailer_and_length_mismatch() {
+        let full = make_block(b"hello");
+        let missing_tailer = &full[..full.len() - 1];
+        assert!(matches!(
+            validate_block(missing_tailer),
+            Err(BufferError::InvalidBlock)
+        ));
+
+        let bad_len_header = LogHeader {
+            magic: select_magic(CompressionKind::Zlib, AppendMode::Async, false),
+            seq: 1,
+            begin_hour: 1,
+            end_hour: 1,
+            len: 6,
+            client_pubkey: [0; 64],
+        };
+        let mut mismatched = bad_len_header.encode().to_vec();
+        mismatched.extend_from_slice(b"hello");
+        mismatched.push(MAGIC_END);
+
+        assert!(matches!(
+            validate_block(&mismatched),
+            Err(BufferError::InvalidBlock)
+        ));
     }
 }

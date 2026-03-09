@@ -84,3 +84,33 @@ impl LogRecord {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::UNIX_EPOCH;
+
+    use super::{LogLevel, LogRecord};
+
+    #[test]
+    fn level_short_tags_match_cpp_style_letters() {
+        assert_eq!(LogLevel::Verbose.short(), "V");
+        assert_eq!(LogLevel::Debug.short(), "D");
+        assert_eq!(LogLevel::Info.short(), "I");
+        assert_eq!(LogLevel::Warn.short(), "W");
+        assert_eq!(LogLevel::Error.short(), "E");
+        assert_eq!(LogLevel::Fatal.short(), "F");
+        assert_eq!(LogLevel::None.short(), "N");
+    }
+
+    #[test]
+    fn now_sets_tag_and_currentish_timestamp() {
+        let record = LogRecord::now(LogLevel::Warn, "core");
+
+        assert_eq!(record.level, LogLevel::Warn);
+        assert_eq!(record.tag, "core");
+        assert!(record.timestamp.duration_since(UNIX_EPOCH).is_ok());
+        assert_eq!(record.pid, -1);
+        assert_eq!(record.tid, -1);
+        assert_eq!(record.maintid, -1);
+    }
+}

@@ -106,3 +106,25 @@ fn append_hex_ascii(out: &mut String, bytes: &[u8]) {
         out.push_str("  ");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{dump_to_file, memory_dump, MAX_DUMP_LENGTH};
+
+    #[test]
+    fn memory_dump_is_bounded_for_large_buffers() {
+        let bytes = vec![b'A'; 4096];
+        let dump = memory_dump(&bytes);
+
+        assert!(dump.starts_with('\n'));
+        assert!(dump.contains("4096 bytes"));
+        assert!(dump.len() <= MAX_DUMP_LENGTH + 32);
+    }
+
+    #[test]
+    fn dump_to_file_rejects_empty_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(dump_to_file("", b"bytes"), "");
+        assert_eq!(dump_to_file(dir.path().to_str().unwrap(), b""), "");
+    }
+}

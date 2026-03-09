@@ -74,3 +74,32 @@ pub fn main_tid() -> i64 {
         -1
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{current_tid, main_tid};
+
+    #[test]
+    fn main_tid_is_stable_across_calls() {
+        let first = main_tid();
+        let second = main_tid();
+
+        assert_eq!(first, second);
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(first, std::process::id() as i64);
+    }
+
+    #[test]
+    fn current_tid_is_positive_on_supported_targets() {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos"
+        ))]
+        assert!(current_tid() > 0);
+    }
+}

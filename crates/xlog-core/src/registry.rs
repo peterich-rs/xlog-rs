@@ -93,3 +93,65 @@ impl<T> InstanceRegistry<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Weak};
+
+    use super::InstanceRegistry;
+
+    #[test]
+    fn get_or_insert_reuses_live_entries_and_recreates_dropped_ones() {
+        let registry = InstanceRegistry::new();
+        let first = registry.get_or_insert_with("alpha", || Arc::new(1usize));
+        let weak = Arc::downgrade(&first);
+        let second = registry.get_or_insert_with("alpha", || Arc::new(2usize));
+
+        assert!(Arc::ptr_eq(&first, &second));
+
+        drop(first);
+        drop(second);
+        assert!(Weak::upgrade(&weak).is_none());
+
+        let third = registry.get_or_insert_with("alpha", || Arc::new(3usize));
+        assert_eq!(*third, 3);
+    }
+
+    #[test]
+    fn get_or_try_insert_with_does_not_cache_errors() {
+        let registry = InstanceRegistry::new();
+
+        let err = registry
+            .get_or_try_insert_with("beta", || -> Result<Arc<usize>, &'static str> {
+                Err("boom")
+            })
+            .unwrap_err();
+        assert_eq!(err, "boom");
+        assert!(registry.get("beta").is_none());
+
+        let inserted = registry
+            .get_or_try_insert_with("beta", || Ok::<_, &'static str>(Arc::new(7usize)))
+            .unwrap();
+        assert!(Arc::ptr_eq(&inserted, &registry.get("beta").unwrap()));
+    }
+
+    #[test]
+    fn default_instance_and_for_each_live_prune_dead_entries() {
+        let registry = InstanceRegistry::new();
+        let dropped = registry.get_or_insert_with("dropped", || Arc::new(1usize));
+        let live = registry.get_or_insert_with("live", || Arc::new(2usize));
+
+        registry.set_default(live.clone());
+        assert!(Arc::ptr_eq(&registry.default_instance().unwrap(), &live));
+
+        drop(dropped);
+        let mut visited = Vec::new();
+        registry.for_each_live(|value| visited.push(*value));
+
+        assert_eq!(visited, vec![2]);
+        assert!(registry.get("dropped").is_none());
+
+        registry.clear_default();
+        assert!(registry.default_instance().is_none());
+    }
+}
