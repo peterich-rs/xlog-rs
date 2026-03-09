@@ -6,6 +6,7 @@ on:
       - 'v*'
 
 permissions:
+  actions: read
   contents: write
 
 concurrency:
@@ -13,7 +14,71 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  await_rust_ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Require successful rust-ci run for tagged commit
+        uses: actions/github-script@v8
+        env:
+          TARGET_SHA: ${{ github.sha }}
+          TARGET_BRANCH: main
+        with:
+          script: |
+            const workflowId = 'rust_ci.yml';
+            const headSha = process.env.TARGET_SHA;
+            const branch = process.env.TARGET_BRANCH;
+            const maxAttempts = 90;
+            const delayMs = 20_000;
+
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: workflowId,
+                head_sha: headSha,
+                branch,
+                event: 'push',
+                per_page: 20,
+              });
+
+              const runs = data.workflow_runs ?? [];
+              const latestRun = runs[0];
+              if (latestRun?.status === 'completed' && latestRun.conclusion === 'success') {
+                core.info(
+                  `rust-ci passed for ${headSha} via run ${latestRun.html_url}`,
+                );
+                return;
+              }
+
+              if (latestRun && latestRun.status !== 'completed') {
+                core.info(
+                  `rust-ci still running for ${headSha}: status=${latestRun.status}, conclusion=${latestRun.conclusion ?? 'n/a'}, run=${latestRun.html_url}`,
+                );
+              } else if (latestRun) {
+                core.setFailed(
+                  `rust-ci for ${headSha} concluded ${latestRun.conclusion ?? 'unknown'}; release is blocked (${latestRun.html_url}).`,
+                );
+                return;
+              } else {
+                core.info(
+                  `No rust-ci push run found for ${headSha} on ${branch} yet (attempt ${attempt}/${maxAttempts}).`,
+                );
+              }
+
+              if (attempt < maxAttempts) {
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+              }
+            }
+
+            core.setFailed(
+              `Timed out waiting for a successful rust-ci push run on ${headSha}.`,
+            );
+
   publish:
+    needs:
+      - await_rust_ci
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -62,29 +127,13 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ steps.meta.outputs.release_version }}"
-          if curl -fsSL "https://crates.io/api/v1/crates/mars-xlog-core/${version}" >/dev/null 2>&1; then
+          if cargo info "mars-xlog-core@${version}" --registry crates-io >/dev/null 2>&1; then
             echo "action=skipped-existing" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           cargo publish -p mars-xlog-core --locked
           echo "action=published" >> "$GITHUB_OUTPUT"
-
-      - name: Wait for mars-xlog-core on crates.io
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ steps.meta.outputs.release_version }}"
-          for attempt in $(seq 1 30); do
-            if curl -fsSL "https://crates.io/api/v1/crates/mars-xlog-core/${version}" >/dev/null 2>&1; then
-              exit 0
-            fi
-            echo "waiting for mars-xlog-core ${version} to appear on crates.io (attempt ${attempt}/30)"
-            sleep 20
-          done
-
-          echo "error: mars-xlog-core ${version} was not visible on crates.io after waiting" >&2
-          exit 1
 
       - name: Run mars-xlog preflight
         shell: bash
@@ -97,29 +146,13 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ steps.meta.outputs.release_version }}"
-          if curl -fsSL "https://crates.io/api/v1/crates/mars-xlog/${version}" >/dev/null 2>&1; then
+          if cargo info "mars-xlog@${version}" --registry crates-io >/dev/null 2>&1; then
             echo "action=skipped-existing" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           cargo publish -p mars-xlog --locked
           echo "action=published" >> "$GITHUB_OUTPUT"
-
-      - name: Wait for mars-xlog on crates.io
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ steps.meta.outputs.release_version }}"
-          for attempt in $(seq 1 30); do
-            if curl -fsSL "https://crates.io/api/v1/crates/mars-xlog/${version}" >/dev/null 2>&1; then
-              exit 0
-            fi
-            echo "waiting for mars-xlog ${version} to appear on crates.io (attempt ${attempt}/30)"
-            sleep 20
-          done
-
-          echo "error: mars-xlog ${version} was not visible on crates.io after waiting" >&2
-          exit 1
 
       - name: Generate release notes
         if: success()

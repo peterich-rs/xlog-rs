@@ -119,8 +119,8 @@ if [[ "$skip_tests" -eq 0 ]]; then
 fi
 
 if [[ "$skip_crates_io_check" -eq 0 ]]; then
-  run_step core_dependency_on_crates_io \
-    curl -fsSL "https://crates.io/api/v1/crates/mars-xlog-core/${core_version}"
+  run_step core_dependency_in_registry \
+    cargo info "mars-xlog-core@${core_version}" --registry crates-io
 fi
 
 if [[ "$skip_crates_io_check" -eq 1 ]]; then
@@ -130,7 +130,7 @@ elif [[ "$last_exit_code" -eq 0 ]]; then
 else
   record_blocked_step \
     publish_dry_run \
-    "mars-xlog-core ${core_version} is not visible on crates.io yet; publish mars-xlog-core first and retry after index propagation"
+    "mars-xlog-core ${core_version} is not visible to Cargo in the crates.io registry yet; publish mars-xlog-core first and retry after registry propagation"
 fi
 
 echo >> "$summary_file"

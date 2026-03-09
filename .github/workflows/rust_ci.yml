@@ -121,6 +121,11 @@ jobs:
 
   release-preflight:
     runs-on: ubuntu-latest
+    needs:
+      - fmt
+      - clippy
+      - check
+      - test
 
     steps:
       - name: Checkout

@@ -12,10 +12,6 @@ readme = "README.md"
 documentation = "https://docs.rs/mars-xlog-core"
 keywords = ["logging", "xlog", "compression", "crypto", "mmap"]
 categories = ["development-tools::debugging"]
-exclude = [
-    "benches/**",
-    "examples/**",
-]
 
 [lib]
 crate-type = ["rlib"]

@@ -12,11 +12,6 @@ readme = "README.md"
 documentation = "https://docs.rs/mars-xlog"
 keywords = ["logging", "xlog", "tracing", "mobile", "rust"]
 categories = ["development-tools::debugging", "api-bindings"]
-exclude = [
-    "benches/**",
-    "examples/bench_backend.rs",
-    "examples/gen_fixture.rs",
-]
 
 [lib]
 crate-type = ["rlib"]
