@@ -230,7 +230,7 @@ fn run() -> Result<(), String> {
                     &msg,
                 );
                 warmup_written += 1;
-                if flush_every > 0 && warmup_written.is_multiple_of(flush_every) {
+                if flush_every > 0 && warmup_written % flush_every == 0 {
                     mark_flush_every_hint();
                     logger.flush(false);
                 }
