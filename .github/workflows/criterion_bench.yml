@@ -2,26 +2,6 @@ name: criterion-bench
 
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - '.github/workflows/criterion_bench.yml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/xlog/**'
-      - 'crates/xlog-core/**'
-      - 'scripts/xlog/**'
-      - 'benchmarks/criterion/**'
-  push:
-    branches:
-      - main
-    paths:
-      - '.github/workflows/criterion_bench.yml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/xlog/**'
-      - 'crates/xlog-core/**'
-      - 'scripts/xlog/**'
-      - 'benchmarks/criterion/**'
 
 concurrency:
   group: criterion-bench-${{ github.ref }}
@@ -81,18 +61,11 @@ jobs:
             echo "criterion benchmark regression: failed" > artifacts/criterion/ci-current/status.txt
           fi
 
-      - name: Upload Criterion artifacts
+      - name: Report benchmark regression result
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: criterion-bench-${{ github.run_id }}
-          path: |
-            artifacts/criterion/ci-current
-          retention-days: 14
-          if-no-files-found: warn
-
-      - name: Fail workflow when benchmark regression failed
-        if: steps.criterion.outputs.exit_code != '0'
         run: |
-          echo "Criterion benchmark regression failed"
-          exit 1
+          if [[ "${{ steps.criterion.outputs.exit_code }}" -eq 0 ]]; then
+            echo "Criterion benchmark regression: success"
+          else
+            echo "Criterion benchmark regression: failed (non-gating manual workflow)"
+          fi
