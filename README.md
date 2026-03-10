@@ -95,6 +95,7 @@ An Android app example that calls the `mars-xlog` crate via JNI lives at:
 
 ## Notes
 - `Xlog::log`/`Xlog::write` capture caller file/line but not function name. Use the `xlog!` macros (feature `macros`) or `write_with_meta` for full metadata.
+- Log files are single-writer only: the Rust backend is not multi-process safe for a shared `(log_dir, name_prefix)` and enforces this with a lock file.
 - iOS/macOS console behavior keeps a native shim to preserve `printf`/`NSLog`/`OSLog` semantics.
 - Low-level/global appender APIs are available directly in `mars-xlog` (`appender_open`/`appender_close`/`flush_all`/`appender_write_with_meta_raw`).
 

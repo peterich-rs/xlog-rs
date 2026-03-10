@@ -67,38 +67,28 @@
 
 ## 5. 当前未关闭的 Rust 侧阻断项
 
-截至当前代码，Rust 侧仍有 `1` 项未关闭的高优先级阻断项。
-
-### S0-1: FileManager 本地长度缓存与 rollback 更强依赖单写者独占
-
-相关代码：
-
-1. `crates/xlog-core/src/file_manager.rs`
-   - `ActiveAppendFile.logical_len / disk_len`
-   - `AppendTargetCache.local_len / merged_len`
-   - `rollback_file_to_len()`
-
-现状：
-
-1. active file、`AppendTargetCache.local_len`、`merged_len` 都依赖本地缓存长度
-2. 出现写失败时会执行 `rollback_file_to_len`
-3. 这些路径默认假设本进程掌握的文件长度就是正确长度
-
-为什么这是阻断项：
-
-1. 如果同一 `.xlog` 文件也被其他 writer 追加，本地缓存长度可能落后于真实长度
-2. 一旦本进程写失败并 rollback，可能把外部 writer 新写入的数据一起截断
-3. 当前 Rust 比 C++ 更重地依赖本地长度缓存与活跃文件路由缓存，因此风险更集中
-
-收口要求：
-
-1. 明确 `.xlog` 是否允许多 writer 进程竞争写入
-2. 如果允许，就必须修复本地长度缓存与 rollback 逻辑
-3. 如果不允许，就必须把独占假设写进文档、测试和外部接入约束，并确保所有入口遵守
+截至当前代码，Rust 侧 active blocker 已清零。
 
 ## 6. 已关闭但必须防回归的红线
 
 下面这项不应再继续列为“当前 active blocker”，但必须保留回归测试与文档说明。
+
+### S0-1-closed: FileManager 单写者假设已显式化并通过锁文件强制
+
+当前代码：
+
+1. `crates/xlog-core/src/file_manager.rs`
+
+现状：
+
+1. `FileManager::new` 在 `log_dir` 下创建 `<name_prefix>.lock` 并独占锁
+2. 锁生命周期与实例一致，同一 `(log_dir, name_prefix)` 的多进程初始化会失败
+3. 文档明确禁止多进程共享同一 `.xlog`
+
+回归要求：
+
+1. 锁文件行为必须保留，不能退回为仅文档约束
+2. 同一 `(log_dir, name_prefix)` 的多进程并发创建应失败
 
 ### C0-closed: recovery / oneshot 的 recovered block 必须保持连续写入
 
@@ -154,8 +144,8 @@
 当前可以明确下结论：
 
 1. “语义级阻断项为 0”仍然是 Rust `GA` / 稳定替代口径的硬门槛，没有被 benchmark 结果放宽
-2. 当前 Rust 侧 active blocker 已收敛到 `FileManager` 的文件所有权与 rollback 假设
-3. 当前如果要发 crates.io，只能按 `Preview` 口径处理，不能把发布行为本身写成“语义已收口”
+2. 当前 Rust 侧 active blocker 已清零，`FileManager` 单写者假设已显式化并通过锁文件强制
+3. 发布口径仍需按 release plan 明确界定，不能仅凭 blocker 清零就宣称 “GA” 或 “完全收口”
 4. recovery / oneshot split-write framing 风险已不再是 active blocker，但必须防回归
 5. 另外还存在 2 项 C++ / Rust 共享的语义边界，文档和后续设计必须诚实描述
 

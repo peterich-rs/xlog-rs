@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{Datelike, Duration as ChronoDuration, Local};
-use fs2::available_space;
+use fs2::{available_space, FileExt};
 use thiserror::Error;
 
 use crate::metrics::{
@@ -41,6 +41,9 @@ pub enum FileManagerError {
     /// Opening a file for read or append failed.
     #[error("open file failed for {0}: {1}")]
     OpenFile(PathBuf, #[source] std::io::Error),
+    /// Acquiring the per-instance lock file failed.
+    #[error("lock file failed for {0}: {1}")]
+    LockFile(PathBuf, #[source] std::io::Error),
     /// Writing file data or flushing buffered bytes failed.
     #[error("write file failed for {0}: {1}")]
     WriteFile(PathBuf, #[source] std::io::Error),
@@ -63,6 +66,7 @@ pub struct FileManager {
     name_prefix: String,
     cache_days: i32,
     runtime: Arc<Mutex<RuntimeState>>,
+    lock_file: Arc<File>,
 }
 
 #[derive(Debug, Default)]
@@ -126,12 +130,24 @@ impl FileManager {
             fs::create_dir_all(dir).map_err(|e| FileManagerError::CreateDir(dir.clone(), e))?;
         }
 
+        let lock_path = log_dir.join(format!("{}.lock", name_prefix));
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| FileManagerError::OpenFile(lock_path.clone(), e))?;
+        lock_file
+            .try_lock_exclusive()
+            .map_err(|e| FileManagerError::LockFile(lock_path.clone(), e))?;
+
         Ok(Self {
             log_dir,
             cache_dir,
             name_prefix,
             cache_days,
             runtime: Arc::new(Mutex::new(RuntimeState::default())),
+            lock_file: Arc::new(lock_file),
         })
     }
 
@@ -1321,8 +1337,10 @@ fn file_mtime(path: &Path) -> Result<SystemTime, FileManagerError> {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::fs;
     use std::fs::OpenOptions;
+    use std::process::Command;
     use std::time::{Duration, SystemTime};
 
     use super::{build_path_for_index, day_key, ActiveAppendFile, AppendTargetCache, FileManager};
@@ -1490,7 +1508,11 @@ mod tests {
         assert_eq!(cache_entries, vec![cache_path.clone()]);
         assert_eq!(std::fs::read(&cache_path).unwrap(), b"aaaabbbbcccc");
         assert!(!root.path().join("bogus").exists());
-        assert!(std::fs::read_dir(&log_dir).unwrap().next().is_none());
+        let has_logs = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.path().extension().and_then(std::ffi::OsStr::to_str) == Some("xlog"));
+        assert!(!has_logs);
     }
 
     #[test]
@@ -1626,5 +1648,33 @@ mod tests {
         assert!(recent_log.exists());
         assert!(!old_day_dir.exists());
         assert!(other_dir.exists());
+    }
+
+    #[test]
+    fn file_manager_lock_rejects_second_process() {
+        if env::var("XLOG_LOCK_CHILD").ok().as_deref() == Some("1") {
+            let dir = env::var("XLOG_LOCK_DIR").unwrap();
+            let prefix = env::var("XLOG_LOCK_PREFIX").unwrap();
+            let res = FileManager::new(dir.into(), None, prefix, 0);
+            assert!(res.is_err());
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let prefix = "locktest".to_string();
+        let _first = FileManager::new(root.path().to_path_buf(), None, prefix.clone(), 0).unwrap();
+
+        let exe = env::current_exe().unwrap();
+        let status = Command::new(exe)
+            .arg("--exact")
+            .arg("file_manager_lock_rejects_second_process")
+            .arg("--nocapture")
+            .env("XLOG_LOCK_CHILD", "1")
+            .env("XLOG_LOCK_DIR", root.path().to_string_lossy().to_string())
+            .env("XLOG_LOCK_PREFIX", prefix)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
     }
 }
