@@ -18,6 +18,10 @@ API. Most external Rust users should start with `mars-xlog` instead.
 
 `mars-xlog-core` currently targets Rust 1.85 or newer.
 
+## Feature flags
+
+- `metrics`: emits runtime metrics via the `metrics` crate (requires a recorder)
+
 ## Stability
 
 `mars-xlog-core` is useful for internal composition and advanced integration,

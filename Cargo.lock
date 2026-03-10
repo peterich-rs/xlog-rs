@@ -1051,6 +1051,7 @@ dependencies = [
  "k256",
  "libc",
  "memmap2",
+ "metrics",
  "rand_core",
  "tempfile",
  "thiserror 1.0.69",

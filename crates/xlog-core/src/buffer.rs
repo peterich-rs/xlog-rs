@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::metrics::record_recovery_scan;
 use crate::mmap_store::{MmapStore, MmapStoreError};
 use crate::protocol::{update_end_hour_in_place, LogHeader, HEADER_LEN, MAGIC_END};
 
@@ -95,6 +96,7 @@ impl PersistentBuffer {
             }
             store.flush()?;
         }
+        record_recovery_scan(scan.valid_len, scan.recovered_pending_block);
 
         Ok(Self { store, len })
     }

@@ -3,11 +3,15 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{Datelike, Duration as ChronoDuration, Local};
 use fs2::available_space;
 use thiserror::Error;
+
+use crate::metrics::{
+    record_cache_move, record_expired_delete, record_file_append, record_file_rotate,
+};
 
 const LOG_EXT: &str = "xlog";
 const CACHE_AVAILABLE_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
@@ -359,6 +363,7 @@ impl FileManager {
             let dest = self.log_dir.join(file_name);
             append_file_to_file(&path, &dest)?;
             fs::remove_file(&path).map_err(|e| FileManagerError::RemoveFile(path, e))?;
+            record_cache_move();
         }
 
         Ok(())
@@ -409,6 +414,7 @@ impl FileManager {
             if path.is_file() {
                 if path.extension().and_then(OsStr::to_str) == Some(LOG_EXT) {
                     fs::remove_file(&path).map_err(|e| FileManagerError::RemoveFile(path, e))?;
+                    record_expired_delete();
                 }
                 continue;
             }
@@ -418,6 +424,7 @@ impl FileManager {
                 let is_day_folder = name.len() == 8 && name.chars().all(|c| c.is_ascii_digit());
                 if is_day_folder {
                     fs::remove_dir_all(&path).map_err(|e| FileManagerError::RemoveDir(path, e))?;
+                    record_expired_delete();
                 }
             }
         }
@@ -519,6 +526,7 @@ impl FileManager {
                 local_len: 0,
                 local_exists: false,
             };
+            record_file_rotate();
             self.set_cached_target(runtime, dir, next.clone());
             Self::record_last_append(runtime, now_ts, &next.path);
             return Some(next.path);
@@ -835,6 +843,7 @@ impl FileManager {
         }
 
         let written = slices.iter().map(|slice| slice.len() as u64).sum::<u64>();
+        let append_begin = Instant::now();
         let result = {
             let active = runtime
                 .active_file
@@ -849,6 +858,7 @@ impl FileManager {
         };
 
         if let Ok(current_len) = result {
+            record_file_append(written as usize, append_begin.elapsed(), keep_open);
             let merged_len =
                 self.merged_len_after_append(path, runtime, day_key, written, current_len);
             self.update_cached_target_after_append(runtime, path, day_key, merged_len, current_len);

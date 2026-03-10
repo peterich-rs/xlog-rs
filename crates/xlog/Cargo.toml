@@ -32,7 +32,7 @@ default = ["rust-backend"]
 rust-backend = ["dep:mars-xlog-core", "dep:chrono"]
 macros = []
 tracing = ["dep:tracing", "dep:tracing-subscriber"]
-metrics = ["dep:metrics"]
+metrics = ["dep:metrics", "mars-xlog-core?/metrics"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

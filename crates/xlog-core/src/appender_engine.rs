@@ -3,6 +3,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::metrics::{
+    record_async_buffer_append_failed, record_async_buffer_len, record_async_buffer_persisted,
+    record_engine_flush, record_engine_flush_requeue, record_engine_mode_switch,
+    record_engine_timeout_flush, record_engine_write_block,
+};
+
 use chrono::{Local, Timelike};
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use thiserror::Error;
@@ -222,6 +228,12 @@ impl AppenderEngine {
         if old == EngineMode::Async && mode == EngineMode::Sync {
             self.request_flush(true, true, AsyncFlushReason::Explicit)?;
         }
+        if old != mode {
+            record_engine_mode_switch(match mode {
+                EngineMode::Async => "async",
+                EngineMode::Sync => "sync",
+            });
+        }
         Ok(())
     }
 
@@ -279,8 +291,10 @@ impl AppenderEngine {
     /// trigger a worker flush when thresholds are exceeded.
     pub fn write_block(&self, block: &[u8], force_flush: bool) -> Result<(), AppenderEngineError> {
         validate_block(block)?;
+        let write_begin = Instant::now();
+        let mode_snapshot = self.mode();
 
-        match self.mode() {
+        match mode_snapshot {
             EngineMode::Sync => {
                 self.file_manager.append_log_bytes(
                     block,
@@ -298,10 +312,15 @@ impl AppenderEngine {
                         .async_pending_bytes_since_persist
                         .saturating_add(block.len());
                     let should_persist_mmap = should_persist_async_mmap(&state, force_flush);
+                    let persist_reason = async_persist_reason(&state, force_flush);
                     let appended = state
                         .buffer
                         .append_block_with_flush(block, should_persist_mmap)?;
+                    if !appended {
+                        record_async_buffer_append_failed();
+                    }
                     if should_persist_mmap {
+                        record_async_buffer_persisted(persist_reason);
                         mark_async_mmap_persisted(&mut state);
                     }
                     state.last_async_buffer_mutation_at = Instant::now();
@@ -311,6 +330,9 @@ impl AppenderEngine {
                         let appended_after_flush = state
                             .buffer
                             .append_block_with_flush(block, should_persist_mmap)?;
+                        if !appended_after_flush {
+                            record_async_buffer_append_failed();
+                        }
                         if !appended_after_flush {
                             state.file_manager.append_log_bytes(
                                 block,
@@ -330,6 +352,15 @@ impl AppenderEngine {
                 }
             }
         }
+        record_engine_write_block(
+            match mode_snapshot {
+                EngineMode::Async => "async",
+                EngineMode::Sync => "sync",
+            },
+            block.len(),
+            write_begin.elapsed(),
+            force_flush,
+        );
         Ok(())
     }
 
@@ -347,13 +378,16 @@ impl AppenderEngine {
             .async_pending_bytes_since_persist
             .saturating_add(HEADER_LEN);
         let should_persist_mmap = should_persist_async_mmap(&state, false);
+        let persist_reason = async_persist_reason(&state, false);
         state
             .buffer
             .begin_pending_block_with_flush(header, should_persist_mmap)?;
         if should_persist_mmap {
+            record_async_buffer_persisted(persist_reason);
             mark_async_mmap_persisted(&mut state);
         }
         state.last_async_buffer_mutation_at = Instant::now();
+        record_async_buffer_len(state.buffer.len(), state.buffer.capacity());
         Ok(())
     }
 
@@ -389,6 +423,7 @@ impl AppenderEngine {
                 .async_pending_bytes_since_persist
                 .saturating_add(bytes_delta);
             let should_persist_mmap = should_persist_async_mmap(&state, force_flush);
+            let persist_reason = async_persist_reason(&state, force_flush);
             state.buffer.append_to_pending_with_flush(
                 truncate_bytes,
                 chunk,
@@ -396,9 +431,11 @@ impl AppenderEngine {
                 should_persist_mmap,
             )?;
             if should_persist_mmap {
+                record_async_buffer_persisted(persist_reason);
                 mark_async_mmap_persisted(&mut state);
             }
             state.last_async_buffer_mutation_at = Instant::now();
+            record_async_buffer_len(state.buffer.len(), state.buffer.capacity());
             should_flush
         };
 
@@ -424,13 +461,16 @@ impl AppenderEngine {
             state.async_pending_bytes_since_persist =
                 state.async_pending_bytes_since_persist.saturating_add(1);
             let should_persist_mmap = should_persist_async_mmap(&state, force_flush);
+            let persist_reason = async_persist_reason(&state, force_flush);
             state
                 .buffer
                 .finalize_pending_block_with_flush(end_hour, should_persist_mmap)?;
             if should_persist_mmap {
+                record_async_buffer_persisted(persist_reason);
                 mark_async_mmap_persisted(&mut state);
             }
             state.last_async_buffer_mutation_at = Instant::now();
+            record_async_buffer_len(state.buffer.len(), state.buffer.capacity());
         }
         if force_flush {
             self.request_flush(false, true, AsyncFlushReason::Threshold)?;
@@ -507,13 +547,16 @@ impl AppenderEngine {
                 .async_pending_bytes_since_persist
                 .saturating_add(pending_bytes.len());
             let should_persist_mmap = should_persist_async_mmap(&state, force_flush);
+            let persist_reason = async_persist_reason(&state, force_flush);
             state
                 .buffer
                 .replace_bytes_with_flush(pending_bytes, should_persist_mmap)?;
             if should_persist_mmap {
+                record_async_buffer_persisted(persist_reason);
                 mark_async_mmap_persisted(&mut state);
             }
             state.last_async_buffer_mutation_at = Instant::now();
+            record_async_buffer_len(state.buffer.len(), state.buffer.capacity());
             should_flush
         };
 
@@ -537,13 +580,27 @@ impl AppenderEngine {
         sync: bool,
         reason: AsyncFlushReason,
     ) -> Result<(), AppenderEngineError> {
+        let flush_begin = Instant::now();
         if self.mode() == EngineMode::Sync {
             if sync {
                 self.file_manager.flush_active_file_buffer()?;
             }
+            record_engine_flush(
+                "sync",
+                "explicit",
+                flush_begin.elapsed(),
+                sync,
+            );
             return Ok(());
         }
-        self.request_flush(sync, !sync, reason)
+        let out = self.request_flush(sync, !sync, reason);
+        record_engine_flush(
+            "async",
+            async_flush_reason_label(reason),
+            flush_begin.elapsed(),
+            sync,
+        );
+        out
     }
 
     fn request_flush(
@@ -568,6 +625,7 @@ impl AppenderEngine {
         }
 
         if self.pending_async_flush.swap(true, Ordering::AcqRel) {
+            record_engine_flush_requeue();
             return Ok(());
         }
         self.tx
@@ -691,6 +749,7 @@ fn run_worker_loop(ctx: WorkerLoopCtx) {
                     .and_then(|mut s| handle_timeout_locked(&mut s, flush_timeout).map_err(|_| ()))
                     .unwrap_or(false);
                 if flushed {
+                    record_engine_timeout_flush();
                     async_flush_reason.store(
                         async_flush_reason_to_u8(AsyncFlushReason::Timeout),
                         Ordering::Release,
@@ -790,6 +849,22 @@ fn mark_async_mmap_persisted(state: &mut EngineState) {
     state.async_pending_updates_since_persist = 0;
     state.async_pending_bytes_since_persist = 0;
     state.last_async_buffer_persist_at = Instant::now();
+}
+
+fn async_persist_reason(state: &EngineState, force_flush: bool) -> &'static str {
+    if force_flush {
+        return "force_flush";
+    }
+    if state.async_pending_updates_since_persist >= ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES {
+        return "updates";
+    }
+    if state.async_pending_bytes_since_persist >= ASYNC_PENDING_MMAP_PERSIST_EVERY_BYTES {
+        return "bytes";
+    }
+    if state.last_async_buffer_persist_at.elapsed() >= ASYNC_PENDING_MMAP_PERSIST_INTERVAL {
+        return "interval";
+    }
+    "unknown"
 }
 
 fn async_buffer_flush_threshold(capacity: usize) -> usize {
@@ -902,6 +977,16 @@ fn u8_to_async_flush_reason(value: u8) -> AsyncFlushReason {
         3 => AsyncFlushReason::Timeout,
         4 => AsyncFlushReason::Stop,
         _ => AsyncFlushReason::Unknown,
+    }
+}
+
+fn async_flush_reason_label(reason: AsyncFlushReason) -> &'static str {
+    match reason {
+        AsyncFlushReason::Unknown => "unknown",
+        AsyncFlushReason::Threshold => "threshold",
+        AsyncFlushReason::Explicit => "explicit",
+        AsyncFlushReason::Timeout => "timeout",
+        AsyncFlushReason::Stop => "stop",
     }
 }
 

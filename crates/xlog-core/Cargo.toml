@@ -28,6 +28,7 @@ hex = "0.4"
 memmap2 = "0.9"
 fs2 = "0.4"
 crossbeam-channel = "0.5"
+metrics = { version = "0.22", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -44,3 +45,6 @@ cc = "1"
 
 [package.metadata.docs.rs]
 no-default-features = false
+
+[features]
+metrics = ["dep:metrics"]

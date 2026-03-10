@@ -9,6 +9,7 @@
 pub mod appender_engine;
 /// Persistent mmap-backed buffer and recovery helpers.
 pub mod buffer;
+mod metrics;
 /// Compression helpers and streaming compressor implementations.
 pub mod compress;
 /// ECDH+TEA encryption helpers.
