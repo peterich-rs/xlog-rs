@@ -170,13 +170,12 @@ impl CppLogger {
     fn init(opts: &Options) -> Result<Arc<Self>, String> {
         let logdir = CString::new(opts.out_dir.to_string_lossy().as_bytes())
             .map_err(|_| "logdir contains NUL".to_string())?;
-        let prefix = CString::new(opts.prefix.clone())
-            .map_err(|_| "prefix contains NUL".to_string())?;
+        let prefix =
+            CString::new(opts.prefix.clone()).map_err(|_| "prefix contains NUL".to_string())?;
         let pub_key = match &opts.pub_key {
-            Some(value) => Some(
-                CString::new(value.as_str())
-                    .map_err(|_| "pub_key contains NUL".to_string())?,
-            ),
+            Some(value) => {
+                Some(CString::new(value.as_str()).map_err(|_| "pub_key contains NUL".to_string())?)
+            }
             None => None,
         };
         let cache_dir = match &opts.cache_dir {
@@ -194,14 +193,18 @@ impl CppLogger {
             pub_key: pub_key.as_ref().map(|v| v.as_ptr()).unwrap_or(ptr::null()),
             compress_mode: to_sys_compress(opts.compress) as c_int,
             compress_level: opts.compress_level,
-            cache_dir: cache_dir.as_ref().map(|v| v.as_ptr()).unwrap_or(ptr::null()),
+            cache_dir: cache_dir
+                .as_ref()
+                .map(|v| v.as_ptr())
+                .unwrap_or(ptr::null()),
             cache_days: opts.cache_days,
         };
 
         unsafe {
             sys::mars_xlog_appender_open(&cfg, sys::TLogLevel::kLevelInfo as c_int);
         }
-        let instance = unsafe { sys::mars_xlog_new_instance(&cfg, sys::TLogLevel::kLevelInfo as c_int) };
+        let instance =
+            unsafe { sys::mars_xlog_new_instance(&cfg, sys::TLogLevel::kLevelInfo as c_int) };
         if instance == 0 {
             return Err("mars_xlog_new_instance failed".to_string());
         }
