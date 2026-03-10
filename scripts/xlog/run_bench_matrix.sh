@@ -311,12 +311,9 @@ fi
 for be in "${requested_backends[@]}"; do
   case "$be" in
     rust) ;;
-    cpp)
-      echo "error: backend 'cpp' is no longer exposed by mars-xlog; use archived comparison artifacts or a separate legacy harness" >&2
-      exit 2
-      ;;
+    cpp) ;;
     *)
-      echo "error: unsupported backend '$be' (allowed: rust)" >&2
+      echo "error: unsupported backend '$be' (allowed: rust, cpp)" >&2
       exit 2
       ;;
   esac
@@ -329,9 +326,18 @@ log "Backend order policy: $backend_order_policy (seed=$order_seed)"
 # ─── Build step ─────────────────────────────────────────────────────────
 if [[ "$skip_build" -eq 0 ]]; then
   for be in "${requested_backends[@]}"; do
-    log "Building ${be}-backend (release)..."
-    cargo build --release -p mars-xlog --example bench_backend \
-      --no-default-features --features rust-backend 2>&1 | tail -1 | tee -a "$log_file"
+    case "$be" in
+      rust)
+        log "Building ${be}-backend (release)..."
+        cargo build --release -p mars-xlog --example bench_backend \
+          --no-default-features --features rust-backend 2>&1 | tail -1 | tee -a "$log_file"
+        ;;
+      cpp)
+        log "Building ${be}-backend (release)..."
+        cargo build --release -p mars-xlog-sys --example bench_backend_cpp \
+          2>&1 | tail -1 | tee -a "$log_file"
+        ;;
+    esac
   done
 fi
 
@@ -419,23 +425,45 @@ while IFS= read -r line || [[ -n "$line" ]]; do
       cache_dir_arg=""
       rm -rf "$run_dir"
 
-      cmd=(
-        cargo run --release -p mars-xlog --example bench_backend
-        --no-default-features --features rust-backend --
-        --out-dir "$run_dir"
-        --prefix "${scenario}-${be}"
-        --messages "$messages"
-        --mode "$mode"
-        --compress "$compress"
-        --compress-level "$compress_level"
-        --msg-size "$msg_size"
-        --payload-profile "$payload_profile"
-        --payload-seed "$payload_seed"
-        --threads "$threads"
-        --flush-every "$flush_every"
-        --warmup "$warmup"
-        --max-file-size "$max_file_size"
-      )
+      case "$be" in
+        rust)
+          cmd=(
+            cargo run --release -p mars-xlog --example bench_backend
+            --no-default-features --features rust-backend --
+            --out-dir "$run_dir"
+            --prefix "${scenario}-${be}"
+            --messages "$messages"
+            --mode "$mode"
+            --compress "$compress"
+            --compress-level "$compress_level"
+            --msg-size "$msg_size"
+            --payload-profile "$payload_profile"
+            --payload-seed "$payload_seed"
+            --threads "$threads"
+            --flush-every "$flush_every"
+            --warmup "$warmup"
+            --max-file-size "$max_file_size"
+          )
+          ;;
+        cpp)
+          cmd=(
+            cargo run --release -p mars-xlog-sys --example bench_backend_cpp --
+            --out-dir "$run_dir"
+            --prefix "${scenario}-${be}"
+            --messages "$messages"
+            --mode "$mode"
+            --compress "$compress"
+            --compress-level "$compress_level"
+            --msg-size "$msg_size"
+            --payload-profile "$payload_profile"
+            --payload-seed "$payload_seed"
+            --threads "$threads"
+            --flush-every "$flush_every"
+            --warmup "$warmup"
+            --max-file-size "$max_file_size"
+          )
+          ;;
+      esac
 
       if is_nonneg_int "${time_buckets:-}" && [[ "$time_buckets" -gt 0 ]]; then
         cmd+=(--time-buckets "$time_buckets")

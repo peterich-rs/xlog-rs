@@ -4,6 +4,85 @@
 > 审查范围: `crates/xlog-core/` + `crates/xlog/src/backend/rust.rs`
 > benchmark 基线: `artifacts/bench-compare/20260308-p0-full-matrix`
 
+## 0. 2026-03-10 本机双端复测结论（新增）
+
+本次新增一轮 **同机双端全量 benchmark**，并为 Rust 侧补充了 Prometheus metrics 快照：
+
+- 双端基线: `artifacts/bench-compare/20260310-core-matrix-dual`
+- Rust metrics 快照: `artifacts/bench-compare/20260310-core-metrics-dual`
+
+### 0.1 全量双端对比（本机）
+
+全量 31 个场景统计：
+
+1. Rust 吞吐更高：`28 / 31`
+2. Rust P99 更低：`24 / 31`
+
+极值：
+
+1. 最差吞吐比：`async_4t_large_entropy` = `0.699x`（Rust 低于 C++）
+2. 最差 P99 比：`async_1t_zlib6` = `1.682x`（Rust 高于 C++）
+3. 最好吞吐比：`sync_4t_boundary` = `17.81x`
+4. 最好 P99 比：`sync_8t_boundary` = `0.015x`
+
+Rust 吞吐落后或持平的场景：
+
+1. `async_4t_large_entropy` = `0.699x`
+2. `async_4t_zstd3` = `0.801x`
+3. `async_1t_entropy` = `0.999x`
+
+Rust P99 反超失败的场景（P99 比值 > 1）：
+
+1. `async_1t_zlib6` = `1.682x`
+2. `async_4t_zstd3` = `1.615x`
+3. `async_1t` = `1.537x`
+4. `async_1t_crypto` = `1.500x`
+5. `async_1t_zstd3` = `1.500x`
+6. `async_1t_human` = `1.497x`
+7. `async_1t_entropy` = `1.219x`
+
+### 0.2 Rust metrics 关键卡点（本机）
+
+Rust metrics 只在 Rust 侧采集（C++ 未接入 metrics）：
+
+1. **Async 高线程背压明显**  
+   `async_8t_dense` / `async_8t_flush64`  
+   - `queue_full_total` ≈ `437,814` / `426,590`  
+   - `queue_block_avg_ns` ≈ `49,869 ns` / `50,932 ns`  
+   - 说明：瓶颈在后台压缩/刷盘吞吐，前端格式化不是主成本。
+
+2. **大包高熵 async 以后台为主瓶颈**  
+   `async_4t_large_entropy`  
+   - `stage_total_avg_ns` ≈ `69,164 ns`  
+   - `queue_block_avg_ns` ≈ `272,851 ns`  
+   - `flush_requeue_total` ≈ `4,086`  
+   - 说明：压缩+刷盘主导，flush requeue 频繁。
+
+3. **Sync 边界/缓存/轮转瓶颈不在 append**  
+   `sync_8t_cache` / `sync_8t_boundary` / `sync_8t_rotate`  
+   - `engine_write_block_avg_ns` ≈ `37k/36k/24k ns`  
+   - `file_append_avg_ns` ≈ `100~140 ns`  
+   - 说明：瓶颈在 write_block/管理逻辑而非文件 append。
+
+### 0.3 复现方式（双端）
+
+双端矩阵跑法：
+
+```
+scripts/xlog/run_bench_matrix.sh \
+  --manifest scripts/xlog/bench_matrix.tsv \
+  --out-root artifacts/bench-compare/20260310-core-matrix-dual \
+  --backends rust,cpp
+```
+
+Rust metrics 快照跑法（每个场景单次快照）：
+
+```
+cargo run --release -p mars-xlog --example bench_backend \
+  --no-default-features --features rust-backend,metrics-prometheus -- \
+  --out-dir <dir> --metrics-out <path>.prom ... (按 manifest 逐条执行)
+```
+
 ## 1. 当前结论
 
 当前 Rust 实现已经不适合再被描述为“性能接近目标，但仍主要落后于 C++”。
