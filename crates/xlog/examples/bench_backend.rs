@@ -7,6 +7,9 @@ use std::time::Instant;
 
 use mars_xlog::{AppenderMode, CompressMode, LogLevel, Xlog, XlogConfig};
 
+#[cfg(feature = "metrics-prometheus")]
+use metrics_exporter_prometheus::PrometheusBuilder;
+
 const USAGE: &str = "\
 Benchmark xlog backend write throughput and latency.
 
@@ -31,6 +34,7 @@ Options:
   --max-file-size <n>      Max logfile size in bytes (default: 0 = disabled)
   --pub-key <hex>          Optional 128-char public key to enable crypto
   --time-buckets <n>       Number of timeline buckets to emit (default: 0 = disabled)
+  --metrics-out <path>     Write Prometheus text format snapshot (requires metrics-prometheus)
   --json-pretty            Pretty-print JSON result
 ";
 
@@ -72,6 +76,7 @@ struct Options {
     max_file_size: i64,
     pub_key: Option<String>,
     time_buckets: usize,
+    metrics_out: Option<PathBuf>,
     json_pretty: bool,
 }
 
@@ -150,6 +155,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let opts = parse_args()?;
+    let metrics_handle = install_metrics_recorder();
     fs::create_dir_all(&opts.out_dir)
         .map_err(|e| format!("create out dir failed {}: {e}", opts.out_dir.display()))?;
     if let Some(cache_dir) = &opts.cache_dir {
@@ -397,6 +403,9 @@ fn run() -> Result<(), String> {
     } else {
         println!("{json}");
     }
+    if let Some(path) = opts.metrics_out {
+        write_metrics_snapshot(metrics_handle.as_ref(), &path)?;
+    }
 
     Ok(())
 }
@@ -445,6 +454,7 @@ fn parse_args() -> Result<Options, String> {
     let mut max_file_size = 0i64;
     let mut pub_key: Option<String> = None;
     let mut time_buckets = 0usize;
+    let mut metrics_out: Option<PathBuf> = None;
     let mut json_pretty = false;
 
     let mut iter = env::args().skip(1);
@@ -576,6 +586,12 @@ fn parse_args() -> Result<Options, String> {
                     .parse::<usize>()
                     .map_err(|e| format!("invalid --time-buckets value {v}: {e}"))?;
             }
+            "--metrics-out" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--metrics-out requires a value".to_string())?;
+                metrics_out = Some(PathBuf::from(v));
+            }
             "--json-pretty" => json_pretty = true,
             unknown => return Err(format!("unknown argument: {unknown}\n\n{USAGE}")),
         }
@@ -619,6 +635,7 @@ fn parse_args() -> Result<Options, String> {
         max_file_size,
         pub_key,
         time_buckets,
+        metrics_out,
         json_pretty,
     })
 }
@@ -871,6 +888,44 @@ fn append_json_array_empty(json: &mut String, key: &str) {
 }
 
 fn mark_flush_every_hint() {}
+
+#[cfg(feature = "metrics-prometheus")]
+fn install_metrics_recorder() -> Option<metrics_exporter_prometheus::PrometheusHandle> {
+    PrometheusBuilder::new().install_recorder().ok()
+}
+
+#[cfg(not(feature = "metrics-prometheus"))]
+fn install_metrics_recorder() -> Option<()> {
+    None
+}
+
+#[cfg(feature = "metrics-prometheus")]
+fn write_metrics_snapshot(
+    handle: Option<&metrics_exporter_prometheus::PrometheusHandle>,
+    path: &Path,
+) -> Result<(), String> {
+    if handle.is_none() {
+        return Err("--metrics-out requires `--features metrics-prometheus`".to_string());
+    }
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("create metrics dir failed {}: {e}", parent.display()))?;
+        }
+    }
+    let contents = handle.render();
+    fs::write(path, contents)
+        .map_err(|e| format!("write metrics snapshot failed {}: {e}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(feature = "metrics-prometheus"))]
+fn write_metrics_snapshot(_handle: Option<&()>, _path: &Path) -> Result<(), String> {
+    Err("--metrics-out requires `--features metrics-prometheus`".to_string())
+}
 
 fn pretty_json(input: &str) -> String {
     let mut out = String::with_capacity(input.len() + input.len() / 2);

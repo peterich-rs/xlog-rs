@@ -1,5 +1,6 @@
 target/
 **/target/
+*.prom
 .DS_Store
 .idea/
 .vscode/

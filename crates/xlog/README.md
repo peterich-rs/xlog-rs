@@ -39,6 +39,7 @@ fn main() -> anyhow::Result<()> {
 - `macros`: enables the `xlog!` family of call-site macros
 - `tracing`: enables `XlogLayer` for `tracing-subscriber`
 - `metrics`: emits runtime metrics via the `metrics` crate (requires a recorder)
+- `metrics-prometheus`: enables the Prometheus recorder for bench/example usage
 
 ## Scope
 

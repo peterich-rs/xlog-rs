@@ -25,6 +25,7 @@ tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"], optional = true }
 crossbeam-queue = "0.3"
 metrics = { version = "0.22", optional = true }
+metrics-exporter-prometheus = { version = "0.13", optional = true }
 
 [features]
 # Public release surface is Rust-only.
@@ -33,6 +34,7 @@ rust-backend = ["dep:mars-xlog-core", "dep:chrono"]
 macros = []
 tracing = ["dep:tracing", "dep:tracing-subscriber"]
 metrics = ["dep:metrics", "mars-xlog-core?/metrics"]
+metrics-prometheus = ["dep:metrics-exporter-prometheus", "metrics"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
