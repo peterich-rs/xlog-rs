@@ -585,12 +585,7 @@ impl AppenderEngine {
             if sync {
                 self.file_manager.flush_active_file_buffer()?;
             }
-            record_engine_flush(
-                "sync",
-                "explicit",
-                flush_begin.elapsed(),
-                sync,
-            );
+            record_engine_flush("sync", "explicit", flush_begin.elapsed(), sync);
             return Ok(());
         }
         let out = self.request_flush(sync, !sync, reason);

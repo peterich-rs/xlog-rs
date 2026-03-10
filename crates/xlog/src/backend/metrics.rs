@@ -128,9 +128,8 @@ pub(super) fn record_async_enqueued(queue_capacity: usize) {
     }
 
     gauge!("xlog.async.queue.depth").set(depth as f64);
-    gauge!("xlog.async.queue.depth_high_watermark").set(
-        ASYNC_QUEUE_DEPTH_HIGH_WATERMARK.load(Ordering::Acquire) as f64,
-    );
+    gauge!("xlog.async.queue.depth_high_watermark")
+        .set(ASYNC_QUEUE_DEPTH_HIGH_WATERMARK.load(Ordering::Acquire) as f64);
 }
 
 #[cfg(not(feature = "metrics"))]
@@ -168,10 +167,8 @@ pub(super) fn record_async_pending_block(
 ) {
     counter!("xlog.async.pending.finalized_total").increment(1);
     histogram!("xlog.async.pending.lines_per_block").record(lines as f64);
-    histogram!("xlog.async.pending.raw_input_bytes_per_block")
-        .record(raw_input_bytes as f64);
-    histogram!("xlog.async.pending.payload_bytes_per_block")
-        .record(payload_bytes as f64);
+    histogram!("xlog.async.pending.raw_input_bytes_per_block").record(raw_input_bytes as f64);
+    histogram!("xlog.async.pending.payload_bytes_per_block").record(payload_bytes as f64);
 
     match reason {
         AsyncPendingFinalizeReason::Threshold => counter!(

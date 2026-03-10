@@ -20,8 +20,7 @@ pub(crate) fn record_engine_write_block(
 ) {
     counter!("xlog.core.engine.write_block_total", "mode" => mode).increment(1);
     histogram!("xlog.core.engine.write_block_bytes", "mode" => mode).record(bytes as f64);
-    histogram!("xlog.core.engine.write_block_ns", "mode" => mode)
-        .record(elapsed.as_nanos() as f64);
+    histogram!("xlog.core.engine.write_block_ns", "mode" => mode).record(elapsed.as_nanos() as f64);
     if force_flush {
         counter!("xlog.core.engine.write_block_force_flush_total", "mode" => mode).increment(1);
     }

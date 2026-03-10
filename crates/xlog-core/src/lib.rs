@@ -9,7 +9,6 @@
 pub mod appender_engine;
 /// Persistent mmap-backed buffer and recovery helpers.
 pub mod buffer;
-mod metrics;
 /// Compression helpers and streaming compressor implementations.
 pub mod compress;
 /// ECDH+TEA encryption helpers.
@@ -20,6 +19,7 @@ pub mod dump;
 pub mod file_manager;
 /// Line formatter used by the Rust runtime path.
 pub mod formatter;
+mod metrics;
 /// Thin mmap storage wrapper used by persistent buffers.
 pub mod mmap_store;
 /// One-shot flush path used to drain mmap/cache state into log files.
