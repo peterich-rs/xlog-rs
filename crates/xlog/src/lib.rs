@@ -156,7 +156,10 @@ pub enum XlogError {
     InvalidConfig,
     #[error("logger `{name_prefix}` is already initialized with a different config")]
     /// The requested `name_prefix` already exists but with a different config.
-    ConfigConflict { name_prefix: String },
+    ConfigConflict {
+        /// Name prefix of the already-initialized logger instance.
+        name_prefix: String,
+    },
     #[error("xlog initialization failed")]
     /// Backend initialization failed.
     InitFailed,

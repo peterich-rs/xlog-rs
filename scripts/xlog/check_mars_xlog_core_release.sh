@@ -59,6 +59,13 @@ if [[ "$allow_dirty" -eq 1 ]]; then
   cargo_dirty_args+=(--allow-dirty)
 fi
 
+package_list_cmd=(cargo package -p mars-xlog-core --locked --list)
+publish_dry_run_cmd=(cargo publish --dry-run -p mars-xlog-core --locked)
+if [[ "$allow_dirty" -eq 1 ]]; then
+  package_list_cmd+=(--allow-dirty)
+  publish_dry_run_cmd+=(--allow-dirty)
+fi
+
 failures=0
 last_exit_code=0
 failed_steps=()
@@ -87,12 +94,12 @@ echo "- worktree: \`$(git -C "$repo_root" status --short | wc -l | tr -d ' ')\` 
 echo "- allow_dirty: \`$allow_dirty\`" >> "$summary_file"
 echo >> "$summary_file"
 
-run_step package_list cargo package -p mars-xlog-core --locked "${cargo_dirty_args[@]}" --list
+run_step package_list "${package_list_cmd[@]}"
 if [[ "$last_exit_code" -eq 0 ]]; then
   cp "$out_dir/logs/package_list.log" "$out_dir/package_list.txt"
 fi
 
-run_step publish_dry_run cargo publish --dry-run -p mars-xlog-core --locked "${cargo_dirty_args[@]}"
+run_step publish_dry_run "${publish_dry_run_cmd[@]}"
 
 run_step rustdoc_missing_docs cargo rustdoc -p mars-xlog-core --lib -- -D missing-docs
 if [[ "$last_exit_code" -ne 0 ]]; then
