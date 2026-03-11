@@ -100,6 +100,9 @@ enum AsyncFrontendCommand {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum AsyncFlushControlReason {
+    // Keep the enum even though only `Explicit` exists today. The control
+    // plane is expected to grow more flush reasons without rewriting the
+    // worker protocol.
     Explicit,
 }
 
@@ -386,11 +389,15 @@ thread_local! {
 fn with_hot_path_scratch<R>(f: impl FnOnce(&mut HotPathScratch) -> R) -> R {
     HOT_PATH_SCRATCH.with(|scratch| match scratch.try_borrow_mut() {
         Ok(mut borrowed) => f(&mut borrowed),
-        Err(_) => {
-            let mut fallback = HotPathScratch::new();
-            f(&mut fallback)
-        }
+        Err(_) => with_hot_path_scratch_fallback(f),
     })
+}
+
+#[cold]
+fn with_hot_path_scratch_fallback<R>(f: impl FnOnce(&mut HotPathScratch) -> R) -> R {
+    debug_assert!(false, "re-entrant logging detected");
+    let mut fallback = HotPathScratch::new();
+    f(&mut fallback)
 }
 
 #[derive(Default)]
@@ -421,6 +428,10 @@ const ASYNC_LINE_POOL_MAX_BUFFERS_PER_SHARD: usize = 256;
 const ASYNC_LINE_POOL_MAX_CAPACITY: usize = 8 * 1024;
 const ASYNC_LINE_BUFFER_INIT_CAPACITY: usize = 512;
 const ASYNC_LINE_POOL_SHARD_SENTINEL: usize = usize::MAX;
+// Keep the historical BUFFER_BLOCK_LENTH typo for compatibility with
+// existing Mars/C++ log text and external grep patterns.
+const ASYNC_HIGH_WATERMARK_WARNING_PREFIX: &str =
+    "[F][ sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len: ";
 
 fn take_async_flush_control_reason(_sync: bool) -> AsyncFlushControlReason {
     AsyncFlushControlReason::Explicit
@@ -576,6 +587,10 @@ impl AsyncFrontend {
     }
 
     fn take_line_buffer(&self, shard: usize) -> String {
+        debug_assert!(
+            shard < self.line_pools.len(),
+            "async line pool shard out of range: {shard}"
+        );
         if let Some(mut line) = self.line_pools[shard].pop() {
             line.clear();
             return line;
@@ -587,6 +602,10 @@ impl AsyncFrontend {
         if shard == ASYNC_LINE_POOL_SHARD_SENTINEL {
             return;
         }
+        debug_assert!(
+            shard < self.line_pools.len(),
+            "async line pool shard out of range: {shard}"
+        );
         if line.capacity() > ASYNC_LINE_POOL_MAX_CAPACITY {
             return;
         }
@@ -761,6 +780,10 @@ fn recycle_line_buffer_to_pool(pools: &[ArrayQueue<String>], shard: usize, mut l
     if shard == ASYNC_LINE_POOL_SHARD_SENTINEL {
         return;
     }
+    debug_assert!(
+        shard < pools.len(),
+        "async line pool shard out of range: {shard}"
+    );
     if line.capacity() > ASYNC_LINE_POOL_MAX_CAPACITY {
         return;
     }
@@ -852,7 +875,7 @@ fn handle_async_frontend_write(
     let mut warning_line = None;
     if current_len >= threshold {
         warning_line = Some(format!(
-            "[F][ sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len: {current_len}\n"
+            "{ASYNC_HIGH_WATERMARK_WARNING_PREFIX}{current_len}\n"
         ));
     }
     let line = warning_line.as_deref().unwrap_or(cmd.line.as_str());
@@ -1011,6 +1034,9 @@ fn local_hour_from_timestamp(timestamp: SystemTime) -> u8 {
             let epoch_second = epoch_secs as i64;
             return HOUR_CACHE.with(|cache_cell| {
                 let mut cache = cache_cell.borrow_mut();
+                // Cache by epoch-second to keep the hot path cheap. This can
+                // miss same-second local timezone changes, which is acceptable
+                // for hour bucketing.
                 if !cache.valid || cache.epoch_second != epoch_second {
                     if let Some(dt) = chrono::Local.timestamp_opt(epoch_second, 0).single() {
                         cache.epoch_second = epoch_second;
@@ -1505,7 +1531,7 @@ impl RustBackend {
                     scratch.line.clear();
                     let _ = writeln!(
                         scratch.line,
-                        "[F][ sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len: {current_len}"
+                        "{ASYNC_HIGH_WATERMARK_WARNING_PREFIX}{current_len}"
                     );
                 }
 
@@ -1933,8 +1959,9 @@ mod tests {
     use mars_xlog_core::compress::{decompress_raw_zlib, decompress_zstd_frames};
     use mars_xlog_core::crypto::{tea_decrypt_in_place, EcdhTeaCipher};
     use mars_xlog_core::protocol::{
-        LogHeader, HEADER_LEN, MAGIC_ASYNC_ZLIB_START, MAGIC_ASYNC_ZSTD_START, MAGIC_END,
-        MAGIC_SYNC_ZLIB_START, TAILER_LEN,
+        LogHeader, HEADER_LEN, MAGIC_ASYNC_NO_CRYPT_ZLIB_START, MAGIC_ASYNC_NO_CRYPT_ZSTD_START,
+        MAGIC_ASYNC_ZLIB_START, MAGIC_ASYNC_ZSTD_START, MAGIC_END, MAGIC_SYNC_ZLIB_START,
+        TAILER_LEN,
     };
 
     use super::RustBackend;
@@ -1997,20 +2024,33 @@ mod tests {
     }
 
     fn decode_block_payload(header: &LogHeader, payload: &[u8]) -> Vec<u8> {
-        let is_async = matches!(header.magic, 0x07 | 0x09 | 0x0C | 0x0D);
+        let is_async = matches!(
+            header.magic,
+            MAGIC_ASYNC_ZLIB_START
+                | MAGIC_ASYNC_NO_CRYPT_ZLIB_START
+                | MAGIC_ASYNC_ZSTD_START
+                | MAGIC_ASYNC_NO_CRYPT_ZSTD_START
+        );
         if !is_async {
             return payload.to_vec();
         }
 
-        let raw = if matches!(header.magic, 0x07 | 0x0C) {
+        let raw = if matches!(
+            header.magic,
+            MAGIC_ASYNC_ZLIB_START | MAGIC_ASYNC_ZSTD_START
+        ) {
             decrypt_async_payload(header, payload)
         } else {
             payload.to_vec()
         };
 
         match header.magic {
-            0x07 | 0x09 => decompress_raw_zlib(&raw).unwrap(),
-            0x0C | 0x0D => decompress_zstd_frames(&raw).unwrap(),
+            MAGIC_ASYNC_ZLIB_START | MAGIC_ASYNC_NO_CRYPT_ZLIB_START => {
+                decompress_raw_zlib(&raw).unwrap()
+            }
+            MAGIC_ASYNC_ZSTD_START | MAGIC_ASYNC_NO_CRYPT_ZSTD_START => {
+                decompress_zstd_frames(&raw).unwrap()
+            }
             _ => raw,
         }
     }
@@ -2493,8 +2533,26 @@ mod tests {
         let payload = &pending[HEADER_LEN..];
         let plain = decode_block_payload(&header, payload);
         let text = std::str::from_utf8(&plain).unwrap();
-        assert!(text.contains("sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5"));
+        assert!(text.contains(super::ASYNC_HIGH_WATERMARK_WARNING_PREFIX));
         assert!(!text.contains("ORIGINAL-LINE-SHOULD-BE-DROPPED"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "async line pool shard out of range")]
+    fn recycle_line_buffer_rejects_invalid_shard_in_debug() {
+        let root = std::env::temp_dir().join(format!(
+            "xlog-rust-backend-invalid-shard-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-invalid-shard");
+        let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
+        backend
+            .async_frontend
+            .recycle_line_buffer(super::ASYNC_LINE_POOL_SHARDS, String::new());
     }
 }
