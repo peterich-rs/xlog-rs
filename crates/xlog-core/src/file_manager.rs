@@ -47,6 +47,9 @@ pub enum FileManagerError {
     /// Writing file data or flushing buffered bytes failed.
     #[error("write file failed for {0}: {1}")]
     WriteFile(PathBuf, #[source] std::io::Error),
+    /// Synchronizing file data to stable storage failed.
+    #[error("sync file failed for {0}: {1}")]
+    SyncFile(PathBuf, #[source] std::io::Error),
     /// Reading file data failed.
     #[error("read file failed for {0}: {1}")]
     ReadFile(PathBuf, #[source] std::io::Error),
@@ -232,7 +235,20 @@ impl FileManager {
         move_file: bool,
         keep_open: bool,
     ) -> Result<(), FileManagerError> {
-        self.append_log_slices(&[bytes], max_file_size, move_file, keep_open)
+        self.append_log_slices_inner(&[bytes], max_file_size, move_file, keep_open, false)
+    }
+
+    /// Appends one encoded log frame and synchronizes the destination file data.
+    ///
+    /// This is intended for low-frequency recovery paths that must not remove
+    /// their source before the destination append is durable.
+    pub fn append_log_bytes_durable(
+        &self,
+        bytes: &[u8],
+        max_file_size: u64,
+        move_file: bool,
+    ) -> Result<(), FileManagerError> {
+        self.append_log_slices_inner(&[bytes], max_file_size, move_file, false, true)
     }
 
     /// Appends multiple encoded log frame slices to the active target file.
@@ -246,6 +262,17 @@ impl FileManager {
         max_file_size: u64,
         move_file: bool,
         keep_open: bool,
+    ) -> Result<(), FileManagerError> {
+        self.append_log_slices_inner(slices, max_file_size, move_file, keep_open, false)
+    }
+
+    fn append_log_slices_inner(
+        &self,
+        slices: &[&[u8]],
+        max_file_size: u64,
+        move_file: bool,
+        keep_open: bool,
+        durable: bool,
     ) -> Result<(), FileManagerError> {
         let total_bytes = slices.iter().map(|slice| slice.len()).sum::<usize>();
         if total_bytes == 0 {
@@ -282,16 +309,17 @@ impl FileManager {
                 slices,
                 now,
                 keep_open,
+                durable,
             );
         }
 
         let cache_dir = self.cache_dir.as_ref().expect("cache_dir is_some");
         let now = Local::now();
         if let Some(log_path) = self.active_append_path(now, &self.log_dir, keep_open) {
-            return self.append_slices_with_runtime(&log_path, slices, now, keep_open);
+            return self.append_slices_with_runtime(&log_path, slices, now, keep_open, durable);
         }
         if let Some(cache_path) = self.active_append_path(now, cache_dir, keep_open) {
-            self.append_slices_with_runtime(&cache_path, slices, now, keep_open)?;
+            self.append_slices_with_runtime(&cache_path, slices, now, keep_open, durable)?;
             if move_file && !self.should_cache_logs(now, max_file_size) {
                 let log_path =
                     self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size);
@@ -310,7 +338,7 @@ impl FileManager {
             .unwrap_or_else(|| cache_path.exists());
 
         if cache_logs || cache_exists {
-            self.append_slices_with_runtime(&cache_path, slices, now, keep_open)?;
+            self.append_slices_with_runtime(&cache_path, slices, now, keep_open, durable)?;
             if cache_logs || !move_file {
                 return Ok(());
             }
@@ -326,9 +354,9 @@ impl FileManager {
 
         let log_path =
             self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size);
-        match self.append_slices_with_runtime(&log_path, slices, now, keep_open) {
+        match self.append_slices_with_runtime(&log_path, slices, now, keep_open, durable) {
             Ok(()) => Ok(()),
-            Err(_) => self.append_slices_with_runtime(&cache_path, slices, now, keep_open),
+            Err(_) => self.append_slices_with_runtime(&cache_path, slices, now, keep_open, durable),
         }
     }
 
@@ -757,12 +785,13 @@ impl FileManager {
         slices: &[&[u8]],
         now: chrono::DateTime<Local>,
         keep_open: bool,
+        durable: bool,
     ) -> Result<(), FileManagerError> {
         let mut runtime = self
             .runtime
             .lock()
             .expect("file_manager runtime lock poisoned");
-        self.append_slices_with_runtime_locked(&mut runtime, path, slices, now, keep_open)
+        self.append_slices_with_runtime_locked(&mut runtime, path, slices, now, keep_open, durable)
     }
 
     fn select_append_path_locked(
@@ -813,7 +842,9 @@ impl FileManager {
         slices: &[&[u8]],
         now: chrono::DateTime<Local>,
         keep_open: bool,
+        durable: bool,
     ) -> Result<(), FileManagerError> {
+        debug_assert!(!(keep_open && durable));
         let day_key = day_key(now);
         let path_buf = path.to_path_buf();
         let active_matches = runtime
@@ -859,6 +890,12 @@ impl FileManager {
             });
         }
 
+        let before_len = runtime
+            .active_file
+            .as_ref()
+            .expect("active file initialized")
+            .logical_len;
+
         let written = slices.iter().map(|slice| slice.len() as u64).sum::<u64>();
         let append_begin = Instant::now();
         let result = {
@@ -879,6 +916,20 @@ impl FileManager {
             let merged_len =
                 self.merged_len_after_append(path, runtime, day_key, written, current_len);
             self.update_cached_target_after_append(runtime, path, day_key, merged_len, current_len);
+        }
+
+        if result.is_ok() && durable {
+            let active = runtime
+                .active_file
+                .as_mut()
+                .expect("active file initialized");
+            if let Err(e) = sync_active_append_file_data(active) {
+                rollback_file_to_len(&mut active.file, before_len);
+                active.disk_len = before_len;
+                active.logical_len = before_len;
+                active.write_buffer.clear();
+                return Err(e);
+            }
         }
 
         if !keep_open {
@@ -1153,6 +1204,10 @@ fn append_file_to_file(src: &Path, dst: &Path) -> Result<(), FileManagerError> {
             std::io::Error::new(std::io::ErrorKind::WriteZero, "partial append"),
         ));
     }
+    if let Err(e) = dst_file.sync_data() {
+        rollback_file_to_len(&mut dst_file, dst_before_len);
+        return Err(FileManagerError::SyncFile(dst.to_path_buf(), e));
+    }
     Ok(())
 }
 
@@ -1304,6 +1359,14 @@ fn flush_active_append_file(active: &mut ActiveAppendFile) -> Result<(), FileMan
     active.disk_len = active.logical_len;
     active.write_buffer.clear();
     Ok(())
+}
+
+fn sync_active_append_file_data(active: &mut ActiveAppendFile) -> Result<(), FileManagerError> {
+    flush_active_append_file(active)?;
+    active
+        .file
+        .sync_data()
+        .map_err(|e| FileManagerError::SyncFile(active.path.clone(), e))
 }
 
 fn rollback_file_to_len(file: &mut File, target_len: u64) {

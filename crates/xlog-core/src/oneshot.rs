@@ -38,7 +38,8 @@ pub enum FileIoAction {
 ///
 /// This is the Rust equivalent of Mars xlog's oneshot recovery path. It reads
 /// the raw mmap bytes, recovers a pending block when possible, appends optional
-/// begin/end marker blocks, and removes the mmap file after a successful drain.
+/// begin/end marker blocks, durably syncs each appended recovery block, and
+/// removes the mmap file only after the destination writes have been synced.
 pub fn oneshot_flush(
     file_manager: &FileManager,
     mmap_capacity: usize,
@@ -80,10 +81,7 @@ pub fn oneshot_flush(
         sample_header,
         "~~~~~ begin of mmap from other process ~~~~~\n",
     ) {
-        if file_manager
-            .append_log_bytes(&begin, max_file_size, false, false)
-            .is_err()
-        {
+        if append_recovered_bytes_durable(file_manager, &begin, max_file_size).is_err() {
             return FileIoAction::WriteFailed;
         }
     }
@@ -94,14 +92,10 @@ pub fn oneshot_flush(
         let mut recovered = Vec::with_capacity(scan.valid_len.saturating_add(1));
         recovered.extend_from_slice(&data[..scan.valid_len]);
         recovered.push(MAGIC_END);
-        if file_manager
-            .append_log_bytes(&recovered, max_file_size, false, false)
-            .is_err()
-        {
+        if append_recovered_bytes_durable(file_manager, &recovered, max_file_size).is_err() {
             return FileIoAction::WriteFailed;
         }
-    } else if file_manager
-        .append_log_bytes(&data[..scan.valid_len], max_file_size, false, false)
+    } else if append_recovered_bytes_durable(file_manager, &data[..scan.valid_len], max_file_size)
         .is_err()
     {
         return FileIoAction::WriteFailed;
@@ -111,10 +105,7 @@ pub fn oneshot_flush(
         current_mark_info()
     );
     if let Some(end) = build_sync_tip_block(sample_header, &end_tip) {
-        if file_manager
-            .append_log_bytes(&end, max_file_size, false, false)
-            .is_err()
-        {
+        if append_recovered_bytes_durable(file_manager, &end, max_file_size).is_err() {
             return FileIoAction::WriteFailed;
         }
     }
@@ -125,6 +116,14 @@ pub fn oneshot_flush(
     }
 
     FileIoAction::Success
+}
+
+fn append_recovered_bytes_durable(
+    file_manager: &FileManager,
+    bytes: &[u8],
+    max_file_size: u64,
+) -> Result<(), crate::file_manager::FileManagerError> {
+    file_manager.append_log_bytes_durable(bytes, max_file_size, false)
 }
 
 fn magic_profile(magic: u8) -> Option<(CompressionKind, bool)> {

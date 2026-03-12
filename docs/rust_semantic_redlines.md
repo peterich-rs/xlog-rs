@@ -126,18 +126,19 @@
 1. 这不是 Rust 相对 C++ 的独有偏离
 2. 但文档不能再把当前 sync / fatal 描述成“每条日志立即落文件”或“fatal 在 sync 下强制落盘”
 
-### C2: 删除恢复源前没有 durability barrier
+### C2-closed-for-rust: Rust 删除恢复源前已建立 durability barrier
 
 现状：
 
-1. Rust 和 C++ 都是在普通 `write_all` / `fwrite` 或 copy 成功后，清 mmap / 删 cache 源
-2. 双方都没有 `sync_data` / `sync_all` / `fsync` 级稳定存储屏障
+1. Rust 在 oneshot recovery 和 cache/log merge 路径上，会在删除 `.mmap3` 或 cache 源文件前先对目标文件执行 `sync_data`
+2. 这关闭了 Rust 自身“目标写入成功但尚未 durable 就删源”的 crash window
+3. vendored Mars C++ 快照当前仍未跟进这一语义升级，本仓库这次也没有修改 `third_party/mars`
 
 因此：
 
-1. 这是当前整套方案共享的 crash window
-2. 不能把它描述成 Rust 最近优化才引入的问题
-3. 如果后续要把“删源前目标已 durable”升格为红线，必须按双端共同语义升级处理
+1. 这项问题不再是 Rust 当前实现的语义边界
+2. 但它仍然是与 vendored C++ 快照之间需要诚实说明的实现差异
+3. 如果后续要求双端都满足“删源前目标已 durable”，需要单独推进上游 C++/vendor 同步
 
 ## 8. 当前结论
 
@@ -147,7 +148,7 @@
 2. 当前 Rust 侧 active blocker 已清零，`FileManager` 单写者假设已显式化并通过锁文件强制
 3. 发布口径仍需按 release plan 明确界定，不能仅凭 blocker 清零就宣称 “GA” 或 “完全收口”
 4. recovery / oneshot split-write framing 风险已不再是 active blocker，但必须防回归
-5. 另外还存在 2 项 C++ / Rust 共享的语义边界，文档和后续设计必须诚实描述
+5. 当前仍有 1 项 C++ / Rust 共享语义边界，以及 1 项 vendored C++ 尚未跟进的 durability 差异，文档和后续设计必须诚实描述
 
 ## 9. 退出条件
 
