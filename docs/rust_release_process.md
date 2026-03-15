@@ -134,7 +134,7 @@ GitHub Actions workflow：
 6. 运行 `scripts/xlog/check_mars_xlog_release.sh`
 7. 若 `mars-xlog` 当前版本尚未发布，则执行 `cargo publish -p mars-xlog`
 8. 轮询 crates.io，直到 `mars-xlog` 当前版本可见
-9. 生成 GitHub Release，并附带本次 release preflight 产物
+9. 优先读取 `docs/releases/<version>.md` 生成 GitHub Release 正文，并附带本次 release preflight 产物
 
 ### 3.1 幂等要求
 
@@ -161,6 +161,12 @@ workflow 必须支持失败后重跑。
 7. push tag，等待 GitHub Actions 自动发布
 
 第 4 步里对 `mars-xlog` 使用 `--skip-crates-io-check`，是因为在本地预检阶段 `mars-xlog-core` 还没有真正发布；tag workflow 会在 core 发布后再次跑完整检查。
+
+变更说明建议作为版本化文档提交到：
+
+1. `docs/releases/<version>.md`
+
+如果该文件存在，release workflow 会优先用它作为 GitHub Release 正文的主体内容。
 
 ## 5. 必要 secrets 与权限
 

@@ -1,6 +1,6 @@
 [package]
 name = "mars-xlog"
-version = "0.1.0-preview.1"
+version = "0.1.0-preview.2"
 edition = "2021"
 license = "MIT"
 description = "Pure Rust xlog library with async/sync appenders, compression, encryption, and tracing integration."
@@ -19,7 +19,7 @@ crate-type = ["rlib"]
 [dependencies]
 libc = { workspace = true }
 thiserror = { workspace = true }
-mars-xlog-core = { path = "../xlog-core", version = "0.1.0-preview.1", optional = true }
+mars-xlog-core = { path = "../xlog-core", version = "0.1.0-preview.2", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"], optional = true }
