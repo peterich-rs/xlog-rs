@@ -1,6 +1,6 @@
 [package]
 name = "mars-xlog-core"
-version = "0.1.0-preview.1"
+version = "0.1.0-preview.2"
 edition = "2021"
 license = "MIT"
 description = "Core runtime building blocks for the Rust-native xlog engine."

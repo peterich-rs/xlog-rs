@@ -166,10 +166,19 @@ jobs:
           title="${{ steps.meta.outputs.release_title }}"
           core_action="${{ steps.publish_core.outputs.action }}"
           xlog_action="${{ steps.publish_xlog.outputs.action }}"
+          notes_source="docs/releases/${version}.md"
 
-          cat > artifacts/release_notes.md <<EOF
+          if [[ -f "${notes_source}" ]]; then
+            cp "${notes_source}" artifacts/release_notes.md
+            printf '\n\n' >> artifacts/release_notes.md
+          else
+            cat > artifacts/release_notes.md <<EOF
           ${title}
+          EOF
+            printf '\n' >> artifacts/release_notes.md
+          fi
 
+          cat >> artifacts/release_notes.md <<EOF
           Published crates:
 
           - \`mars-xlog-core ${version}\` (${core_action})

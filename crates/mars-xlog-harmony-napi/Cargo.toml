@@ -1,6 +1,6 @@
 [package]
 name    = "oh-xlog"
-version = "0.1.0-preview.1"
+version = "0.1.0-preview.2"
 edition = "2021"
 publish = false
 
@@ -14,7 +14,7 @@ default = ["rust-backend"]
 rust-backend = ["mars-xlog/rust-backend"]
 
 [dependencies]
-mars-xlog = { path = "../xlog", version = "0.1.0-preview.1", default-features = false, features = ["tracing"] }
+mars-xlog = { path = "../xlog", version = "0.1.0-preview.2", default-features = false, features = ["tracing"] }
 napi-ohos = { version = "1.0", default-features = false, features = [
     "napi8",
     "async",
