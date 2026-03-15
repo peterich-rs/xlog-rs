@@ -1,10 +1,38 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
-import 'package:xlog/xlog.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:xlog/xlog.dart';
+
+const _displayFontFamily = 'Avenir Next';
+const _displayFontFallback = <String>['Helvetica Neue', 'Segoe UI', 'Arial'];
+const _monoFontFamily = 'Menlo';
+const _monoFontFallback = <String>['SF Mono', 'Consolas', 'Courier New'];
+
+TextTheme _displayTextTheme(TextTheme base) {
+  return base.apply(
+    fontFamily: _displayFontFamily,
+    displayColor: const Color(0xFF0F172A),
+    bodyColor: const Color(0xFF0F172A),
+  );
+}
+
+TextStyle _monoStyle({
+  double? fontSize,
+  FontWeight? fontWeight,
+  Color? color,
+  double? height,
+}) {
+  return TextStyle(
+    fontFamily: _monoFontFamily,
+    fontFamilyFallback: _monoFontFallback,
+    fontSize: fontSize,
+    fontWeight: fontWeight,
+    color: color,
+    height: height,
+  );
+}
 
 void main() {
   runApp(const MarsXlogDiagnosticsApp());
@@ -28,7 +56,7 @@ class MarsXlogDiagnosticsApp extends StatelessWidget {
       title: 'xlog example',
       theme: baseTheme.copyWith(
         scaffoldBackgroundColor: const Color(0xFFF3EEE4),
-        textTheme: GoogleFonts.spaceGroteskTextTheme(baseTheme.textTheme),
+        textTheme: _displayTextTheme(baseTheme.textTheme),
         colorScheme: baseTheme.colorScheme.copyWith(
           primary: const Color(0xFF14532D),
           secondary: const Color(0xFFE07A2F),
@@ -570,7 +598,7 @@ class _DiagnosticsHomePageState extends State<DiagnosticsHomePage> {
               Expanded(
                 child: SelectableText(
                   'logDir: ${_logDir ?? 'bootstrapping...'}\ncacheDir: ${_cacheDir ?? 'bootstrapping...'}',
-                  style: GoogleFonts.ibmPlexMono(
+                  style: _monoStyle(
                     fontSize: 12,
                     color: const Color(0xFF334155),
                     height: 1.5,
@@ -746,7 +774,7 @@ class _DiagnosticsHomePageState extends State<DiagnosticsHomePage> {
               alignment: Alignment.centerLeft,
               child: Text(
                 'Last artifact: ${report.currentLogPath ?? 'n/a'}',
-                style: GoogleFonts.ibmPlexMono(fontSize: 12),
+                style: _monoStyle(fontSize: 12),
               ),
             ),
           ],
@@ -832,7 +860,7 @@ class _DiagnosticsHomePageState extends State<DiagnosticsHomePage> {
                     _decodedFileContent.isEmpty
                         ? 'Select a file to inspect decoded content.'
                         : _decodedFileContent,
-                    style: GoogleFonts.ibmPlexMono(
+                    style: _monoStyle(
                       fontSize: 12.5,
                       color: const Color(0xFFE2E8F0),
                       height: 1.55,
@@ -889,7 +917,7 @@ class _DiagnosticsHomePageState extends State<DiagnosticsHomePage> {
               _metricsSnapshot.isEmpty
                   ? 'Metrics snapshot will appear here after logger initialization.'
                   : _metricsSnapshot,
-              style: GoogleFonts.ibmPlexMono(
+              style: _monoStyle(
                 fontSize: 12.5,
                 color: const Color(0xFF334155),
                 height: 1.45,
@@ -920,7 +948,7 @@ class _DiagnosticsHomePageState extends State<DiagnosticsHomePage> {
                     ),
                     child: Text(
                       item,
-                      style: GoogleFonts.ibmPlexMono(
+                      style: _monoStyle(
                         fontSize: 12.5,
                         color: const Color(0xFF334155),
                       ),
@@ -984,7 +1012,7 @@ class _DiagnosticsHomePageState extends State<DiagnosticsHomePage> {
       ),
       child: Text(
         label,
-        style: GoogleFonts.ibmPlexMono(
+        style: _monoStyle(
           color: Colors.white,
           fontSize: 12,
           fontWeight: FontWeight.w600,
@@ -1011,7 +1039,7 @@ class _DiagnosticsHomePageState extends State<DiagnosticsHomePage> {
         children: [
           Text(
             title,
-            style: GoogleFonts.ibmPlexMono(
+            style: _monoStyle(
               fontSize: 11.5,
               color: Colors.white.withValues(alpha: 0.7),
             ),
@@ -1043,10 +1071,7 @@ class _DiagnosticsHomePageState extends State<DiagnosticsHomePage> {
         children: [
           Text(
             label,
-            style: GoogleFonts.ibmPlexMono(
-              fontSize: 11,
-              color: const Color(0xFF64748B),
-            ),
+            style: _monoStyle(fontSize: 11, color: const Color(0xFF64748B)),
           ),
           const SizedBox(height: 6),
           Text(
