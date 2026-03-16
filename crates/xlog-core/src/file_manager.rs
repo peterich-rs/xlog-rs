@@ -5,16 +5,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use chrono::{Datelike, Duration as ChronoDuration, Local};
+use chrono::{Duration as ChronoDuration, Local};
 use fs2::{available_space, FileExt};
 use thiserror::Error;
 
+use crate::file_naming::{
+    build_path_for_index, day_key, file_index_from_path, make_date_prefix,
+    make_date_prefix_from_day_key, LOG_EXT, LOG_EXT_WITH_DOT,
+};
 use crate::metrics::{
     record_cache_move, record_expired_delete, record_file_append, record_file_rotate,
 };
-
-const LOG_EXT: &str = "xlog";
-const LOG_EXT_WITH_DOT: &str = ".xlog";
 const CACHE_AVAILABLE_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
 // Keep-open sync path benefits from a moderate userspace append buffer under
 // contention without turning flush bursts into a new tail-latency problem.
@@ -590,7 +591,10 @@ impl FileManager {
         dir: &Path,
         max_file_size: u64,
     ) -> Option<bool> {
-        let mut runtime = self.runtime.lock().ok()?;
+        let mut runtime = self
+            .runtime
+            .lock()
+            .expect("file_manager runtime lock poisoned");
         let target = self.cached_target(&runtime, dir)?.clone();
         if target.day_key != day_key(now) {
             if let Some(slot) = self.cached_target_mut(&mut runtime, dir) {
@@ -713,9 +717,10 @@ impl FileManager {
     }
 
     fn mark_cached_path_removed(&self, path: &Path) {
-        let Ok(mut runtime) = self.runtime.lock() else {
-            return;
-        };
+        let mut runtime = self
+            .runtime
+            .lock()
+            .expect("file_manager runtime lock poisoned");
 
         if let Some(target) = runtime.log_target.as_mut() {
             if target.path == path {
@@ -1100,34 +1105,6 @@ impl FileManager {
     }
 }
 
-fn make_date_prefix(prefix: &str, timespan: i32) -> String {
-    let now = Local::now() - ChronoDuration::days(timespan as i64);
-    format!(
-        "{}_{:04}{:02}{:02}",
-        prefix,
-        now.year(),
-        now.month(),
-        now.day()
-    )
-}
-
-fn make_date_prefix_from_day_key(prefix: &str, day_key: i32) -> String {
-    let year = day_key / 10_000;
-    let month = (day_key / 100) % 100;
-    let day = day_key % 100;
-    format!("{prefix}_{year:04}{month:02}{day:02}")
-}
-
-fn build_path_for_index(dir: &Path, prefix: &str, day_key: i32, file_index: i64) -> PathBuf {
-    let date_prefix = make_date_prefix_from_day_key(prefix, day_key);
-    let file_name = if file_index == 0 {
-        format!("{date_prefix}.{LOG_EXT}")
-    } else {
-        format!("{date_prefix}_{file_index}.{LOG_EXT}")
-    };
-    dir.join(file_name)
-}
-
 fn lock_paths(log_dir: &Path, cache_dir: Option<&Path>, prefix: &str) -> Vec<PathBuf> {
     let mut dirs = vec![log_dir.to_path_buf()];
     if let Some(cache_dir) = cache_dir {
@@ -1147,25 +1124,6 @@ fn local_file_state(path: &Path) -> (bool, u64) {
         Ok(meta) => (true, meta.len()),
         Err(_) => (false, 0),
     }
-}
-
-fn file_index_from_path(path: &Path, prefix: &str) -> Option<i64> {
-    let name = path.file_name()?.to_str()?;
-    let base = name.strip_suffix(LOG_EXT_WITH_DOT)?;
-    let prefix_part = format!("{prefix}_");
-    if !name.starts_with(&prefix_part) {
-        return None;
-    }
-    let rest = &base[prefix_part.len() + 8..];
-    if rest.is_empty() {
-        Some(0)
-    } else {
-        rest.strip_prefix('_')?.parse().ok()
-    }
-}
-
-fn day_key(now: chrono::DateTime<Local>) -> i32 {
-    now.year() * 10_000 + (now.month() as i32) * 100 + now.day() as i32
 }
 
 fn append_file_to_file(src: &Path, dst: &Path) -> Result<(), FileManagerError> {
@@ -1424,7 +1382,8 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, SystemTime};
 
-    use super::{build_path_for_index, day_key, ActiveAppendFile, AppendTargetCache, FileManager};
+    use super::{ActiveAppendFile, AppendTargetCache, FileManager};
+    use crate::file_naming::{build_path_for_index, day_key};
     use chrono::{Datelike, Local};
     use filetime::{set_file_mtime, FileTime};
 

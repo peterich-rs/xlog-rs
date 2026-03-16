@@ -18,9 +18,8 @@
 
 1. recovery helper 在 `appender_engine.rs` 与 `oneshot.rs` 之间存在重复实现
 2. `FileManager` 复杂度偏高，后续仍值得拆分
-3. mutex poison 处理在少数 setter 路径上存在不一致，可能导致 state 副本与 atomic 副本分裂
-4. 若干 magic number / 临时分配 / 边界转换可以收口
-5. `compress.rs` 缺少 `ZlibStreamCompressor` roundtrip 测试
+3. `ConsoleLevel` 与 `LogLevel` 仍是两套接近的枚举
+4. `FileManager` 仍需继续拆分更深层的 append/cache 路由逻辑
 
 ## 1. 本轮已处理
 
@@ -44,6 +43,10 @@
 4. `file_manager.rs` 使用 `LOG_EXT_WITH_DOT`，消除热路径上的重复 `format!(".{LOG_EXT}")`
 5. `mmap_store.rs` 的零填充分配改为固定缓冲区分块写入
 6. `platform_console` 的短标签复用 `record::LogLevel::short()`
+7. `EngineMode` / `AsyncFlushReason` 改为 `#[repr(u8)]`，`AppenderEngine.mode` 收口为 `AtomicU8`
+8. `async_buffer_stats` / `async_buffer_snapshot`、`FileManager` 部分 runtime 访问、`InstanceRegistry` 查询改为 poison fast-fail
+9. `file_manager.rs` 的路径/日期命名辅助逻辑已抽到 `file_naming.rs`
+10. `ZlibStreamCompressor` / `ZstdStreamCompressor` 每次发射后都会清理内部输出缓冲，不再保留整块 pending block 已发射字节
 
 ### 1.3 补测试
 
@@ -51,6 +54,8 @@
 
 1. recovery helper 行为测试集中到 `recovery.rs`
 2. `ZlibStreamCompressor` roundtrip 测试已补充
+3. `platform_console` 非 Apple/Android fallback 格式已有单测
+4. `file_naming` 已有独立单测
 
 ## 2. 仍然成立的技术债
 
@@ -82,14 +87,6 @@
 
 两者语义相近，维护上容易漂移。当前已让 console 的短标签复用 `LogLevel::short()`，但类型本身仍未统一。
 
-### 2.3 压缩器内存保留策略仍可优化
-
-原审查里“无限增长”表述过重，不应保留。更准确的说法是：
-
-1. `ZlibStreamCompressor` / `ZstdStreamCompressor` 当前会保留本 pending block 已发射的编码输出
-2. 峰值内存随单个 pending block 大小增长，而不是随整个 engine 生命周期无限增长
-3. 如果后续要继续压低 async 峰值内存，可以评估 writer 直写或显式回收策略
-
 ## 3. 测试结论
 
 当前测试覆盖比原始审查里写得更完整：
@@ -97,11 +94,10 @@
 1. `AppenderEngine` 已有 async flush、startup recover、mode switch、timeout flush 等集成测试
 2. `oneshot_flush` 已有端到端恢复测试
 3. `mmap_recovery` 已覆盖 torn tail / pending block 恢复
+4. `platform_console` fallback 格式已有单测
+5. `file_naming` 已有单测
 
-仍值得继续补的主要是：
-
-1. `platform_console.rs` 非 Apple/Android fallback 行为测试
-2. 更细粒度的 `FileManager` 分层后测试
+仍值得继续补的主要是更细粒度的 `FileManager` 分层后测试。
 
 ## 4. 当前优先级
 
@@ -117,5 +113,5 @@
 
 ### P2
 
-1. 评估压缩器内存保留策略
-2. 增补 `platform_console` fallback 测试
+1. 继续压缩 `FileManager` 复杂度
+2. 评估是否进一步统一 console / record level 类型

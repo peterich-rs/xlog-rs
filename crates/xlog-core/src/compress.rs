@@ -31,7 +31,6 @@ pub trait StreamCompressor {
 /// Raw-deflate stream compressor compatible with Mars zlib settings.
 pub struct ZlibStreamCompressor {
     inner: flate2::write::DeflateEncoder<Vec<u8>>,
-    emitted: usize,
 }
 
 impl ZlibStreamCompressor {
@@ -40,7 +39,6 @@ impl ZlibStreamCompressor {
         let level = level.clamp(0, 9) as u32;
         Self {
             inner: flate2::write::DeflateEncoder::new(Vec::new(), Compression::new(level)),
-            emitted: 0,
         }
     }
 }
@@ -59,11 +57,7 @@ impl StreamCompressor for ZlibStreamCompressor {
         self.inner
             .flush()
             .map_err(|e| CompressError::Zlib(e.to_string()))?;
-        let encoded = self.inner.get_ref();
-        if encoded.len() > self.emitted {
-            output.extend_from_slice(&encoded[self.emitted..]);
-            self.emitted = encoded.len();
-        }
+        drain_encoded_bytes(self.inner.get_mut(), output);
         Ok(())
     }
 
@@ -71,11 +65,7 @@ impl StreamCompressor for ZlibStreamCompressor {
         self.inner
             .try_finish()
             .map_err(|e| CompressError::Zlib(e.to_string()))?;
-        let encoded = self.inner.get_ref();
-        if encoded.len() > self.emitted {
-            output.extend_from_slice(&encoded[self.emitted..]);
-            self.emitted = encoded.len();
-        }
+        drain_encoded_bytes(self.inner.get_mut(), output);
         Ok(())
     }
 }
@@ -113,7 +103,6 @@ impl StreamCompressor for ZstdChunkCompressor {
 /// emitting the final frame epilogue in `flush()`.
 pub struct ZstdStreamCompressor {
     inner: Option<zstd::stream::write::Encoder<'static, Vec<u8>>>,
-    emitted: usize,
 }
 
 impl ZstdStreamCompressor {
@@ -126,7 +115,6 @@ impl ZstdStreamCompressor {
             .map_err(|e| CompressError::Zstd(e.to_string()))?;
         Ok(Self {
             inner: Some(encoder),
-            emitted: 0,
         })
     }
 }
@@ -144,11 +132,7 @@ impl StreamCompressor for ZstdStreamCompressor {
         encoder
             .flush()
             .map_err(|e| CompressError::Zstd(e.to_string()))?;
-        let encoded = encoder.get_ref();
-        if encoded.len() > self.emitted {
-            output.extend_from_slice(&encoded[self.emitted..]);
-            self.emitted = encoded.len();
-        }
+        drain_encoded_bytes(encoder.get_mut(), output);
         Ok(())
     }
 
@@ -156,15 +140,20 @@ impl StreamCompressor for ZstdStreamCompressor {
         let Some(encoder) = self.inner.take() else {
             return Ok(());
         };
-        let encoded = encoder
+        let mut encoded = encoder
             .finish()
             .map_err(|e| CompressError::Zstd(e.to_string()))?;
-        if encoded.len() > self.emitted {
-            output.extend_from_slice(&encoded[self.emitted..]);
-            self.emitted = encoded.len();
-        }
+        drain_encoded_bytes(&mut encoded, output);
         Ok(())
     }
+}
+
+fn drain_encoded_bytes(encoded: &mut Vec<u8>, output: &mut Vec<u8>) {
+    if encoded.is_empty() {
+        return;
+    }
+    output.extend_from_slice(encoded);
+    encoded.clear();
 }
 
 /// Decompresses raw-deflate data produced by the zlib stream compressor.
@@ -206,6 +195,23 @@ mod tests {
         compressor.flush(&mut encoded).unwrap();
 
         assert_eq!(decompress_raw_zlib(&encoded).unwrap(), b"mars xlog");
+    }
+
+    #[test]
+    fn stream_compressors_release_emitted_bytes_after_each_chunk() {
+        let mut zlib = ZlibStreamCompressor::new(6);
+        let mut zlib_out = Vec::new();
+        zlib.compress_chunk(b"mars", &mut zlib_out).unwrap();
+        assert!(zlib.inner.get_ref().is_empty());
+        zlib.compress_chunk(b" xlog", &mut zlib_out).unwrap();
+        assert!(zlib.inner.get_ref().is_empty());
+
+        let mut zstd = ZstdStreamCompressor::new(3).unwrap();
+        let mut zstd_out = Vec::new();
+        zstd.compress_chunk(b"mars", &mut zstd_out).unwrap();
+        assert!(zstd.inner.as_ref().unwrap().get_ref().is_empty());
+        zstd.compress_chunk(b" xlog", &mut zstd_out).unwrap();
+        assert!(zstd.inner.as_ref().unwrap().get_ref().is_empty());
     }
 
     #[test]

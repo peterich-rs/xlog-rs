@@ -55,7 +55,7 @@ impl<T> InstanceRegistry<T> {
 
     /// Return the live named instance if it still exists.
     pub fn get(&self, name: &str) -> Option<Arc<T>> {
-        let map = self.instances.lock().ok()?;
+        let map = self.instances.lock().expect("instances lock poisoned");
         map.get(name)?.upgrade()
     }
 
@@ -67,7 +67,7 @@ impl<T> InstanceRegistry<T> {
 
     /// Return the current default instance, if any.
     pub fn default_instance(&self) -> Option<Arc<T>> {
-        self.default.lock().ok()?.clone()
+        self.default.lock().expect("default lock poisoned").clone()
     }
 
     /// Clear the current default instance reference.

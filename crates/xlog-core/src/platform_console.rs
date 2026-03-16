@@ -158,15 +158,7 @@ pub fn write_console_line(
                 return;
             }
             if mode == AppleConsoleFun::NsLog as u8 {
-                let text = format!(
-                    "[{}][{}][{}:{}, {}][{}",
-                    level_short(level),
-                    tag,
-                    file_name,
-                    line,
-                    func_name,
-                    msg
-                );
+                let text = format_basic_console_line(level, tag, file_name, func_name, line, msg);
                 let c_line = to_console_cstring(&text);
                 unsafe {
                     xlog_core_apple_console_nslog(c_line.as_ptr());
@@ -205,13 +197,8 @@ pub fn write_console_line(
         )))]
         {
             eprintln!(
-                "[{}][{}][{}:{}, {}][{}",
-                level_short(level),
-                tag,
-                file_name,
-                line,
-                func_name,
-                msg
+                "{}",
+                format_basic_console_line(level, tag, file_name, func_name, line, msg)
             );
         }
     }
@@ -219,6 +206,25 @@ pub fn write_console_line(
 
 fn level_short(level: ConsoleLevel) -> &'static str {
     LogLevel::from(level).short()
+}
+
+fn format_basic_console_line(
+    level: ConsoleLevel,
+    tag: &str,
+    file_name: &str,
+    func_name: &str,
+    line: u32,
+    msg: &str,
+) -> String {
+    format!(
+        "[{}][{}][{}:{}, {}][{}",
+        level_short(level),
+        tag,
+        file_name,
+        line,
+        func_name,
+        msg
+    )
 }
 
 #[cfg(any(
@@ -311,4 +317,22 @@ unsafe extern "C" {
         func: *const libc::c_char,
         msg: *const libc::c_char,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_basic_console_line, ConsoleLevel};
+
+    #[test]
+    fn format_basic_console_line_matches_stderr_layout() {
+        let line =
+            format_basic_console_line(ConsoleLevel::Warn, "core", "main.rs", "write", 42, "hello");
+        assert_eq!(line, "[W][core][main.rs:42, write][hello");
+    }
+
+    #[test]
+    fn format_basic_console_line_keeps_empty_func_slot() {
+        let line = format_basic_console_line(ConsoleLevel::Info, "core", "main.rs", "", 7, "msg");
+        assert_eq!(line, "[I][core][main.rs:7, ][msg");
+    }
 }

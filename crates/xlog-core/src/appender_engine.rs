@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -29,6 +29,7 @@ const EXPIRED_SWEEP_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const CACHE_MOVE_INTERVAL: Duration = Duration::from_secs(3 * 60);
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(u8)]
 /// Runtime mode used by [`AppenderEngine`].
 pub enum EngineMode {
     /// Buffer blocks in mmap/cache state and let the worker flush them later.
@@ -38,6 +39,7 @@ pub enum EngineMode {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(u8)]
 /// Reason attached to an async flush request or observed flush epoch.
 pub enum AsyncFlushReason {
     /// No concrete reason was recorded.
@@ -98,7 +100,7 @@ enum EngineCommand {
 /// The engine owns the mmap-backed async buffer, the active file manager, and
 /// the worker thread that drains async state into `.xlog` files.
 pub struct AppenderEngine {
-    mode: AtomicI32,
+    mode: AtomicU8,
     file_manager: FileManager,
     state: Arc<Mutex<EngineState>>,
     buffer_capacity: usize,
@@ -193,7 +195,7 @@ impl AppenderEngine {
             .expect("spawn appender engine thread");
 
         Self {
-            mode: AtomicI32::new(mode_to_i32(mode)),
+            mode: AtomicU8::new(mode as u8),
             file_manager,
             state,
             buffer_capacity,
@@ -210,7 +212,7 @@ impl AppenderEngine {
 
     /// Return the current engine mode.
     pub fn mode(&self) -> EngineMode {
-        i32_to_mode(self.mode.load(Ordering::Relaxed))
+        engine_mode_from_u8(self.mode.load(Ordering::Relaxed))
     }
 
     /// Switch the engine between async and sync modes.
@@ -218,7 +220,7 @@ impl AppenderEngine {
     /// Switching from async to sync forces a synchronous drain first so the
     /// caller does not leave buffered async data behind.
     pub fn set_mode(&self, mode: EngineMode) -> Result<(), AppenderEngineError> {
-        let old = i32_to_mode(self.mode.swap(mode_to_i32(mode), Ordering::Relaxed));
+        let old = engine_mode_from_u8(self.mode.swap(mode as u8, Ordering::Relaxed));
         if old == EngineMode::Async && mode == EngineMode::Sync {
             self.request_flush(true, true, AsyncFlushReason::Explicit)?;
         }
@@ -475,10 +477,8 @@ impl AppenderEngine {
         if self.mode() != EngineMode::Async {
             return None;
         }
-        self.state
-            .lock()
-            .ok()
-            .map(|s| (s.buffer.len(), s.buffer.capacity()))
+        let state = self.state.lock().expect("state lock poisoned");
+        Some((state.buffer.len(), state.buffer.capacity()))
     }
 
     /// Snapshot the current async buffer contents, or `None` in sync mode.
@@ -486,7 +486,14 @@ impl AppenderEngine {
         if self.mode() != EngineMode::Async {
             return None;
         }
-        self.state.lock().ok().map(|s| s.buffer.as_bytes().to_vec())
+        Some(
+            self.state
+                .lock()
+                .expect("state lock poisoned")
+                .buffer
+                .as_bytes()
+                .to_vec(),
+        )
     }
 
     /// Return the fixed capacity of the backing async buffer.
@@ -888,37 +895,23 @@ fn maybe_housekeep_locked(state: &mut EngineState, force: bool) -> Result<(), Ap
     Ok(())
 }
 
-fn mode_to_i32(mode: EngineMode) -> i32 {
-    match mode {
-        EngineMode::Async => 0,
-        EngineMode::Sync => 1,
-    }
-}
-
-fn i32_to_mode(v: i32) -> EngineMode {
-    if v == 1 {
-        EngineMode::Sync
-    } else {
-        EngineMode::Async
+fn engine_mode_from_u8(v: u8) -> EngineMode {
+    match v {
+        x if x == EngineMode::Sync as u8 => EngineMode::Sync,
+        _ => EngineMode::Async,
     }
 }
 
 fn async_flush_reason_to_u8(reason: AsyncFlushReason) -> u8 {
-    match reason {
-        AsyncFlushReason::Unknown => 0,
-        AsyncFlushReason::Threshold => 1,
-        AsyncFlushReason::Explicit => 2,
-        AsyncFlushReason::Timeout => 3,
-        AsyncFlushReason::Stop => 4,
-    }
+    reason as u8
 }
 
 fn u8_to_async_flush_reason(value: u8) -> AsyncFlushReason {
     match value {
-        1 => AsyncFlushReason::Threshold,
-        2 => AsyncFlushReason::Explicit,
-        3 => AsyncFlushReason::Timeout,
-        4 => AsyncFlushReason::Stop,
+        x if x == AsyncFlushReason::Threshold as u8 => AsyncFlushReason::Threshold,
+        x if x == AsyncFlushReason::Explicit as u8 => AsyncFlushReason::Explicit,
+        x if x == AsyncFlushReason::Timeout as u8 => AsyncFlushReason::Timeout,
+        x if x == AsyncFlushReason::Stop as u8 => AsyncFlushReason::Stop,
         _ => AsyncFlushReason::Unknown,
     }
 }
@@ -936,16 +929,16 @@ fn async_flush_reason_label(reason: AsyncFlushReason) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        async_buffer_flush_threshold, async_flush_reason_to_u8, i32_to_mode, mode_to_i32,
+        async_buffer_flush_threshold, async_flush_reason_to_u8, engine_mode_from_u8,
         u8_to_async_flush_reason, AsyncFlushReason, EngineMode,
     };
 
     #[test]
     fn mode_and_async_flush_reason_roundtrip() {
         for mode in [EngineMode::Async, EngineMode::Sync] {
-            assert_eq!(i32_to_mode(mode_to_i32(mode)), mode);
+            assert_eq!(engine_mode_from_u8(mode as u8), mode);
         }
-        assert_eq!(i32_to_mode(99), EngineMode::Async);
+        assert_eq!(engine_mode_from_u8(99), EngineMode::Async);
 
         for reason in [
             AsyncFlushReason::Unknown,

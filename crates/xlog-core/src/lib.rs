@@ -17,6 +17,7 @@ pub mod crypto;
 pub mod dump;
 /// File lifecycle, cache movement, and active log append helpers.
 pub mod file_manager;
+mod file_naming;
 /// Line formatter used by the Rust runtime path.
 pub mod formatter;
 mod metrics;
