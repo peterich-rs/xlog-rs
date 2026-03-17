@@ -14,11 +14,9 @@
 3. `FileManager` 仍是当前 correctness active blocker，这条不成立；单写者约束已通过 `log_dir/cache_dir` 锁、README 和回归测试显式化
 4. `AppenderEngine` 在高并发 sync 路径上统一争抢 `EngineState` 锁，这条不成立；sync `write_block()` 不进入 `EngineState` mutex
 
-保留并成立的重点有：
+当前只剩一个仍然成立且未完全处理的问题：
 
-1. recovery helper 在 `appender_engine.rs` 与 `oneshot.rs` 之间存在重复实现
-2. `FileManager` 复杂度偏高，后续仍值得拆分
-3. `FileManager` 仍需继续拆分更深层的 append/cache 路由逻辑
+1. `FileManager` 复杂度偏高，仍需继续拆分更深层的 append/cache 路由与 target cache 状态管理逻辑
 
 ## 1. 本轮已处理
 
