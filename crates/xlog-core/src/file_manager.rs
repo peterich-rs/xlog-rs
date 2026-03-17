@@ -84,6 +84,227 @@ struct RuntimeState {
     cache_target: Option<AppendTargetCache>,
 }
 
+impl RuntimeState {
+    fn target_for_dir<'a>(
+        &'a self,
+        log_dir: &Path,
+        cache_dir: Option<&Path>,
+        dir: &Path,
+    ) -> Option<&'a AppendTargetCache> {
+        if dir == log_dir {
+            self.log_target.as_ref()
+        } else if cache_dir == Some(dir) {
+            self.cache_target.as_ref()
+        } else {
+            None
+        }
+    }
+
+    fn target_slot_for_dir<'a>(
+        &'a mut self,
+        log_dir: &Path,
+        cache_dir: Option<&Path>,
+        dir: &Path,
+    ) -> Option<&'a mut Option<AppendTargetCache>> {
+        if dir == log_dir {
+            Some(&mut self.log_target)
+        } else if cache_dir == Some(dir) {
+            Some(&mut self.cache_target)
+        } else {
+            None
+        }
+    }
+
+    fn set_target_for_dir(
+        &mut self,
+        log_dir: &Path,
+        cache_dir: Option<&Path>,
+        dir: &Path,
+        target: AppendTargetCache,
+    ) {
+        if let Some(slot) = self.target_slot_for_dir(log_dir, cache_dir, dir) {
+            *slot = Some(target);
+        }
+    }
+
+    fn record_last_append(&mut self, now_ts: i64, path: &Path) {
+        self.last_append_time = Some(now_ts);
+        self.last_append_path = Some(path.to_path_buf());
+    }
+
+    fn next_cached_path(
+        &mut self,
+        log_dir: &Path,
+        cache_dir: Option<&Path>,
+        now_ts: i64,
+        dir: &Path,
+        day_key: i32,
+        prefix: &str,
+        max_file_size: u64,
+    ) -> Option<PathBuf> {
+        let target = self.target_for_dir(log_dir, cache_dir, dir)?.clone();
+        if target.day_key != day_key {
+            if let Some(slot) = self.target_slot_for_dir(log_dir, cache_dir, dir) {
+                *slot = None;
+            }
+            return None;
+        }
+        if max_file_size > 0 && target.merged_len > max_file_size {
+            let next = AppendTargetCache {
+                path: build_path_for_index(dir, prefix, target.day_key, target.file_index + 1),
+                day_key,
+                file_index: target.file_index + 1,
+                merged_len: 0,
+                local_len: 0,
+                local_exists: false,
+            };
+            record_file_rotate();
+            self.set_target_for_dir(log_dir, cache_dir, dir, next.clone());
+            self.record_last_append(now_ts, &next.path);
+            return Some(next.path);
+        }
+        self.record_last_append(now_ts, &target.path);
+        Some(target.path)
+    }
+
+    fn cached_local_exists_for_day(
+        &mut self,
+        log_dir: &Path,
+        cache_dir: Option<&Path>,
+        dir: &Path,
+        current_day: i32,
+        max_file_size: u64,
+    ) -> Option<bool> {
+        let target = self.target_for_dir(log_dir, cache_dir, dir)?.clone();
+        if target.day_key != current_day {
+            if let Some(slot) = self.target_slot_for_dir(log_dir, cache_dir, dir) {
+                *slot = None;
+            }
+            return None;
+        }
+        if max_file_size > 0 && target.merged_len > max_file_size {
+            if let Some(slot) = self.target_slot_for_dir(log_dir, cache_dir, dir) {
+                *slot = None;
+            }
+            return None;
+        }
+        Some(target.local_exists)
+    }
+
+    fn cached_local_len_for_path(&self, path: &Path, day_key: i32) -> Option<u64> {
+        for target in [self.log_target.as_ref(), self.cache_target.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if target.day_key == day_key && target.path == path {
+                return Some(target.local_len);
+            }
+        }
+        None
+    }
+
+    fn merged_len_after_append(
+        &self,
+        path: &Path,
+        day_key: i32,
+        delta: u64,
+        current_len: u64,
+    ) -> u64 {
+        let file_name = path.file_name();
+        for target in [self.log_target.as_ref(), self.cache_target.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if target.day_key == day_key && target.path.file_name() == file_name {
+                return target.merged_len.saturating_add(delta);
+            }
+        }
+        current_len
+    }
+
+    fn update_target_after_append(
+        &mut self,
+        log_dir: &Path,
+        cache_dir: Option<&Path>,
+        name_prefix: &str,
+        path: &Path,
+        day_key: i32,
+        merged_len: u64,
+        current_len: u64,
+    ) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let file_name = path.file_name();
+        let now_ts = Local::now().timestamp();
+
+        let mut matched_current_dir = false;
+        if let Some(target) = self.log_target.as_mut() {
+            if target.day_key == day_key && target.path.file_name() == file_name {
+                target.merged_len = merged_len;
+                if target.path == path {
+                    target.local_exists = true;
+                    target.local_len = current_len;
+                    matched_current_dir = true;
+                }
+            }
+        }
+        if let Some(target) = self.cache_target.as_mut() {
+            if target.day_key == day_key && target.path.file_name() == file_name {
+                target.merged_len = merged_len;
+                if target.path == path {
+                    target.local_exists = true;
+                    target.local_len = current_len;
+                    matched_current_dir = true;
+                }
+            }
+        }
+
+        if !matched_current_dir {
+            self.set_target_for_dir(
+                log_dir,
+                cache_dir,
+                parent,
+                AppendTargetCache {
+                    path: path.to_path_buf(),
+                    day_key,
+                    file_index: file_index_from_path(path, name_prefix).unwrap_or(0),
+                    merged_len,
+                    local_len: current_len,
+                    local_exists: true,
+                },
+            );
+        }
+        self.record_last_append(now_ts, path);
+    }
+
+    fn mark_path_removed(&mut self, path: &Path) {
+        if let Some(target) = self.log_target.as_mut() {
+            if target.path == path {
+                target.local_exists = false;
+                target.local_len = 0;
+            }
+        }
+        if let Some(target) = self.cache_target.as_mut() {
+            if target.path == path {
+                target.local_exists = false;
+                target.local_len = 0;
+            }
+        }
+        if self
+            .active_file
+            .as_ref()
+            .map(|active| active.path.as_path())
+            == Some(path)
+        {
+            self.active_file = None;
+        }
+        if self.last_append_path.as_deref() == Some(path) {
+            self.last_append_path = None;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AppendTargetCache {
     path: PathBuf,
@@ -426,79 +647,6 @@ impl FileManager {
         Ok(())
     }
 
-    fn cached_target<'a>(
-        &self,
-        runtime: &'a RuntimeState,
-        dir: &Path,
-    ) -> Option<&'a AppendTargetCache> {
-        if dir == self.log_dir.as_path() {
-            runtime.log_target.as_ref()
-        } else if self.cache_dir.as_deref() == Some(dir) {
-            runtime.cache_target.as_ref()
-        } else {
-            None
-        }
-    }
-
-    fn cached_target_mut<'a>(
-        &self,
-        runtime: &'a mut RuntimeState,
-        dir: &Path,
-    ) -> Option<&'a mut Option<AppendTargetCache>> {
-        if dir == self.log_dir.as_path() {
-            Some(&mut runtime.log_target)
-        } else if self.cache_dir.as_deref() == Some(dir) {
-            Some(&mut runtime.cache_target)
-        } else {
-            None
-        }
-    }
-
-    fn set_cached_target(&self, runtime: &mut RuntimeState, dir: &Path, target: AppendTargetCache) {
-        if let Some(slot) = self.cached_target_mut(runtime, dir) {
-            *slot = Some(target);
-        }
-    }
-
-    fn record_last_append(runtime: &mut RuntimeState, now_ts: i64, path: &Path) {
-        runtime.last_append_time = Some(now_ts);
-        runtime.last_append_path = Some(path.to_path_buf());
-    }
-
-    fn cached_target_path(
-        &self,
-        runtime: &mut RuntimeState,
-        now_ts: i64,
-        dir: &Path,
-        day_key: i32,
-        prefix: &str,
-        max_file_size: u64,
-    ) -> Option<PathBuf> {
-        let target = self.cached_target(runtime, dir)?.clone();
-        if target.day_key != day_key {
-            if let Some(slot) = self.cached_target_mut(runtime, dir) {
-                *slot = None;
-            }
-            return None;
-        }
-        if max_file_size > 0 && target.merged_len > max_file_size {
-            let next = AppendTargetCache {
-                path: build_path_for_index(dir, prefix, target.day_key, target.file_index + 1),
-                day_key,
-                file_index: target.file_index + 1,
-                merged_len: 0,
-                local_len: 0,
-                local_exists: false,
-            };
-            record_file_rotate();
-            self.set_cached_target(runtime, dir, next.clone());
-            Self::record_last_append(runtime, now_ts, &next.path);
-            return Some(next.path);
-        }
-        Self::record_last_append(runtime, now_ts, &target.path);
-        Some(target.path)
-    }
-
     fn cached_local_exists(
         &self,
         now: chrono::DateTime<Local>,
@@ -509,20 +657,13 @@ impl FileManager {
             .runtime
             .lock()
             .expect("file_manager runtime lock poisoned");
-        let target = self.cached_target(&runtime, dir)?.clone();
-        if target.day_key != day_key(now) {
-            if let Some(slot) = self.cached_target_mut(&mut runtime, dir) {
-                *slot = None;
-            }
-            return None;
-        }
-        if max_file_size > 0 && target.merged_len > max_file_size {
-            if let Some(slot) = self.cached_target_mut(&mut runtime, dir) {
-                *slot = None;
-            }
-            return None;
-        }
-        Some(target.local_exists)
+        runtime.cached_local_exists_for_day(
+            self.log_dir.as_path(),
+            self.cache_dir.as_deref(),
+            dir,
+            day_key(now),
+            max_file_size,
+        )
     }
 
     fn try_append_active_plain_keep_open(
@@ -557,108 +698,12 @@ impl FileManager {
         Ok(true)
     }
 
-    fn update_cached_target_after_append(
-        &self,
-        runtime: &mut RuntimeState,
-        path: &Path,
-        day_key: i32,
-        merged_len: u64,
-        current_len: u64,
-    ) {
-        let Some(parent) = path.parent() else {
-            return;
-        };
-        let file_name = path.file_name();
-        let now_ts = Local::now().timestamp();
-
-        let mut matched_current_dir = false;
-        if let Some(target) = runtime.log_target.as_mut() {
-            if target.day_key == day_key && target.path.file_name() == file_name {
-                target.merged_len = merged_len;
-                if target.path == path {
-                    target.local_exists = true;
-                    target.local_len = current_len;
-                    matched_current_dir = true;
-                }
-            }
-        }
-        if let Some(target) = runtime.cache_target.as_mut() {
-            if target.day_key == day_key && target.path.file_name() == file_name {
-                target.merged_len = merged_len;
-                if target.path == path {
-                    target.local_exists = true;
-                    target.local_len = current_len;
-                    matched_current_dir = true;
-                }
-            }
-        }
-
-        if !matched_current_dir {
-            self.set_cached_target(
-                runtime,
-                parent,
-                AppendTargetCache {
-                    path: path.to_path_buf(),
-                    day_key,
-                    file_index: file_index_from_path(path, &self.name_prefix).unwrap_or(0),
-                    merged_len,
-                    local_len: current_len,
-                    local_exists: true,
-                },
-            );
-        }
-        Self::record_last_append(runtime, now_ts, path);
-    }
-
-    fn merged_len_after_append(
-        &self,
-        path: &Path,
-        runtime: &RuntimeState,
-        day_key: i32,
-        delta: u64,
-        current_len: u64,
-    ) -> u64 {
-        let file_name = path.file_name();
-        for target in [runtime.log_target.as_ref(), runtime.cache_target.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            if target.day_key == day_key && target.path.file_name() == file_name {
-                return target.merged_len.saturating_add(delta);
-            }
-        }
-        current_len
-    }
-
     fn mark_cached_path_removed(&self, path: &Path) {
         let mut runtime = self
             .runtime
             .lock()
             .expect("file_manager runtime lock poisoned");
-
-        if let Some(target) = runtime.log_target.as_mut() {
-            if target.path == path {
-                target.local_exists = false;
-                target.local_len = 0;
-            }
-        }
-        if let Some(target) = runtime.cache_target.as_mut() {
-            if target.path == path {
-                target.local_exists = false;
-                target.local_len = 0;
-            }
-        }
-        if runtime
-            .active_file
-            .as_ref()
-            .map(|active| active.path.as_path())
-            == Some(path)
-        {
-            runtime.active_file = None;
-        }
-        if runtime.last_append_path.as_deref() == Some(path) {
-            runtime.last_append_path = None;
-        }
+        runtime.mark_path_removed(path);
     }
 
     fn should_cache_logs(&self, now: chrono::DateTime<Local>, max_file_size: u64) -> bool {
@@ -820,7 +865,7 @@ impl FileManager {
             if let Some(active) = runtime.active_file.as_ref() {
                 if active.day_key == day_key && active.path.parent() == Some(dir) {
                     let path = active.path.clone();
-                    Self::record_last_append(runtime, now_ts, &path);
+                    runtime.record_last_append(now_ts, &path);
                     return path;
                 }
             }
@@ -833,15 +878,26 @@ impl FileManager {
                 }
             }
         }
-        if let Some(path) =
-            self.cached_target_path(runtime, now_ts, dir, day_key, prefix, max_file_size)
-        {
+        if let Some(path) = runtime.next_cached_path(
+            self.log_dir.as_path(),
+            self.cache_dir.as_deref(),
+            now_ts,
+            dir,
+            day_key,
+            prefix,
+            max_file_size,
+        ) {
             return path;
         }
 
         let target = self.resolve_append_target(now, dir, prefix, max_file_size);
-        self.set_cached_target(runtime, dir, target.clone());
-        Self::record_last_append(runtime, now_ts, &target.path);
+        runtime.set_target_for_dir(
+            self.log_dir.as_path(),
+            self.cache_dir.as_deref(),
+            dir,
+            target.clone(),
+        );
+        runtime.record_last_append(now_ts, &target.path);
         target.path
     }
 
@@ -865,7 +921,7 @@ impl FileManager {
         let cached_local_len = if active_matches {
             None
         } else {
-            self.cached_local_len_for_path(runtime, &path_buf, day_key)
+            runtime.cached_local_len_for_path(&path_buf, day_key)
         };
 
         let must_reopen = runtime
@@ -923,9 +979,16 @@ impl FileManager {
 
         if let Ok(current_len) = result {
             record_file_append(written as usize, append_begin.elapsed(), keep_open);
-            let merged_len =
-                self.merged_len_after_append(path, runtime, day_key, written, current_len);
-            self.update_cached_target_after_append(runtime, path, day_key, merged_len, current_len);
+            let merged_len = runtime.merged_len_after_append(path, day_key, written, current_len);
+            runtime.update_target_after_append(
+                self.log_dir.as_path(),
+                self.cache_dir.as_deref(),
+                &self.name_prefix,
+                path,
+                day_key,
+                merged_len,
+                current_len,
+            );
         }
 
         if result.is_ok() && durable {
@@ -1022,23 +1085,6 @@ impl FileManager {
             local_len,
             local_exists,
         }
-    }
-
-    fn cached_local_len_for_path(
-        &self,
-        runtime: &RuntimeState,
-        path: &Path,
-        day_key: i32,
-    ) -> Option<u64> {
-        for target in [runtime.log_target.as_ref(), runtime.cache_target.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            if target.day_key == day_key && target.path == path {
-                return Some(target.local_len);
-            }
-        }
-        None
     }
 
     fn next_file_index_state(&self, date_prefix: &str, max_file_size: u64) -> (i64, u64) {
