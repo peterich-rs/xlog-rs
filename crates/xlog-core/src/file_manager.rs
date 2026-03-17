@@ -1,9 +1,8 @@
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Instant;
 
 use chrono::{Duration as ChronoDuration, Local};
 use fs2::{available_space, FileExt};
@@ -13,14 +12,14 @@ use crate::active_append::{
     append_slices_direct, append_slices_keep_open, flush_active_append_file, rollback_file_to_len,
     sync_active_append_file_data, ActiveAppendFile, ACTIVE_APPEND_BUFFER_CAPACITY,
 };
-use crate::file_naming::{
-    build_path_for_index, day_key, make_date_prefix, make_date_prefix_from_day_key, LOG_EXT,
-    LOG_EXT_WITH_DOT,
-};
-use crate::file_runtime::{AppendTargetCache, RuntimeState};
-use crate::metrics::{record_cache_move, record_expired_delete, record_file_append};
+use crate::file_maintenance::{delete_expired_files, move_old_cache_files, CacheMaintenance};
+use crate::file_naming::{day_key, make_date_prefix, LOG_EXT_WITH_DOT};
+use crate::file_ops::append_file_to_file;
+use crate::file_policy::{AppendRoutePlan, CacheRoutePlanner};
+use crate::file_runtime::{RuntimeState, TargetDirs};
+use crate::file_target::resolve_append_target;
+use crate::metrics::record_file_append;
 const CACHE_AVAILABLE_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
-const FILE_COPY_BUFFER_SIZE: usize = 128 * 1024;
 
 #[derive(Debug, Error)]
 /// Errors produced while selecting log targets or mutating log/cache files.
@@ -74,19 +73,11 @@ pub struct FileManager {
     _lock_files: Arc<Vec<File>>,
 }
 
-#[derive(Debug)]
-enum CacheAppendPlan {
-    AppendToPath {
-        path: PathBuf,
-        promote_after_append: bool,
-    },
-    PreferLogThenCache {
-        log_path: PathBuf,
-        cache_path: PathBuf,
-    },
-}
-
 impl FileManager {
+    fn target_dirs(&self) -> TargetDirs<'_> {
+        TargetDirs::new(self.log_dir.as_path(), self.cache_dir.as_deref())
+    }
+
     /// Creates a file manager for the given log and optional cache directories.
     pub fn new(
         log_dir: PathBuf,
@@ -261,16 +252,7 @@ impl FileManager {
             return self.append_log_slices_plain(slices, now, max_file_size, keep_open, durable);
         }
 
-        let cache_dir = self.cache_dir.as_ref().expect("cache_dir is_some");
-        self.append_log_slices_with_cache(
-            cache_dir,
-            slices,
-            now,
-            max_file_size,
-            move_file,
-            keep_open,
-            durable,
-        )
+        self.append_log_slices_with_cache(slices, now, max_file_size, move_file, keep_open, durable)
     }
 
     /// Moves eligible cache files into the primary log directory.
@@ -278,48 +260,14 @@ impl FileManager {
     /// Files newer than `cache_days` are left in place. When no cache directory is
     /// configured, this is a no-op.
     pub fn move_old_cache_files(&self, _max_file_size: u64) -> Result<(), FileManagerError> {
-        let Some(cache_dir) = &self.cache_dir else {
-            return Ok(());
-        };
-        if cache_dir == &self.log_dir {
-            return Ok(());
-        }
-        if !cache_dir.is_dir() {
-            return Ok(());
-        }
-
         self.flush_active_file_if_needed()?;
-
-        let now = SystemTime::now();
-        let entries =
-            fs::read_dir(cache_dir).map_err(|e| FileManagerError::ReadDir(cache_dir.clone(), e))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| FileManagerError::ReadDir(cache_dir.clone(), e))?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
-                continue;
-            };
-            if !file_name.starts_with(&self.name_prefix) || !file_name.ends_with(LOG_EXT_WITH_DOT) {
-                continue;
-            }
-
-            if self.cache_days > 0 {
-                let modified = file_mtime(&path)?;
-                let Ok(age) = now.duration_since(modified) else {
-                    continue;
-                };
-                if age < Duration::from_secs(self.cache_days as u64 * 24 * 60 * 60) {
-                    continue;
-                }
-            }
-
-            let dest = self.log_dir.join(file_name);
-            append_file_to_file(&path, &dest)?;
-            fs::remove_file(&path).map_err(|e| FileManagerError::RemoveFile(path, e))?;
-            record_cache_move();
+        for path in move_old_cache_files(CacheMaintenance {
+            log_dir: &self.log_dir,
+            cache_dir: self.cache_dir.as_deref(),
+            name_prefix: &self.name_prefix,
+            cache_days: self.cache_days,
+        })? {
+            self.mark_runtime_path_removed(&path);
         }
 
         Ok(())
@@ -327,14 +275,11 @@ impl FileManager {
 
     /// Deletes log and cache files whose modification time exceeds `max_alive_seconds`.
     pub fn delete_expired_files(&self, max_alive_seconds: i64) -> Result<(), FileManagerError> {
-        if max_alive_seconds <= 0 {
-            return Ok(());
-        }
         self.flush_active_file_if_needed()?;
-        let threshold = Duration::from_secs(max_alive_seconds as u64);
-        self.delete_expired_under(&self.log_dir, threshold)?;
-        if let Some(cache_dir) = &self.cache_dir {
-            self.delete_expired_under(cache_dir, threshold)?;
+        for path in
+            delete_expired_files(&self.log_dir, self.cache_dir.as_deref(), max_alive_seconds)?
+        {
+            self.mark_runtime_path_removed(&path);
         }
         Ok(())
     }
@@ -342,49 +287,6 @@ impl FileManager {
     /// Flushes any buffered bytes held by the keep-open append path.
     pub fn flush_active_file_buffer(&self) -> Result<(), FileManagerError> {
         self.flush_active_file_if_needed()
-    }
-
-    fn delete_expired_under(
-        &self,
-        dir: &Path,
-        threshold: Duration,
-    ) -> Result<(), FileManagerError> {
-        if !dir.is_dir() {
-            return Ok(());
-        }
-
-        let now = SystemTime::now();
-        let entries =
-            fs::read_dir(dir).map_err(|e| FileManagerError::ReadDir(dir.to_path_buf(), e))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| FileManagerError::ReadDir(dir.to_path_buf(), e))?;
-            let path = entry.path();
-            let modified = file_mtime(&path)?;
-            let Ok(age) = now.duration_since(modified) else {
-                continue;
-            };
-            if age <= threshold {
-                continue;
-            }
-
-            if path.is_file() {
-                if path.extension().and_then(OsStr::to_str) == Some(LOG_EXT) {
-                    fs::remove_file(&path).map_err(|e| FileManagerError::RemoveFile(path, e))?;
-                    record_expired_delete();
-                }
-                continue;
-            }
-
-            if path.is_dir() {
-                let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
-                let is_day_folder = name.len() == 8 && name.chars().all(|c| c.is_ascii_digit());
-                if is_day_folder {
-                    fs::remove_dir_all(&path).map_err(|e| FileManagerError::RemoveDir(path, e))?;
-                    record_expired_delete();
-                }
-            }
-        }
-        Ok(())
     }
 
     fn list_existing_files(&self, dir: &Path, file_prefix: &str) -> Vec<String> {
@@ -428,13 +330,7 @@ impl FileManager {
             .runtime
             .lock()
             .expect("file_manager runtime lock poisoned");
-        runtime.cached_local_exists_for_day(
-            self.log_dir.as_path(),
-            self.cache_dir.as_deref(),
-            dir,
-            day_key(now),
-            max_file_size,
-        )
+        runtime.cached_local_exists_for_day(self.target_dirs(), dir, day_key(now), max_file_size)
     }
 
     fn try_append_active_plain_keep_open(
@@ -469,7 +365,7 @@ impl FileManager {
         Ok(true)
     }
 
-    fn mark_cached_path_removed(&self, path: &Path) {
+    fn mark_runtime_path_removed(&self, path: &Path) {
         let mut runtime = self
             .runtime
             .lock()
@@ -561,10 +457,8 @@ impl FileManager {
         self.append_slices_with_runtime_locked(&mut runtime, &path, slices, now, keep_open, durable)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn append_log_slices_with_cache(
         &self,
-        cache_dir: &Path,
         slices: &[&[u8]],
         now: chrono::DateTime<Local>,
         max_file_size: u64,
@@ -572,8 +466,8 @@ impl FileManager {
         keep_open: bool,
         durable: bool,
     ) -> Result<(), FileManagerError> {
-        match self.plan_cache_append(cache_dir, now, max_file_size, move_file, keep_open) {
-            CacheAppendPlan::AppendToPath {
+        match self.plan_cache_append(now, max_file_size, move_file, keep_open) {
+            AppendRoutePlan::AppendToPath {
                 path,
                 promote_after_append,
             } => {
@@ -583,7 +477,7 @@ impl FileManager {
                 }
                 Ok(())
             }
-            CacheAppendPlan::PreferLogThenCache {
+            AppendRoutePlan::PreferLogThenCache {
                 log_path,
                 cache_path,
             } => {
@@ -603,42 +497,32 @@ impl FileManager {
 
     fn plan_cache_append(
         &self,
-        cache_dir: &Path,
         now: chrono::DateTime<Local>,
         max_file_size: u64,
         move_file: bool,
         keep_open: bool,
-    ) -> CacheAppendPlan {
+    ) -> AppendRoutePlan {
         if let Some(log_path) = self.active_append_path(now, &self.log_dir, keep_open) {
-            return CacheAppendPlan::AppendToPath {
-                path: log_path,
-                promote_after_append: false,
-            };
+            return CacheRoutePlanner::new(false, move_file).active_log(log_path);
         }
+        let cache_dir = self.cache_dir.as_deref().expect("cache_dir is_some");
+        let planner = CacheRoutePlanner::new(self.should_cache_logs(now, max_file_size), move_file);
         if let Some(cache_path) = self.active_append_path(now, cache_dir, keep_open) {
-            return CacheAppendPlan::AppendToPath {
-                path: cache_path,
-                promote_after_append: move_file && !self.should_cache_logs(now, max_file_size),
-            };
+            return planner.active_cache(cache_path);
         }
 
         let cache_path = self.select_append_path(now, cache_dir, &self.name_prefix, max_file_size);
-        let cache_logs = self.should_cache_logs(now, max_file_size);
         let cache_exists = self
             .cached_local_exists(now, cache_dir, max_file_size)
             .unwrap_or_else(|| cache_path.exists());
 
-        if cache_logs || cache_exists {
-            return CacheAppendPlan::AppendToPath {
-                path: cache_path,
-                promote_after_append: !cache_logs && move_file,
-            };
+        if let Some(plan) = planner.resolved_cache(cache_path.clone(), cache_exists) {
+            return plan;
         }
 
-        CacheAppendPlan::PreferLogThenCache {
-            log_path: self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size),
-            cache_path,
-        }
+        let log_path =
+            self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size);
+        planner.fallback(log_path, cache_path)
     }
 
     fn promote_cache_path_to_log(
@@ -652,7 +536,7 @@ impl FileManager {
         append_file_to_file(cache_path, &log_path)?;
         fs::remove_file(cache_path)
             .map_err(|e| FileManagerError::RemoveFile(cache_path.to_path_buf(), e))?;
-        self.mark_cached_path_removed(cache_path);
+        self.mark_runtime_path_removed(cache_path);
         Ok(())
     }
 
@@ -686,8 +570,7 @@ impl FileManager {
             }
         }
         if let Some(path) = runtime.next_cached_path(
-            self.log_dir.as_path(),
-            self.cache_dir.as_deref(),
+            self.target_dirs(),
             now_ts,
             dir,
             day_key,
@@ -697,13 +580,15 @@ impl FileManager {
             return path;
         }
 
-        let target = self.resolve_append_target(now, dir, prefix, max_file_size);
-        runtime.set_target_for_dir(
+        let target = resolve_append_target(
             self.log_dir.as_path(),
             self.cache_dir.as_deref(),
+            now,
             dir,
-            target.clone(),
+            prefix,
+            max_file_size,
         );
+        runtime.set_target_for_dir(self.target_dirs(), dir, target.clone());
         runtime.record_last_append(now_ts, &target.path);
         target.path
     }
@@ -788,8 +673,7 @@ impl FileManager {
             record_file_append(written as usize, append_begin.elapsed(), keep_open);
             let merged_len = runtime.merged_len_after_append(path, day_key, written, current_len);
             runtime.update_target_after_append(
-                self.log_dir.as_path(),
-                self.cache_dir.as_deref(),
+                self.target_dirs(),
                 &self.name_prefix,
                 path,
                 day_key,
@@ -854,108 +738,15 @@ impl FileManager {
         prefix: &str,
         max_file_size: u64,
     ) -> PathBuf {
-        self.resolve_append_target(now, dir, prefix, max_file_size)
-            .path
-    }
-
-    fn resolve_append_target(
-        &self,
-        now: chrono::DateTime<Local>,
-        dir: &Path,
-        prefix: &str,
-        max_file_size: u64,
-    ) -> AppendTargetCache {
-        let day_key = day_key(now);
-        let date_prefix = make_date_prefix_from_day_key(prefix, day_key);
-        let (idx, merged_len) = if max_file_size == 0 {
-            let path = build_path_for_index(dir, prefix, day_key, 0);
-            let (local_exists, local_len) = local_file_state(&path);
-            return AppendTargetCache {
-                path,
-                day_key,
-                file_index: 0,
-                merged_len: local_len,
-                local_len,
-                local_exists,
-            };
-        } else {
-            self.next_file_index_state(&date_prefix, max_file_size)
-        };
-
-        let path = build_path_for_index(dir, prefix, day_key, idx);
-        let (local_exists, local_len) = local_file_state(&path);
-        AppendTargetCache {
-            path,
-            day_key,
-            file_index: idx,
-            merged_len,
-            local_len,
-            local_exists,
-        }
-    }
-
-    fn next_file_index_state(&self, date_prefix: &str, max_file_size: u64) -> (i64, u64) {
-        let mut names = self.get_file_names_by_prefix(&self.log_dir, date_prefix);
-        if let Some(cache_dir) = &self.cache_dir {
-            names.extend(self.get_file_names_by_prefix(cache_dir, date_prefix));
-        }
-        if names.is_empty() {
-            return (0, 0);
-        }
-
-        names.sort_by(|a, b| {
-            if a.len() == b.len() {
-                b.cmp(a)
-            } else {
-                b.len().cmp(&a.len())
-            }
-        });
-        let last = &names[0];
-
-        let mut idx = 0i64;
-        if let Some(base) = last.strip_suffix(LOG_EXT_WITH_DOT) {
-            if let Some(rest) = base.strip_prefix(date_prefix) {
-                let rest = rest.strip_prefix('_').unwrap_or(rest);
-                idx = rest.parse::<i64>().unwrap_or(0);
-            }
-        }
-
-        let mut merged_size = 0u64;
-        let log_path = self.log_dir.join(last);
-        if let Ok(meta) = fs::metadata(&log_path) {
-            merged_size = merged_size.saturating_add(meta.len());
-        }
-        if let Some(cache_dir) = &self.cache_dir {
-            let cache_path = cache_dir.join(last);
-            if let Ok(meta) = fs::metadata(&cache_path) {
-                merged_size = merged_size.saturating_add(meta.len());
-            }
-        }
-        if merged_size > max_file_size {
-            (idx + 1, 0)
-        } else {
-            (idx, merged_size)
-        }
-    }
-
-    fn get_file_names_by_prefix(&self, dir: &Path, file_prefix: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let Ok(entries) = fs::read_dir(dir) else {
-            return out;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(OsStr::to_str) else {
-                continue;
-            };
-            if name.starts_with(file_prefix) && name.ends_with(LOG_EXT_WITH_DOT) {
-                out.push(name.to_string());
-            }
-        }
-        out
+        resolve_append_target(
+            self.log_dir.as_path(),
+            self.cache_dir.as_deref(),
+            now,
+            dir,
+            prefix,
+            max_file_size,
+        )
+        .path
     }
 }
 
@@ -971,72 +762,6 @@ fn lock_paths(log_dir: &Path, cache_dir: Option<&Path>, prefix: &str) -> Vec<Pat
     dirs.into_iter()
         .map(|dir| dir.join(format!("{prefix}.lock")))
         .collect()
-}
-
-fn local_file_state(path: &Path) -> (bool, u64) {
-    match fs::metadata(path) {
-        Ok(meta) => (true, meta.len()),
-        Err(_) => (false, 0),
-    }
-}
-
-fn append_file_to_file(src: &Path, dst: &Path) -> Result<(), FileManagerError> {
-    if src == dst || !src.exists() {
-        return Ok(());
-    }
-    let src_meta =
-        fs::metadata(src).map_err(|e| FileManagerError::Metadata(src.to_path_buf(), e))?;
-    if src_meta.len() == 0 {
-        return Ok(());
-    }
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| FileManagerError::CreateDir(parent.to_path_buf(), e))?;
-    }
-
-    let mut src_file =
-        File::open(src).map_err(|e| FileManagerError::OpenFile(src.to_path_buf(), e))?;
-    let mut dst_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dst)
-        .map_err(|e| FileManagerError::OpenFile(dst.to_path_buf(), e))?;
-    let dst_before_len = dst_file
-        .metadata()
-        .map_err(|e| FileManagerError::Metadata(dst.to_path_buf(), e))?
-        .len();
-
-    let mut buf = vec![0u8; FILE_COPY_BUFFER_SIZE];
-    let mut copied = 0u64;
-    loop {
-        let n = match src_file.read(&mut buf) {
-            Ok(n) => n,
-            Err(e) => {
-                rollback_file_to_len(&mut dst_file, dst_before_len);
-                return Err(FileManagerError::ReadFile(src.to_path_buf(), e));
-            }
-        };
-        if n == 0 {
-            break;
-        }
-        if let Err(e) = dst_file.write_all(&buf[..n]) {
-            rollback_file_to_len(&mut dst_file, dst_before_len);
-            return Err(FileManagerError::WriteFile(dst.to_path_buf(), e));
-        }
-        copied = copied.saturating_add(n as u64);
-    }
-    if copied < src_meta.len() {
-        rollback_file_to_len(&mut dst_file, dst_before_len);
-        return Err(FileManagerError::WriteFile(
-            dst.to_path_buf(),
-            std::io::Error::new(std::io::ErrorKind::WriteZero, "partial append"),
-        ));
-    }
-    if let Err(e) = dst_file.sync_data() {
-        rollback_file_to_len(&mut dst_file, dst_before_len);
-        return Err(FileManagerError::SyncFile(dst.to_path_buf(), e));
-    }
-    Ok(())
 }
 
 fn close_active_append_file(runtime: &mut RuntimeState) -> Result<(), FileManagerError> {
@@ -1066,12 +791,6 @@ fn open_append_file(path: &Path, path_buf: &Path) -> Result<File, FileManagerErr
     }
 }
 
-fn file_mtime(path: &Path) -> Result<SystemTime, FileManagerError> {
-    let meta = fs::metadata(path).map_err(|e| FileManagerError::Metadata(path.to_path_buf(), e))?;
-    meta.modified()
-        .map_err(|e| FileManagerError::Metadata(path.to_path_buf(), e))
-}
-
 #[cfg(test)]
 mod tests {
     use std::env;
@@ -1081,8 +800,9 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, SystemTime};
 
-    use super::{ActiveAppendFile, AppendTargetCache, FileManager};
+    use super::{ActiveAppendFile, FileManager};
     use crate::file_naming::{build_path_for_index, day_key};
+    use crate::file_runtime::AppendTargetCache;
     use chrono::{Datelike, Local};
     use filetime::{set_file_mtime, FileTime};
 

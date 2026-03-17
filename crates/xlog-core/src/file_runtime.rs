@@ -15,6 +15,18 @@ pub(crate) struct RuntimeState {
     pub(crate) cache_target: Option<AppendTargetCache>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TargetDirs<'a> {
+    pub(crate) log_dir: &'a Path,
+    pub(crate) cache_dir: Option<&'a Path>,
+}
+
+impl<'a> TargetDirs<'a> {
+    pub(crate) fn new(log_dir: &'a Path, cache_dir: Option<&'a Path>) -> Self {
+        Self { log_dir, cache_dir }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AppendTargetCache {
     pub(crate) path: PathBuf,
@@ -28,13 +40,12 @@ pub(crate) struct AppendTargetCache {
 impl RuntimeState {
     pub(crate) fn target_for_dir<'a>(
         &'a self,
-        log_dir: &Path,
-        cache_dir: Option<&Path>,
+        dirs: TargetDirs<'_>,
         dir: &Path,
     ) -> Option<&'a AppendTargetCache> {
-        if dir == log_dir {
+        if dir == dirs.log_dir {
             self.log_target.as_ref()
-        } else if cache_dir == Some(dir) {
+        } else if dirs.cache_dir == Some(dir) {
             self.cache_target.as_ref()
         } else {
             None
@@ -43,13 +54,12 @@ impl RuntimeState {
 
     pub(crate) fn target_slot_for_dir<'a>(
         &'a mut self,
-        log_dir: &Path,
-        cache_dir: Option<&Path>,
+        dirs: TargetDirs<'_>,
         dir: &Path,
     ) -> Option<&'a mut Option<AppendTargetCache>> {
-        if dir == log_dir {
+        if dir == dirs.log_dir {
             Some(&mut self.log_target)
-        } else if cache_dir == Some(dir) {
+        } else if dirs.cache_dir == Some(dir) {
             Some(&mut self.cache_target)
         } else {
             None
@@ -58,12 +68,11 @@ impl RuntimeState {
 
     pub(crate) fn set_target_for_dir(
         &mut self,
-        log_dir: &Path,
-        cache_dir: Option<&Path>,
+        dirs: TargetDirs<'_>,
         dir: &Path,
         target: AppendTargetCache,
     ) {
-        if let Some(slot) = self.target_slot_for_dir(log_dir, cache_dir, dir) {
+        if let Some(slot) = self.target_slot_for_dir(dirs, dir) {
             *slot = Some(target);
         }
     }
@@ -75,17 +84,16 @@ impl RuntimeState {
 
     pub(crate) fn next_cached_path(
         &mut self,
-        log_dir: &Path,
-        cache_dir: Option<&Path>,
+        dirs: TargetDirs<'_>,
         now_ts: i64,
         dir: &Path,
         day_key: i32,
         prefix: &str,
         max_file_size: u64,
     ) -> Option<PathBuf> {
-        let target = self.target_for_dir(log_dir, cache_dir, dir)?.clone();
+        let target = self.target_for_dir(dirs, dir)?.clone();
         if target.day_key != day_key {
-            if let Some(slot) = self.target_slot_for_dir(log_dir, cache_dir, dir) {
+            if let Some(slot) = self.target_slot_for_dir(dirs, dir) {
                 *slot = None;
             }
             return None;
@@ -100,7 +108,7 @@ impl RuntimeState {
                 local_exists: false,
             };
             record_file_rotate();
-            self.set_target_for_dir(log_dir, cache_dir, dir, next.clone());
+            self.set_target_for_dir(dirs, dir, next.clone());
             self.record_last_append(now_ts, &next.path);
             return Some(next.path);
         }
@@ -110,21 +118,20 @@ impl RuntimeState {
 
     pub(crate) fn cached_local_exists_for_day(
         &mut self,
-        log_dir: &Path,
-        cache_dir: Option<&Path>,
+        dirs: TargetDirs<'_>,
         dir: &Path,
         current_day: i32,
         max_file_size: u64,
     ) -> Option<bool> {
-        let target = self.target_for_dir(log_dir, cache_dir, dir)?.clone();
+        let target = self.target_for_dir(dirs, dir)?.clone();
         if target.day_key != current_day {
-            if let Some(slot) = self.target_slot_for_dir(log_dir, cache_dir, dir) {
+            if let Some(slot) = self.target_slot_for_dir(dirs, dir) {
                 *slot = None;
             }
             return None;
         }
         if max_file_size > 0 && target.merged_len > max_file_size {
-            if let Some(slot) = self.target_slot_for_dir(log_dir, cache_dir, dir) {
+            if let Some(slot) = self.target_slot_for_dir(dirs, dir) {
                 *slot = None;
             }
             return None;
@@ -165,8 +172,7 @@ impl RuntimeState {
 
     pub(crate) fn update_target_after_append(
         &mut self,
-        log_dir: &Path,
-        cache_dir: Option<&Path>,
+        dirs: TargetDirs<'_>,
         name_prefix: &str,
         path: &Path,
         day_key: i32,
@@ -203,8 +209,7 @@ impl RuntimeState {
 
         if !matched_current_dir {
             self.set_target_for_dir(
-                log_dir,
-                cache_dir,
+                dirs,
                 parent,
                 AppendTargetCache {
                     path: path.to_path_buf(),

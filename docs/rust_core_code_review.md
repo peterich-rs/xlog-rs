@@ -2,11 +2,12 @@
 
 > 审查日期: 2026-03-16
 > 复核日期: 2026-03-17
+> 最终收口日期: 2026-03-17
 > 审查范围: `crates/xlog-core/src/`
 
 ## 当前结论
 
-原始 review 中除 `FileManager` 复杂度外的其余问题，当前都已经处理或证伪，不再保留为 active issue。
+原始 review 列出的 active issue 当前已经全部处理，不再保留未收口项。
 
 已经关闭或收口的内容包括：
 
@@ -23,26 +24,24 @@
 11. `ConsoleLevel` / `LogLevel` 重复类型
 12. `FileManager` 命名层、writer 层、plain/cache 主路径未拆分
 
-## 唯一剩余问题
+## 本轮收口内容
 
-`FileManager` 仍然把 cache/log 生命周期策略与业务路由协调耦合在同一个模块里。
-
-更具体地说：
+此前唯一剩余的 `FileManager` 耦合问题，已在本轮拆分中收口：
 
 1. 命名层已经拆到 `file_naming.rs`
 2. buffered writer 已拆到 `active_append.rs`
-3. plain/cache 主路径已经拆开
-4. `RuntimeState` / `AppendTargetCache` 已抽到独立的 `file_runtime.rs`
-5. 但 cache 命中、cache 提升、log fallback 和文件生命周期策略仍由 `file_manager.rs` 统一决策
+3. `RuntimeState` / `AppendTargetCache` 已拆到 `file_runtime.rs`
+4. append target 解析已拆到 `file_target.rs`
+5. cache/log 路由策略已拆到 `file_policy.rs`
+6. cache move / expiry lifecycle 已拆到 `file_maintenance.rs`
+7. `file_manager.rs` 现在主要保留对外 API、文件锁初始化和 append orchestration
 
-因此当前 `mars-xlog-core` 在可维护性上的唯一主要剩余问题是：
-
-`FileManager` 的问题已经不再是命名、writer 或状态机细节，而是 cache/log 生命周期策略与路由决策仍过于耦合。
+因此当前 `mars-xlog-core` 在这份 code review 范围内，已经没有需要继续追踪的主要架构问题。
 
 ## 后续方向
 
-下一步如果继续重构，应只围绕这一个问题展开：
+后续如果继续演进，应以局部优化和测试补强为主，而不是继续围绕 review blocker 进行强制拆分：
 
-1. 继续收口 `AppendTargetCache` 相关辅助逻辑
-2. 把 cache 命中 / promote / fallback 进一步收成显式策略边界
-3. 在拆分后补更细粒度的 `FileManager` 分层测试
+1. 继续为 `file_policy.rs` / `file_maintenance.rs` 补更细粒度的边界测试
+2. 在不牺牲可读性的前提下继续压缩 `file_manager.rs` 内部 orchestration helper
+3. 维持 `clippy`、`async_engine`、`oneshot_flush`、`mmap_recovery`、`file_manager` 回归测试闭环

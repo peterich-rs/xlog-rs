@@ -16,10 +16,14 @@ pub mod compress;
 pub mod crypto;
 /// Human-readable dump utilities for log buffers.
 pub mod dump;
+mod file_maintenance;
 /// File lifecycle, cache movement, and active log append helpers.
 pub mod file_manager;
 mod file_naming;
+mod file_ops;
+mod file_policy;
 mod file_runtime;
+mod file_target;
 /// Line formatter used by the Rust runtime path.
 pub mod formatter;
 mod metrics;
