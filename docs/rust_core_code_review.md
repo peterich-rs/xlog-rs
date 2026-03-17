@@ -48,6 +48,7 @@
 9. `file_manager.rs` 的路径/日期命名辅助逻辑已抽到 `file_naming.rs`
 10. `ZlibStreamCompressor` / `ZstdStreamCompressor` 每次发射后都会清理内部输出缓冲，不再保留整块 pending block 已发射字节
 11. `append_log_slices_inner` 已拆成 plain-path / cache-path 两条私有路径，并把 cache→log 提升提成独立 helper
+12. `ActiveAppendFile` 与 buffered I/O 已抽到独立的 `active_append.rs`
 
 ### 1.3 补测试
 
@@ -64,20 +65,18 @@
 
 `file_manager.rs` 仍同时承担：
 
-1. 路径解析与日期编码
-2. append target 缓存
-3. active file buffered I/O
-4. cache/log 路由
-5. cache 迁移与过期清理
-6. 进程级单写者锁
+1. append target 缓存
+2. cache/log 路由
+3. cache 迁移与过期清理
+4. 进程级单写者锁
 
 这会持续抬高 `append_log_slices_inner` 一类核心逻辑的理解和测试成本。
 
 建议后续拆分方向：
 
-1. active append writer
-2. 更细粒度的 cache/log append routing
-3. 清理剩余的内部状态/缓存辅助逻辑
+1. 更细粒度的 cache/log append routing
+2. 清理剩余的内部状态/缓存辅助逻辑
+3. 继续压缩 append target cache 相关逻辑
 
 ### 2.2 ConsoleLevel 与 LogLevel 仍是两套枚举
 

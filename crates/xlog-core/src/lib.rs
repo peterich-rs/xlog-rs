@@ -5,6 +5,7 @@
 //! they are intentionally composing lower-level buffer, protocol, or appender
 //! primitives.
 
+mod active_append;
 /// Append engine, flush control, and async pending-block primitives.
 pub mod appender_engine;
 /// Persistent mmap-backed buffer and recovery helpers.
