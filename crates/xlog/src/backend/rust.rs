@@ -23,6 +23,7 @@ use mars_xlog_core::formatter::format_record_parts_into;
 use mars_xlog_core::oneshot::{
     oneshot_flush as core_oneshot_flush, FileIoAction as CoreFileIoAction,
 };
+use mars_xlog_core::platform_console::write_console_line;
 #[cfg(any(
     target_os = "ios",
     target_os = "macos",
@@ -30,7 +31,6 @@ use mars_xlog_core::oneshot::{
     target_os = "watchos"
 ))]
 use mars_xlog_core::platform_console::{set_apple_console_fun, AppleConsoleFun};
-use mars_xlog_core::platform_console::{write_console_line, ConsoleLevel};
 use mars_xlog_core::platform_tid::{current_tid, main_tid};
 use mars_xlog_core::protocol::{
     select_magic, AppendMode, CompressionKind, LogHeader, SeqGenerator, HEADER_LEN,
@@ -1310,7 +1310,7 @@ impl RustBackend {
         let trace_console_bypass = false;
 
         if self.console_open.load(Ordering::Relaxed) || trace_console_bypass {
-            write_console_line(to_console_level(level), tag, file, func, line, msg);
+            write_console_line(to_core_level(level), tag, file, func, line, msg);
         }
 
         let (pid, tid, maintid) = self.resolve_record_meta(raw_meta, resolve_mode);
@@ -1935,18 +1935,6 @@ fn appender_to_engine_mode(mode: AppenderMode) -> EngineMode {
     match mode {
         AppenderMode::Async => EngineMode::Async,
         AppenderMode::Sync => EngineMode::Sync,
-    }
-}
-
-fn to_console_level(level: LogLevel) -> ConsoleLevel {
-    match level {
-        LogLevel::Verbose => ConsoleLevel::Verbose,
-        LogLevel::Debug => ConsoleLevel::Debug,
-        LogLevel::Info => ConsoleLevel::Info,
-        LogLevel::Warn => ConsoleLevel::Warn,
-        LogLevel::Error => ConsoleLevel::Error,
-        LogLevel::Fatal => ConsoleLevel::Fatal,
-        LogLevel::None => ConsoleLevel::None,
     }
 }
 

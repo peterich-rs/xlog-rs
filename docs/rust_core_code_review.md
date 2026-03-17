@@ -18,8 +18,7 @@
 
 1. recovery helper 在 `appender_engine.rs` 与 `oneshot.rs` 之间存在重复实现
 2. `FileManager` 复杂度偏高，后续仍值得拆分
-3. `ConsoleLevel` 与 `LogLevel` 仍是两套接近的枚举
-4. `FileManager` 仍需继续拆分更深层的 append/cache 路由逻辑
+3. `FileManager` 仍需继续拆分更深层的 append/cache 路由逻辑
 
 ## 1. 本轮已处理
 
@@ -49,6 +48,7 @@
 10. `ZlibStreamCompressor` / `ZstdStreamCompressor` 每次发射后都会清理内部输出缓冲，不再保留整块 pending block 已发射字节
 11. `append_log_slices_inner` 已拆成 plain-path / cache-path 两条私有路径，并把 cache→log 提升提成独立 helper
 12. `ActiveAppendFile` 与 buffered I/O 已抽到独立的 `active_append.rs`
+13. `platform_console` 已直接复用 core `LogLevel`，`ConsoleLevel` 类型已移除
 
 ### 1.3 补测试
 
@@ -78,15 +78,6 @@
 2. 清理剩余的内部状态/缓存辅助逻辑
 3. 继续压缩 append target cache 相关逻辑
 
-### 2.2 ConsoleLevel 与 LogLevel 仍是两套枚举
-
-这条“完全冗余”不应表述得过强，但问题仍存在：
-
-1. `platform_console::ConsoleLevel`
-2. `record::LogLevel`
-
-两者语义相近，维护上容易漂移。当前已让 console 的短标签复用 `LogLevel::short()`，但类型本身仍未统一。
-
 ## 3. 测试结论
 
 当前测试覆盖比原始审查里写得更完整：
@@ -114,4 +105,3 @@
 ### P2
 
 1. 继续压缩 `FileManager` 复杂度
-2. 评估是否进一步统一 console / record level 类型

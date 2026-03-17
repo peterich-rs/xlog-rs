@@ -34,20 +34,6 @@ impl LogLevel {
     }
 }
 
-impl From<crate::platform_console::ConsoleLevel> for LogLevel {
-    fn from(level: crate::platform_console::ConsoleLevel) -> Self {
-        match level {
-            crate::platform_console::ConsoleLevel::Verbose => LogLevel::Verbose,
-            crate::platform_console::ConsoleLevel::Debug => LogLevel::Debug,
-            crate::platform_console::ConsoleLevel::Info => LogLevel::Info,
-            crate::platform_console::ConsoleLevel::Warn => LogLevel::Warn,
-            crate::platform_console::ConsoleLevel::Error => LogLevel::Error,
-            crate::platform_console::ConsoleLevel::Fatal => LogLevel::Fatal,
-            crate::platform_console::ConsoleLevel::None => LogLevel::None,
-        }
-    }
-}
-
 /// Rust-native representation of a log entry metadata block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogRecord {
