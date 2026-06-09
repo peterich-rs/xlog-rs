@@ -66,6 +66,40 @@ impl EcdhTeaCipher {
         Self::from_secret_key(server_pubkey_hex, secret)
     }
 
+    /// Creates a cipher from a caller-supplied server private key and client public key.
+    pub fn new_with_server_private_key(
+        client_pubkey: [u8; 64],
+        server_private_key: [u8; 32],
+    ) -> Result<Self, CryptoError> {
+        let secret = SecretKey::from_slice(&server_private_key)
+            .map_err(|_| CryptoError::InvalidKeyMaterial)?;
+        let mut sec1 = [0u8; 65];
+        sec1[0] = 0x04;
+        sec1[1..].copy_from_slice(&client_pubkey);
+        let client_public_key =
+            PublicKey::from_sec1_bytes(&sec1).map_err(|_| CryptoError::InvalidKeyMaterial)?;
+
+        let shared = diffie_hellman(secret.to_nonzero_scalar(), client_public_key.as_affine());
+        let shared_bytes = shared.raw_secret_bytes();
+
+        let mut tea_key = [0u32; 4];
+        for (i, word) in tea_key.iter_mut().enumerate() {
+            let start = i * 4;
+            *word = u32::from_le_bytes([
+                shared_bytes[start],
+                shared_bytes[start + 1],
+                shared_bytes[start + 2],
+                shared_bytes[start + 3],
+            ]);
+        }
+
+        Ok(Self {
+            enabled: true,
+            tea_key,
+            client_pubkey,
+        })
+    }
+
     fn from_secret_key(server_pubkey_hex: &str, secret: SecretKey) -> Result<Self, CryptoError> {
         let server_pubkey = decode_uncompressed_pubkey(server_pubkey_hex)?;
 

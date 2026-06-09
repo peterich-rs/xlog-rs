@@ -156,6 +156,37 @@ jobs:
           cargo publish -p mars-xlog --locked
           echo "action=published" >> "$GITHUB_OUTPUT"
 
+      - name: Run mars-xlog-cli preflight
+        shell: bash
+        run: |
+          scripts/xlog/check_mars_xlog_cli_release.sh
+
+      - name: Publish mars-xlog-cli when needed
+        id: publish_cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.release_version }}"
+          if cargo info "mars-xlog-cli@${version}" --registry crates-io >/dev/null 2>&1; then
+            echo "action=skipped-existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          cargo publish -p mars-xlog-cli --locked
+          echo "action=published" >> "$GITHUB_OUTPUT"
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Pack npm CLI package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/npm
+          npm pack ./packages/mars-xlog-cli-npm --pack-destination artifacts/npm
+
       - name: Generate release notes
         if: success()
         shell: bash
@@ -166,6 +197,7 @@ jobs:
           title="${{ steps.meta.outputs.release_title }}"
           core_action="${{ steps.publish_core.outputs.action }}"
           xlog_action="${{ steps.publish_xlog.outputs.action }}"
+          cli_action="${{ steps.publish_cli.outputs.action }}"
           notes_source="docs/releases/${version}.md"
 
           if [[ -f "${notes_source}" ]]; then
@@ -183,6 +215,7 @@ jobs:
 
           - \`mars-xlog-core ${version}\` (${core_action})
           - \`mars-xlog ${version}\` (${xlog_action})
+          - \`mars-xlog-cli ${version}\` (${cli_action})
 
           Workflow run:
 
@@ -192,6 +225,9 @@ jobs:
 
           - preflight summaries from \`scripts/xlog/check_mars_xlog_core_release.sh\`
           - preflight summaries from \`scripts/xlog/check_mars_xlog_release.sh\`
+          - preflight summaries from \`scripts/xlog/check_mars_xlog_cli_release.sh\`
+          - prebuilt \`mars-xlog\` CLI archives for macOS, Linux, and Windows
+          - npm package tarball for \`mars-xlog-cli\`
           EOF
 
       - name: Bundle release artifacts
@@ -210,17 +246,138 @@ jobs:
           name: rust-release-${{ steps.meta.outputs.release_version }}
           path: |
             artifacts/rust-release-${{ steps.meta.outputs.release_version }}.tar.gz
+            artifacts/npm/*
             artifacts/release
             artifacts/release_notes.md
           retention-days: 30
           if-no-files-found: warn
 
+  cli_artifacts:
+    needs:
+      - await_rust_ci
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Validate release tag
+        id: meta
+        shell: bash
+        run: |
+          scripts/xlog/check_rust_release_tag.sh --tag "${GITHUB_REF_NAME}"
+
+      - name: Build CLI binary
+        shell: bash
+        run: |
+          cargo build --release -p mars-xlog-cli --target "${{ matrix.target }}" --locked
+
+      - name: Package CLI artifact
+        shell: bash
+        run: |
+          scripts/xlog/package_cli_artifact.sh \
+            --version "${{ steps.meta.outputs.release_version }}" \
+            --target "${{ matrix.target }}" \
+            --out-dir artifacts/cli
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mars-xlog-${{ matrix.target }}
+          path: artifacts/cli/*
+          retention-days: 30
+          if-no-files-found: error
+
+  github_release:
+    needs:
+      - publish
+      - cli_artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag
+        id: meta
+        shell: bash
+        run: |
+          scripts/xlog/check_rust_release_tag.sh --tag "${GITHUB_REF_NAME}"
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/downloaded
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/release-assets
+          find artifacts/downloaded -maxdepth 3 -type f -print
+          find artifacts/downloaded -type f \
+            \( -name '*.tar.gz' -o -name '*.sha256' -o -name '*.tgz' -o -name 'release_notes.md' \) \
+            -exec cp {} artifacts/release-assets/ \;
+
       - name: Publish GitHub release
-        if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ steps.meta.outputs.release_title }}
-          body_path: artifacts/release_notes.md
+          body_path: artifacts/release-assets/release_notes.md
           prerelease: ${{ steps.meta.outputs.is_preview == 'true' }}
-          files: artifacts/rust-release-${{ steps.meta.outputs.release_version }}.tar.gz
+          files: artifacts/release-assets/*
+
+      - name: Ensure npm token is configured
+        shell: bash
+        run: |
+          if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
+            echo "error: NPM_TOKEN secret is not configured" >&2
+            exit 1
+          fi
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish npm CLI package when needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.release_version }}"
+          if npm view "mars-xlog-cli@${version}" version >/dev/null 2>&1; then
+            exit 0
+          fi
+
+          npm publish ./packages/mars-xlog-cli-npm --access public

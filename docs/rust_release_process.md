@@ -6,12 +6,14 @@
 
 1. `mars-xlog-core`
 2. `mars-xlog`
+3. `mars-xlog-cli`
 
-这两个 crate 当前按“同版本、同一 release commit、同一 release tag”管理，但实际上传顺序必须是：
+这些 crate 当前按“同版本、同一 release commit、同一 release tag”管理，但实际上传顺序必须是：
 
 1. 先发布 `mars-xlog-core`
 2. 等待 crates.io index 可见
 3. 再发布 `mars-xlog`
+4. 最后发布 `mars-xlog-cli`
 
 ## 1. 版本号策略
 
@@ -21,7 +23,9 @@
 
 1. `crates/xlog-core/Cargo.toml`
 2. `crates/xlog/Cargo.toml`
-3. workspace 内依赖这两个 crate 的绑定 crate
+3. `crates/xlog-cli/Cargo.toml`
+4. `packages/mars-xlog-cli-npm/package.json`
+5. workspace 内依赖这些 crate 的绑定 crate
 
 都应保持同一个版本号，以避免 preview 版本下的 path 依赖版本漂移。
 
@@ -91,7 +95,9 @@ tag 中的版本号必须和以下位置完全一致：
 
 1. `crates/xlog-core/Cargo.toml`
 2. `crates/xlog/Cargo.toml`
-3. workspace 内对 `mars-xlog-core` / `mars-xlog` 的 path 依赖版本
+3. `crates/xlog-cli/Cargo.toml`
+4. `packages/mars-xlog-cli-npm/package.json`
+5. workspace 内对 `mars-xlog-core` / `mars-xlog` 的 path 依赖版本
 
 推荐在打 tag 前先运行：
 
@@ -134,7 +140,11 @@ GitHub Actions workflow：
 6. 运行 `scripts/xlog/check_mars_xlog_release.sh`
 7. 若 `mars-xlog` 当前版本尚未发布，则执行 `cargo publish -p mars-xlog`
 8. 轮询 crates.io，直到 `mars-xlog` 当前版本可见
-9. 优先读取 `docs/releases/<version>.md` 生成 GitHub Release 正文，并附带本次 release preflight 产物
+9. 运行 `scripts/xlog/check_mars_xlog_cli_release.sh`
+10. 若 `mars-xlog-cli` 当前版本尚未发布，则执行 `cargo publish -p mars-xlog-cli`
+11. 发布 npm 包 `mars-xlog-cli`
+12. 构建并上传 macOS/Linux/Windows CLI 预编译包
+13. 优先读取 `docs/releases/<version>.md` 生成 GitHub Release 正文，并附带本次 release preflight 产物
 
 ### 3.1 幂等要求
 
@@ -156,6 +166,7 @@ workflow 必须支持失败后重跑。
 4. 本地运行：
    - `scripts/xlog/check_mars_xlog_core_release.sh`
    - `scripts/xlog/check_mars_xlog_release.sh --skip-crates-io-check`
+   - `scripts/xlog/check_mars_xlog_cli_release.sh --skip-crates-io-check`
 5. 合并到 `main`
 6. 在 `main` 上打 annotated tag
 7. push tag，等待 GitHub Actions 自动发布
@@ -173,6 +184,7 @@ workflow 必须支持失败后重跑。
 GitHub 仓库需要配置：
 
 1. `CARGO_REGISTRY_TOKEN`
+2. `NPM_TOKEN`
 
 workflow 需要：
 
@@ -211,7 +223,7 @@ workflow 需要：
 
 1. 版本号：`0.1.0-preview.1`
 2. tag：`v0.1.0-preview.1`
-3. 自动发布：由 tag 触发 workflow 顺序发布 `mars-xlog-core` 和 `mars-xlog`
+3. 自动发布：由 tag 触发 workflow 顺序发布 `mars-xlog-core`、`mars-xlog` 和 `mars-xlog-cli`
 4. 对外口径：`Preview`
 
 在语义级阻断项清零之前，不建议直接打：
