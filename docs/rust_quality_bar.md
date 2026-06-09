@@ -1,11 +1,12 @@
 # Rust 维护门槛
 
-本文定义 `mars-xlog-core` 与 `mars-xlog` 的长期维护门槛。
+本文定义 `mars-xlog-core`、`mars-xlog` 与 `mars-xlog-cli` 的长期维护门槛。
 
 适用范围：
 
 1. `crates/xlog-core`
 2. `crates/xlog`
+3. `crates/xlog-cli`
 
 目标：
 
@@ -18,10 +19,11 @@
 下面这些检查应视为长期硬门槛：
 
 1. `cargo fmt --all --check`
-2. `cargo clippy -p mars-xlog-core -p mars-xlog --all-targets --all-features --locked -- -D warnings`
-3. `cargo test -p mars-xlog-core -p mars-xlog --all-features --locked`
+2. `cargo clippy -p mars-xlog-core -p mars-xlog -p mars-xlog-cli --all-targets --all-features --locked -- -D warnings`
+3. `cargo test -p mars-xlog-core -p mars-xlog -p mars-xlog-cli --all-features --locked`
 4. `cargo check` 的关键 feature / target 组合
-5. release preflight 脚本可执行且结果符合预期
+5. npm 包内容检查可执行且结果符合预期
+6. release preflight 脚本可执行且结果符合预期
 
 对应 workflow：
 
@@ -50,6 +52,7 @@
 2. `mars-xlog`：默认特性
 3. `mars-xlog`：`--all-features`
 4. `mars-xlog`：`--no-default-features --features rust-backend`
+5. `mars-xlog-cli`：`cargo check --all-targets`
 
 原因：
 
@@ -94,6 +97,8 @@
 
 1. `scripts/xlog/check_mars_xlog_core_release.sh --skip-tests`
 2. `scripts/xlog/check_mars_xlog_release.sh --skip-tests --skip-crates-io-check`
+3. `scripts/xlog/check_mars_xlog_cli_release.sh --skip-tests --skip-crates-io-check`
+4. `npm pack --dry-run --json ./packages/mars-xlog-cli-npm`
 
 这保证：
 

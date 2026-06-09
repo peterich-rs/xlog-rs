@@ -1,0 +1,164 @@
+name: rust-crates-release
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        description: 'Release tag to publish, for example v0.1.0'
+        required: true
+        type: string
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag to publish, for example v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-crates-release-${{ inputs.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RELEASE_TAG: ${{ inputs.tag_name }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag_name }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+
+      - name: Cache cargo artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Validate release tag
+        id: meta
+        shell: bash
+        run: |
+          scripts/xlog/check_rust_release_tag.sh --tag "${RELEASE_TAG}"
+
+      - name: Ensure release tag points to main
+        shell: bash
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+
+      - name: Ensure crates.io token is configured
+        shell: bash
+        run: |
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "error: CARGO_REGISTRY_TOKEN secret is not configured" >&2
+            exit 1
+          fi
+
+      - name: Run mars-xlog-core preflight
+        shell: bash
+        run: |
+          scripts/xlog/check_mars_xlog_core_release.sh
+
+      - name: Publish mars-xlog-core when needed
+        id: publish_core
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.release_version }}"
+          if cargo info "mars-xlog-core@${version}" --registry crates-io >/dev/null 2>&1; then
+            echo "action=skipped-existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          cargo publish -p mars-xlog-core --locked
+          echo "action=published" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for mars-xlog-core on crates.io
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.release_version }}"
+          for attempt in {1..60}; do
+            if cargo info "mars-xlog-core@${version}" --registry crates-io >/dev/null 2>&1; then
+              exit 0
+            fi
+            echo "waiting for mars-xlog-core ${version} on crates.io (${attempt}/60)"
+            sleep 10
+          done
+          echo "error: mars-xlog-core ${version} did not become visible on crates.io" >&2
+          exit 1
+
+      - name: Run mars-xlog preflight
+        shell: bash
+        run: |
+          scripts/xlog/check_mars_xlog_release.sh
+
+      - name: Publish mars-xlog when needed
+        id: publish_xlog
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.release_version }}"
+          if cargo info "mars-xlog@${version}" --registry crates-io >/dev/null 2>&1; then
+            echo "action=skipped-existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          cargo publish -p mars-xlog --locked
+          echo "action=published" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for mars-xlog on crates.io
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.release_version }}"
+          for attempt in {1..60}; do
+            if cargo info "mars-xlog@${version}" --registry crates-io >/dev/null 2>&1; then
+              exit 0
+            fi
+            echo "waiting for mars-xlog ${version} on crates.io (${attempt}/60)"
+            sleep 10
+          done
+          echo "error: mars-xlog ${version} did not become visible on crates.io" >&2
+          exit 1
+
+      - name: Run mars-xlog-cli preflight
+        shell: bash
+        run: |
+          scripts/xlog/check_mars_xlog_cli_release.sh
+
+      - name: Publish mars-xlog-cli when needed
+        id: publish_cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.release_version }}"
+          if cargo info "mars-xlog-cli@${version}" --registry crates-io >/dev/null 2>&1; then
+            echo "action=skipped-existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          cargo publish -p mars-xlog-cli --locked
+          echo "action=published" >> "$GITHUB_OUTPUT"
+
+      - name: Upload crate release artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-crates-release-${{ steps.meta.outputs.release_version }}
+          path: artifacts/release
+          retention-days: 30
+          if-no-files-found: warn

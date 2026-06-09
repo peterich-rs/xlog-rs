@@ -4,6 +4,7 @@ members = [
     "crates/xlog-sys",
     "crates/xlog",
     "crates/xlog-core",
+    "crates/xlog-cli",
     "crates/xlog-uniffi",
     "crates/xlog-android-jni",
     "crates/mars-xlog-harmony-napi"
@@ -11,6 +12,7 @@ members = [
 default-members = [
     "crates/xlog",
     "crates/xlog-core",
+    "crates/xlog-cli",
     "crates/xlog-uniffi",
     "crates/xlog-android-jni",
     "crates/mars-xlog-harmony-napi"

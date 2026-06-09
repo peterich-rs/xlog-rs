@@ -55,4 +55,4 @@
 3. 跨设备验证形成固定节奏
 4. 版本策略、变更日志、升级指南稳定
 
-发布流程细节见 [rust_release_process.md](/Users/fannnzhang/.codex/worktrees/6bdf/xlog-rs/docs/rust_release_process.md)。
+发布流程细节见 [rust_release_process.md](rust_release_process.md)。

@@ -1,0 +1,164 @@
+name: cli-binary-release
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        description: 'Release tag to publish, for example v0.1.0'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag to publish, for example v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cli-binary-release-${{ inputs.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      RELEASE_TAG: ${{ inputs.tag_name }}
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag_name }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Validate release tag
+        id: meta
+        shell: bash
+        run: |
+          scripts/xlog/check_rust_release_tag.sh --tag "${RELEASE_TAG}"
+
+      - name: Ensure release tag points to main
+        shell: bash
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+
+      - name: Build CLI binary
+        shell: bash
+        run: |
+          cargo build --release -p mars-xlog-cli --target "${{ matrix.target }}" --locked
+
+      - name: Package CLI artifact
+        shell: bash
+        run: |
+          scripts/xlog/package_cli_artifact.sh \
+            --version "${{ steps.meta.outputs.release_version }}" \
+            --target "${{ matrix.target }}" \
+            --out-dir artifacts/cli
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mars-xlog-${{ matrix.target }}
+          path: artifacts/cli/*
+          retention-days: 30
+          if-no-files-found: error
+
+  github_release:
+    needs:
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RELEASE_TAG: ${{ inputs.tag_name }}
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag_name }}
+
+      - name: Validate release tag
+        id: meta
+        shell: bash
+        run: |
+          scripts/xlog/check_rust_release_tag.sh --tag "${RELEASE_TAG}"
+
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/downloaded
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/release-assets
+          find artifacts/downloaded -maxdepth 3 -type f -print
+          find artifacts/downloaded -type f \
+            \( -name 'mars-xlog-*.tar.gz' -o -name 'mars-xlog-*.tar.gz.sha256' \) \
+            -exec cp {} artifacts/release-assets/ \;
+
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.release_version }}"
+          title="${{ steps.meta.outputs.release_title }}"
+          notes_source="docs/releases/${version}.md"
+          mkdir -p artifacts/release-assets
+
+          if [[ -f "${notes_source}" ]]; then
+            cp "${notes_source}" artifacts/release-assets/release_notes.md
+            printf '\n\n' >> artifacts/release-assets/release_notes.md
+          else
+            printf '# %s\n\n' "${title}" > artifacts/release-assets/release_notes.md
+          fi
+
+          cat >> artifacts/release-assets/release_notes.md <<EOF
+          CLI release artifacts:
+
+          - \`mars-xlog-v${version}-aarch64-apple-darwin.tar.gz\`
+          - \`mars-xlog-v${version}-x86_64-apple-darwin.tar.gz\`
+          - \`mars-xlog-v${version}-x86_64-unknown-linux-gnu.tar.gz\`
+          - \`mars-xlog-v${version}-x86_64-pc-windows-msvc.tar.gz\`
+
+          Workflow run:
+
+          - [GitHub Actions run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          EOF
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          name: ${{ steps.meta.outputs.release_title }}
+          body_path: artifacts/release-assets/release_notes.md
+          prerelease: ${{ steps.meta.outputs.is_preview == 'true' }}
+          files: artifacts/release-assets/*

@@ -31,6 +31,8 @@ repo_root="$(cd "${script_dir}/../.." && pwd)"
 replace_first_package_version() {
   local file="$1"
   local tmp
+  local mode
+  mode="$(stat -f '%Lp' "$file" 2>/dev/null || stat -c '%a' "$file")"
   tmp="$(mktemp)"
   awk -v version="$version" '
     BEGIN { replaced = 0 }
@@ -43,12 +45,15 @@ replace_first_package_version() {
     }
   ' "$file" > "$tmp"
   mv "$tmp" "$file"
+  chmod "$mode" "$file"
 }
 
 replace_dependency_version() {
   local file="$1"
   local dep="$2"
   local tmp
+  local mode
+  mode="$(stat -f '%Lp' "$file" 2>/dev/null || stat -c '%a' "$file")"
   tmp="$(mktemp)"
   awk -v dep="$dep" -v version="$version" '
     {
@@ -59,11 +64,13 @@ replace_dependency_version() {
     }
   ' "$file" > "$tmp"
   mv "$tmp" "$file"
+  chmod "$mode" "$file"
 }
 
 manifests=(
   "${repo_root}/crates/xlog-core/Cargo.toml"
   "${repo_root}/crates/xlog/Cargo.toml"
+  "${repo_root}/crates/xlog-cli/Cargo.toml"
   "${repo_root}/crates/xlog-uniffi/Cargo.toml"
   "${repo_root}/crates/xlog-android-jni/Cargo.toml"
   "${repo_root}/crates/mars-xlog-harmony-napi/Cargo.toml"
@@ -75,11 +82,36 @@ for file in "${manifests[@]}"; do
 done
 
 replace_dependency_version "${repo_root}/crates/xlog/Cargo.toml" "mars-xlog-core"
+replace_dependency_version "${repo_root}/crates/xlog-cli/Cargo.toml" "mars-xlog-core"
 replace_dependency_version "${repo_root}/crates/xlog-uniffi/Cargo.toml" "mars-xlog"
 replace_dependency_version "${repo_root}/crates/xlog-android-jni/Cargo.toml" "mars-xlog"
 replace_dependency_version "${repo_root}/crates/mars-xlog-harmony-napi/Cargo.toml" "mars-xlog"
 
 cargo metadata --no-deps --format-version 1 >/dev/null
+tmp="$(mktemp)"
+awk -v version="$version" '
+  {
+    if ($0 ~ /"version":/) {
+      sub(/"version": "[^"]+"/, "\"version\": \"" version "\"")
+    }
+    print
+  }
+' "${repo_root}/packages/mars-xlog-cli-npm/package.json" > "$tmp"
+mv "$tmp" "${repo_root}/packages/mars-xlog-cli-npm/package.json"
+chmod 0644 "${repo_root}/packages/mars-xlog-cli-npm/package.json"
+
+tmp="$(mktemp)"
+awk -v version="$version" '
+  {
+    if ($0 ~ /^[[:space:]]*version "/) {
+      sub(/version "[^"]+"/, "version \"" version "\"")
+    }
+    print
+  }
+' "${repo_root}/Casks/mars-xlog.rb" > "$tmp"
+mv "$tmp" "${repo_root}/Casks/mars-xlog.rb"
+chmod 0644 "${repo_root}/Casks/mars-xlog.rb"
+
 scripts/xlog/check_rust_release_tag.sh --tag "v${version}" >/dev/null
 
 cat <<EOF

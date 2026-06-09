@@ -6,6 +6,7 @@ This workspace provides a Rust-native implementation of Tencent Mars `xlog`. The
 
 - `mars-xlog` is the release-facing Rust crate and the intended Cargo entry point for Rust users.
 - `mars-xlog-core` is the implementation-layer crate used by `mars-xlog`.
+- `mars-xlog-cli` provides the `mars-xlog` command-line decoder for xlog files.
 - `mars-xlog-sys` and the platform binding crates remain repository-local support crates and are not part of the `mars-xlog` release surface.
 
 ## Migration status
@@ -16,6 +17,7 @@ This workspace provides a Rust-native implementation of Tencent Mars `xlog`. The
 ## Workspace crates
 - `mars-xlog-core`: Rust runtime core (protocol/compress/crypto/mmap/appender).
 - `mars-xlog`: safe Rust wrapper API and the default Rust integration surface.
+- `mars-xlog-cli`: command-line decoder for Mars-compatible `.xlog` files.
 - `mars-xlog-uniffi`: minimal UniFFI surface (Kotlin/Swift friendly).
 - `mars-xlog-android-jni`: JNI bridge used by the Android example app.
 - `oh-xlog`: Harmony/ohos N-API bindings.
@@ -66,6 +68,38 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+## CLI decoder
+
+Decode a generated `.xlog` file:
+
+```bash
+mars-xlog decode --input app.xlog --output app.log --key <64-hex-private-key>
+```
+
+`--key` is only required for encrypted async blocks. Plaintext logs can be decoded with:
+
+```bash
+mars-xlog --input app.xlog --output app.log
+```
+
+Install options:
+
+```bash
+# Homebrew tap/cask install from this repository or a copied tap.
+brew install --cask ./Casks/mars-xlog.rb
+
+# npm installs a small Node wrapper and downloads the release binary.
+npm install -g mars-xlog-cli
+```
+
+The Homebrew cask and npm package both consume GitHub Release archives named
+`mars-xlog-v<version>-<target>.tar.gz`.
+
+Release workflows are split by channel: `cli-binary-release` creates the
+prebuilt archives, `brew-cask-release` publishes the cask asset, `npm-release`
+publishes the npm wrapper, and `rust-crates-release` publishes crates.io
+packages. The `full-release` workflow composes all of them.
 
 ## Example (tracing + tracing-subscriber)
 Enable feature `tracing` and build an `XlogLayer`:
