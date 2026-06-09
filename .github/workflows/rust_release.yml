@@ -1,28 +1,57 @@
-name: rust-release
+name: full-release
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag to publish, for example v0.1.0'
+        required: true
+        type: string
 
 permissions:
   actions: read
   contents: write
 
 concurrency:
-  group: rust-release-${{ github.ref }}
+  group: full-release-${{ inputs.tag_name || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   await_rust_ci:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    outputs:
+      tag_name: ${{ steps.release_ref.outputs.tag_name }}
+      target_sha: ${{ steps.release_ref.outputs.target_sha }}
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release ref
+        id: release_ref
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
+        run: |
+          set -euo pipefail
+          scripts/xlog/check_rust_release_tag.sh --tag "${RELEASE_TAG}"
+          git fetch origin main
+          git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          target_sha="$(git rev-list -n 1 "${RELEASE_TAG}")"
+          git merge-base --is-ancestor "${target_sha}" origin/main
+          echo "tag_name=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "target_sha=${target_sha}" >> "$GITHUB_OUTPUT"
+
       - name: Require successful rust-ci run for tagged commit
         uses: actions/github-script@v8
         env:
-          TARGET_SHA: ${{ github.sha }}
+          TARGET_SHA: ${{ steps.release_ref.outputs.target_sha }}
           TARGET_BRANCH: main
         with:
           script: |
@@ -76,308 +105,37 @@ jobs:
               `Timed out waiting for a successful rust-ci push run on ${headSha}.`,
             );
 
-  publish:
+  rust_crates_release:
     needs:
       - await_rust_ci
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    uses: ./.github/workflows/rust_crates_release.yml
+    with:
+      tag_name: ${{ needs.await_rust_ci.outputs.tag_name }}
+    secrets: inherit
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.85.0
-
-      - name: Cache cargo artifacts
-        uses: swatinem/rust-cache@v2
-
-      - name: Validate release tag
-        id: meta
-        shell: bash
-        run: |
-          scripts/xlog/check_rust_release_tag.sh --tag "${GITHUB_REF_NAME}"
-
-      - name: Ensure release tag points to main
-        shell: bash
-        run: |
-          git fetch origin main --depth=1
-          git merge-base --is-ancestor "${GITHUB_SHA}" "origin/main"
-
-      - name: Ensure crates.io token is configured
-        shell: bash
-        run: |
-          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
-            echo "error: CARGO_REGISTRY_TOKEN secret is not configured" >&2
-            exit 1
-          fi
-
-      - name: Run mars-xlog-core preflight
-        shell: bash
-        run: |
-          scripts/xlog/check_mars_xlog_core_release.sh
-
-      - name: Publish mars-xlog-core when needed
-        id: publish_core
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ steps.meta.outputs.release_version }}"
-          if cargo info "mars-xlog-core@${version}" --registry crates-io >/dev/null 2>&1; then
-            echo "action=skipped-existing" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          cargo publish -p mars-xlog-core --locked
-          echo "action=published" >> "$GITHUB_OUTPUT"
-
-      - name: Run mars-xlog preflight
-        shell: bash
-        run: |
-          scripts/xlog/check_mars_xlog_release.sh
-
-      - name: Publish mars-xlog when needed
-        id: publish_xlog
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ steps.meta.outputs.release_version }}"
-          if cargo info "mars-xlog@${version}" --registry crates-io >/dev/null 2>&1; then
-            echo "action=skipped-existing" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          cargo publish -p mars-xlog --locked
-          echo "action=published" >> "$GITHUB_OUTPUT"
-
-      - name: Run mars-xlog-cli preflight
-        shell: bash
-        run: |
-          scripts/xlog/check_mars_xlog_cli_release.sh
-
-      - name: Publish mars-xlog-cli when needed
-        id: publish_cli
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ steps.meta.outputs.release_version }}"
-          if cargo info "mars-xlog-cli@${version}" --registry crates-io >/dev/null 2>&1; then
-            echo "action=skipped-existing" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          cargo publish -p mars-xlog-cli --locked
-          echo "action=published" >> "$GITHUB_OUTPUT"
-
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Pack npm CLI package
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts/npm
-          npm pack ./packages/mars-xlog-cli-npm --pack-destination artifacts/npm
-
-      - name: Generate release notes
-        if: success()
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          version="${{ steps.meta.outputs.release_version }}"
-          title="${{ steps.meta.outputs.release_title }}"
-          core_action="${{ steps.publish_core.outputs.action }}"
-          xlog_action="${{ steps.publish_xlog.outputs.action }}"
-          cli_action="${{ steps.publish_cli.outputs.action }}"
-          notes_source="docs/releases/${version}.md"
-
-          if [[ -f "${notes_source}" ]]; then
-            cp "${notes_source}" artifacts/release_notes.md
-            printf '\n\n' >> artifacts/release_notes.md
-          else
-            cat > artifacts/release_notes.md <<EOF
-          ${title}
-          EOF
-            printf '\n' >> artifacts/release_notes.md
-          fi
-
-          cat >> artifacts/release_notes.md <<EOF
-          Published crates:
-
-          - \`mars-xlog-core ${version}\` (${core_action})
-          - \`mars-xlog ${version}\` (${xlog_action})
-          - \`mars-xlog-cli ${version}\` (${cli_action})
-
-          Workflow run:
-
-          - [GitHub Actions run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
-
-          Release artifacts:
-
-          - preflight summaries from \`scripts/xlog/check_mars_xlog_core_release.sh\`
-          - preflight summaries from \`scripts/xlog/check_mars_xlog_release.sh\`
-          - preflight summaries from \`scripts/xlog/check_mars_xlog_cli_release.sh\`
-          - prebuilt \`mars-xlog\` CLI archives for macOS, Linux, and Windows
-          - npm package tarball for \`mars-xlog-cli\`
-          EOF
-
-      - name: Bundle release artifacts
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          mkdir -p artifacts/release
-          tar -czf "artifacts/rust-release-${{ steps.meta.outputs.release_version }}.tar.gz" artifacts/release
-
-      - name: Upload release artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rust-release-${{ steps.meta.outputs.release_version }}
-          path: |
-            artifacts/rust-release-${{ steps.meta.outputs.release_version }}.tar.gz
-            artifacts/npm/*
-            artifacts/release
-            artifacts/release_notes.md
-          retention-days: 30
-          if-no-files-found: warn
-
-  cli_artifacts:
+  cli_binary_release:
     needs:
       - await_rust_ci
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-13
-            target: x86_64-apple-darwin
-          - os: macos-14
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    uses: ./.github/workflows/cli_binary_release.yml
+    with:
+      tag_name: ${{ needs.await_rust_ci.outputs.tag_name }}
+    secrets: inherit
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.85.0
-          targets: ${{ matrix.target }}
-
-      - name: Cache cargo artifacts
-        uses: swatinem/rust-cache@v2
-
-      - name: Validate release tag
-        id: meta
-        shell: bash
-        run: |
-          scripts/xlog/check_rust_release_tag.sh --tag "${GITHUB_REF_NAME}"
-
-      - name: Build CLI binary
-        shell: bash
-        run: |
-          cargo build --release -p mars-xlog-cli --target "${{ matrix.target }}" --locked
-
-      - name: Package CLI artifact
-        shell: bash
-        run: |
-          scripts/xlog/package_cli_artifact.sh \
-            --version "${{ steps.meta.outputs.release_version }}" \
-            --target "${{ matrix.target }}" \
-            --out-dir artifacts/cli
-
-      - name: Upload CLI artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: mars-xlog-${{ matrix.target }}
-          path: artifacts/cli/*
-          retention-days: 30
-          if-no-files-found: error
-
-  github_release:
+  brew_cask_release:
     needs:
-      - publish
-      - cli_artifacts
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - await_rust_ci
+      - cli_binary_release
+    uses: ./.github/workflows/brew_cask_release.yml
+    with:
+      tag_name: ${{ needs.await_rust_ci.outputs.tag_name }}
+    secrets: inherit
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Validate release tag
-        id: meta
-        shell: bash
-        run: |
-          scripts/xlog/check_rust_release_tag.sh --tag "${GITHUB_REF_NAME}"
-
-      - name: Download release artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts/downloaded
-
-      - name: Collect release assets
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts/release-assets
-          find artifacts/downloaded -maxdepth 3 -type f -print
-          find artifacts/downloaded -type f \
-            \( -name '*.tar.gz' -o -name '*.sha256' -o -name '*.tgz' -o -name 'release_notes.md' \) \
-            -exec cp {} artifacts/release-assets/ \;
-
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ steps.meta.outputs.release_title }}
-          body_path: artifacts/release-assets/release_notes.md
-          prerelease: ${{ steps.meta.outputs.is_preview == 'true' }}
-          files: artifacts/release-assets/*
-
-      - name: Ensure npm token is configured
-        shell: bash
-        run: |
-          if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
-            echo "error: NPM_TOKEN secret is not configured" >&2
-            exit 1
-          fi
-
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Publish npm CLI package when needed
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ steps.meta.outputs.release_version }}"
-          if npm view "mars-xlog-cli@${version}" version >/dev/null 2>&1; then
-            exit 0
-          fi
-
-          npm publish ./packages/mars-xlog-cli-npm --access public
+  npm_release:
+    needs:
+      - await_rust_ci
+      - rust_crates_release
+      - cli_binary_release
+    uses: ./.github/workflows/npm_release.yml
+    with:
+      tag_name: ${{ needs.await_rust_ci.outputs.tag_name }}
+    secrets: inherit

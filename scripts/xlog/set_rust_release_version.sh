@@ -31,6 +31,8 @@ repo_root="$(cd "${script_dir}/../.." && pwd)"
 replace_first_package_version() {
   local file="$1"
   local tmp
+  local mode
+  mode="$(stat -f '%Lp' "$file" 2>/dev/null || stat -c '%a' "$file")"
   tmp="$(mktemp)"
   awk -v version="$version" '
     BEGIN { replaced = 0 }
@@ -43,12 +45,15 @@ replace_first_package_version() {
     }
   ' "$file" > "$tmp"
   mv "$tmp" "$file"
+  chmod "$mode" "$file"
 }
 
 replace_dependency_version() {
   local file="$1"
   local dep="$2"
   local tmp
+  local mode
+  mode="$(stat -f '%Lp' "$file" 2>/dev/null || stat -c '%a' "$file")"
   tmp="$(mktemp)"
   awk -v dep="$dep" -v version="$version" '
     {
@@ -59,6 +64,7 @@ replace_dependency_version() {
     }
   ' "$file" > "$tmp"
   mv "$tmp" "$file"
+  chmod "$mode" "$file"
 }
 
 manifests=(
@@ -92,6 +98,19 @@ awk -v version="$version" '
   }
 ' "${repo_root}/packages/mars-xlog-cli-npm/package.json" > "$tmp"
 mv "$tmp" "${repo_root}/packages/mars-xlog-cli-npm/package.json"
+chmod 0644 "${repo_root}/packages/mars-xlog-cli-npm/package.json"
+
+tmp="$(mktemp)"
+awk -v version="$version" '
+  {
+    if ($0 ~ /^[[:space:]]*version "/) {
+      sub(/version "[^"]+"/, "version \"" version "\"")
+    }
+    print
+  }
+' "${repo_root}/Casks/mars-xlog.rb" > "$tmp"
+mv "$tmp" "${repo_root}/Casks/mars-xlog.rb"
+chmod 0644 "${repo_root}/Casks/mars-xlog.rb"
 
 scripts/xlog/check_rust_release_tag.sh --tag "v${version}" >/dev/null
 

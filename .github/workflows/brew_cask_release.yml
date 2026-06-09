@@ -1,0 +1,74 @@
+name: brew-cask-release
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        description: 'Release tag to publish, for example v0.1.0'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag to publish, for example v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: brew-cask-release-${{ inputs.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ inputs.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag_name }}
+
+      - name: Validate release tag
+        id: meta
+        shell: bash
+        run: |
+          scripts/xlog/check_rust_release_tag.sh --tag "${RELEASE_TAG}"
+
+      - name: Validate Homebrew cask
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.release_version }}"
+          ruby -c Casks/mars-xlog.rb
+          cask_version="$(ruby -ne 'if $_ =~ /version "([^"]+)"/; puts $1; exit; end' Casks/mars-xlog.rb)"
+          if [[ "${cask_version}" != "${version}" ]]; then
+            echo "error: Casks/mars-xlog.rb version ${cask_version} does not match ${version}" >&2
+            exit 1
+          fi
+
+      - name: Ensure macOS CLI assets exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.release_version }}"
+          assets="$(gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name')"
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            expected="mars-xlog-v${version}-${target}.tar.gz"
+            if ! grep -Fxq "${expected}" <<< "${assets}"; then
+              echo "error: missing GitHub Release asset ${expected}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload cask to GitHub release
+        shell: bash
+        run: |
+          gh release upload "${RELEASE_TAG}" Casks/mars-xlog.rb --clobber

@@ -1,0 +1,107 @@
+name: npm-release
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        description: 'Release tag to publish, for example v0.1.0'
+        required: true
+        type: string
+    secrets:
+      NPM_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag to publish, for example v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-release-${{ inputs.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RELEASE_TAG: ${{ inputs.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag_name }}
+
+      - name: Validate release tag
+        id: meta
+        shell: bash
+        run: |
+          scripts/xlog/check_rust_release_tag.sh --tag "${RELEASE_TAG}"
+
+      - name: Ensure GitHub release has CLI assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.release_version }}"
+          assets="$(gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name')"
+          for target in \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin \
+            x86_64-unknown-linux-gnu \
+            x86_64-pc-windows-msvc
+          do
+            expected="mars-xlog-v${version}-${target}.tar.gz"
+            if ! grep -Fxq "${expected}" <<< "${assets}"; then
+              echo "error: missing GitHub Release asset ${expected}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Ensure npm token is configured
+        shell: bash
+        run: |
+          if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
+            echo "error: NPM_TOKEN secret is not configured" >&2
+            exit 1
+          fi
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Pack npm CLI package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/npm
+          npm pack ./packages/mars-xlog-cli-npm --pack-destination artifacts/npm
+
+      - name: Publish npm CLI package when needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.release_version }}"
+          if npm view "mars-xlog-cli@${version}" version >/dev/null 2>&1; then
+            exit 0
+          fi
+
+          npm publish ./packages/mars-xlog-cli-npm --access public
+
+      - name: Upload npm package artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-release-${{ steps.meta.outputs.release_version }}
+          path: artifacts/npm/*
+          retention-days: 30
+          if-no-files-found: warn

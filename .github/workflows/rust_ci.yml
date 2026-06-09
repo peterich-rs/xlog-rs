@@ -6,6 +6,10 @@ on:
     paths:
       - '.github/workflows/rust_ci.yml'
       - '.github/workflows/rust_release.yml'
+      - '.github/workflows/rust_crates_release.yml'
+      - '.github/workflows/cli_binary_release.yml'
+      - '.github/workflows/brew_cask_release.yml'
+      - '.github/workflows/npm_release.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/xlog/**'
@@ -14,12 +18,17 @@ on:
       - 'packages/mars-xlog-cli-npm/**'
       - 'scripts/xlog/**'
       - 'docs/rust_quality_bar.md'
+      - 'docs/rust_release_process.md'
   push:
     branches:
       - main
     paths:
       - '.github/workflows/rust_ci.yml'
       - '.github/workflows/rust_release.yml'
+      - '.github/workflows/rust_crates_release.yml'
+      - '.github/workflows/cli_binary_release.yml'
+      - '.github/workflows/brew_cask_release.yml'
+      - '.github/workflows/npm_release.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/xlog/**'
@@ -28,6 +37,7 @@ on:
       - 'packages/mars-xlog-cli-npm/**'
       - 'scripts/xlog/**'
       - 'docs/rust_quality_bar.md'
+      - 'docs/rust_release_process.md'
 
 concurrency:
   group: rust-ci-${{ github.ref }}
