@@ -76,8 +76,7 @@ git push origin v0.1.0
 
 触发方式：
 
-1. push `v*` tag
-2. 手动 `workflow_dispatch`，传入 `tag_name`
+1. 手动 `workflow_dispatch`，传入 `tag_name`
 
 执行内容：
 
@@ -87,7 +86,7 @@ git push origin v0.1.0
 4. 调用 `brew-cask-release`
 5. 调用 `npm-release`
 
-这是正常全量发版入口。
+这是正常全量发版入口。push tag 不会自动触发该工作流，避免只想发布 brew/npm 时误触发 crates.io 全量发布。
 
 ### 3.2 rust-crates-release
 
@@ -128,7 +127,7 @@ git push origin v0.1.0
 
 执行内容：
 
-1. 校验 tag 和 cask 版本
+1. 校验 tag
 2. 构建并打包下面四个平台：
    - `aarch64-apple-darwin`
    - `x86_64-apple-darwin`
@@ -211,7 +210,12 @@ git tag -a v0.1.0 -m "Rust GA 0.1.0"
 git push origin v0.1.0
 ```
 
-push tag 会自动触发 `full-release`。
+然后手动运行：
+
+```text
+full-release
+tag_name=v0.1.0
+```
 
 ### 4.2 只发布 brew 可用的 CLI 二进制和 cask
 
