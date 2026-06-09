@@ -9,11 +9,11 @@
 3. `brew-cask-release`：校验并上传 Homebrew cask，cask 使用 `cli-binary-release` 产出的 macOS assets
 4. `npm-release`：发布 npm 包 `mars-xlog-cli`，安装时下载 GitHub Release 里的预编译 CLI
 
-`full-release` 是全量编排入口，会按顺序组合这些发布段。
+`full-release` 是当前全量编排入口，会先发布 crates.io，再构建 CLI assets，最后上传 Homebrew cask。npm 发布暂时不接入 `full-release`，等 `NPM_TOKEN` 配置完成后再恢复。
 
 ## 1. 版本号策略
 
-当前 Rust crate、CLI 二进制、Homebrew cask 与 npm 包仍使用同一个 release version。
+当前 Rust crate、CLI 二进制、Homebrew cask 与 npm package manifest 仍使用同一个 release version。
 
 需要保持一致的位置：
 
@@ -76,17 +76,17 @@ git push origin v0.1.0
 
 触发方式：
 
-1. 手动 `workflow_dispatch`，传入 `tag_name`
+1. push `v*` tag 自动触发
+2. 手动 `workflow_dispatch`，传入 `tag_name`，用于补救或重跑
 
 执行内容：
 
 1. 等待 tag commit 对应的 `main` push `rust-ci` 成功
 2. 调用 `rust-crates-release`
-3. 调用 `cli-binary-release`
+3. `rust-crates-release` 成功后调用 `cli-binary-release`
 4. 调用 `brew-cask-release`
-5. 调用 `npm-release`
 
-这是正常全量发版入口。push tag 不会自动触发该工作流，避免只想发布 brew/npm 时误触发 crates.io 全量发布。
+这是正常全量发版入口。push `v*` tag 会自动触发 crates.io 发布；tag 必须只打在已经合入 `main` 且 CI 通过的 release commit 上。
 
 ### 3.2 rust-crates-release
 
@@ -167,8 +167,7 @@ Homebrew cask 和 npm 包都依赖该工作流产出的 assets。
 
 触发方式：
 
-1. 被 `full-release` 调用
-2. 手动 `workflow_dispatch`，传入 `tag_name`
+1. 手动 `workflow_dispatch`，传入 `tag_name`
 
 执行内容：
 
@@ -180,7 +179,7 @@ Homebrew cask 和 npm 包都依赖该工作流产出的 assets。
 
 1. `NPM_TOKEN`
 
-npm 包安装时会下载 GitHub Release 里的 CLI 二进制，因此必须先完成 `cli-binary-release`。
+npm 包安装时会下载 GitHub Release 里的 CLI 二进制，因此必须先完成 `cli-binary-release`。该工作流暂时不在 `full-release` 链路中运行。
 
 ## 4. 推荐发版流程
 
@@ -189,6 +188,7 @@ npm 包安装时会下载 GitHub Release 里的 CLI 二进制，因此必须先�
 ```bash
 git checkout main
 git pull origin main
+git checkout -b release/0.1.0
 
 scripts/xlog/set_rust_release_version.sh 0.1.0
 
@@ -196,26 +196,23 @@ scripts/xlog/check_rust_release_tag.sh --tag v0.1.0
 scripts/xlog/check_mars_xlog_core_release.sh
 scripts/xlog/check_mars_xlog_release.sh --skip-crates-io-check
 scripts/xlog/check_mars_xlog_cli_release.sh --skip-crates-io-check
-npm pack --dry-run --json ./packages/mars-xlog-cli-npm
 
 git add .
 git commit -m "Prepare Rust 0.1.0 release"
-git push origin main
+git push origin release/0.1.0
 ```
 
-等 `main` 上 `rust-ci` 通过后：
+开 PR，等 PR 合入 `main` 且 `main` 上 `rust-ci` 通过后：
 
 ```bash
+git fetch origin main --tags
+git checkout main
+git reset --ff-only origin/main
 git tag -a v0.1.0 -m "Rust GA 0.1.0"
 git push origin v0.1.0
 ```
 
-然后手动运行：
-
-```text
-full-release
-tag_name=v0.1.0
-```
+push `v0.1.0` tag 后，`full-release` 会自动运行。
 
 ### 4.2 只发布 brew 可用的 CLI 二进制和 cask
 
@@ -261,9 +258,9 @@ tag_name=v<version>
 各工作流按版本幂等：
 
 1. crates.io 上已存在的 crate 版本会跳过发布
-2. npm 上已存在的包版本会跳过发布
-3. GitHub Release assets 可以通过重跑 `cli-binary-release` 重新上传
-4. cask 可以通过重跑 `brew-cask-release` 重新上传
+2. GitHub Release assets 可以通过重跑 `cli-binary-release` 重新上传
+3. cask 可以通过重跑 `brew-cask-release` 重新上传
+4. npm 上已存在的包版本会跳过发布；npm 当前只在手动运行 `npm-release` 时涉及
 
 如果 release commit 需要变化，不要复用旧 tag 和旧版本号；修新 commit、递增版本、重新打 tag。
 
@@ -272,6 +269,9 @@ tag_name=v<version>
 全量发布需要：
 
 1. `CARGO_REGISTRY_TOKEN`
-2. `NPM_TOKEN`
 
 只运行 `cli-binary-release` / `brew-cask-release` 不需要 crates.io 或 npm secret。
+
+手动运行 `npm-release` 需要：
+
+1. `NPM_TOKEN`

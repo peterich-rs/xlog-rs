@@ -1,6 +1,6 @@
 {
   "name": "mars-xlog-cli",
-  "version": "0.1.0-preview.2",
+  "version": "0.1.0",
   "description": "Command-line decoder for Tencent Mars xlog files.",
   "license": "MIT",
   "homepage": "https://github.com/peterich-rs/xlog-rs#readme",
