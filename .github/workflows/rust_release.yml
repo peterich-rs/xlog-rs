@@ -1,6 +1,9 @@
 name: full-release
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       tag_name:
@@ -13,7 +16,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: full-release-${{ inputs.tag_name }}
+  group: full-release-${{ inputs.tag_name || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -113,6 +116,7 @@ jobs:
   cli_binary_release:
     needs:
       - await_rust_ci
+      - rust_crates_release
     uses: ./.github/workflows/cli_binary_release.yml
     with:
       tag_name: ${{ needs.await_rust_ci.outputs.tag_name }}
@@ -123,16 +127,6 @@ jobs:
       - await_rust_ci
       - cli_binary_release
     uses: ./.github/workflows/brew_cask_release.yml
-    with:
-      tag_name: ${{ needs.await_rust_ci.outputs.tag_name }}
-    secrets: inherit
-
-  npm_release:
-    needs:
-      - await_rust_ci
-      - rust_crates_release
-      - cli_binary_release
-    uses: ./.github/workflows/npm_release.yml
     with:
       tag_name: ${{ needs.await_rust_ci.outputs.tag_name }}
     secrets: inherit

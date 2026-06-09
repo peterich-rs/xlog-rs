@@ -1,6 +1,6 @@
 [package]
 name = "mars-xlog-cli"
-version = "0.1.0-preview.2"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Command-line decoder for Tencent Mars xlog files."
@@ -18,7 +18,7 @@ name = "mars-xlog"
 path = "src/main.rs"
 
 [dependencies]
-mars-xlog-core = { path = "../xlog-core", version = "0.1.0-preview.2" }
+mars-xlog-core = { path = "../xlog-core", version = "0.1.0" }
 clap = { version = "4.5", features = ["derive"] }
 thiserror = { workspace = true }
 hex = "0.4"
