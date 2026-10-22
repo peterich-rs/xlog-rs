@@ -1,0 +1,10 @@
+# NDK r23's aarch64 linker still defaults to max-page-size=4096.
+# cargo:rustc-link-arg from a dependency build script does not reach the
+# final cdylib, so JNI, UniFFI, and the Flutter native-assets crate all
+# pick this up from the repo root (including packages/xlog/rust).
+# armeabi-v7a is left alone. x86_64 is not in the Android ABI filters.
+[target.aarch64-linux-android]
+rustflags = [
+  "-C", "link-arg=-Wl,-z,max-page-size=16384",
+  "-C", "link-arg=-Wl,-z,common-page-size=4096",
+]
