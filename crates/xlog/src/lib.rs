@@ -23,8 +23,13 @@ use libc::c_int;
 use std::sync::Arc;
 
 mod backend;
+mod event;
+mod layout;
 #[cfg(feature = "tracing")]
 mod tracing_layer;
+
+pub use event::Event;
+pub use layout::{Layout, Piece, WriteLine};
 
 #[cfg(feature = "tracing")]
 pub use tracing_layer::{XlogLayer, XlogLayerConfig, XlogLayerHandle};
@@ -46,6 +51,36 @@ pub enum LogLevel {
     Fatal,
     /// Logging disabled.
     None,
+}
+
+#[cfg(feature = "rust-backend")]
+impl From<LogLevel> for mars_xlog_core::record::LogLevel {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Verbose => Self::Verbose,
+            LogLevel::Debug => Self::Debug,
+            LogLevel::Info => Self::Info,
+            LogLevel::Warn => Self::Warn,
+            LogLevel::Error => Self::Error,
+            LogLevel::Fatal => Self::Fatal,
+            LogLevel::None => Self::None,
+        }
+    }
+}
+
+#[cfg(feature = "rust-backend")]
+impl From<mars_xlog_core::record::LogLevel> for LogLevel {
+    fn from(level: mars_xlog_core::record::LogLevel) -> Self {
+        match level {
+            mars_xlog_core::record::LogLevel::Verbose => Self::Verbose,
+            mars_xlog_core::record::LogLevel::Debug => Self::Debug,
+            mars_xlog_core::record::LogLevel::Info => Self::Info,
+            mars_xlog_core::record::LogLevel::Warn => Self::Warn,
+            mars_xlog_core::record::LogLevel::Error => Self::Error,
+            mars_xlog_core::record::LogLevel::Fatal => Self::Fatal,
+            mars_xlog_core::record::LogLevel::None => Self::None,
+        }
+    }
 }
 
 /// Controls whether logs are appended asynchronously or synchronously.
@@ -163,6 +198,25 @@ pub enum XlogError {
     #[error("xlog initialization failed")]
     /// Backend initialization failed.
     InitFailed,
+    #[error("cache_days must be non-negative")]
+    /// `cache_days` was negative.
+    InvalidCacheDays,
+    #[error("compress level {level} is outside the range accepted by {mode:?}")]
+    /// `compress_level` is outside the selected compressor's range.
+    InvalidCompressLevel {
+        /// Rejected level.
+        level: i32,
+        /// Compressor that rejected it.
+        mode: CompressMode,
+    },
+    #[error("max alive time {alive_seconds}s is below the minimum {minimum}s")]
+    /// Retention was below the Mars floor of one day.
+    AliveTimeTooSmall {
+        /// Requested retention, in seconds.
+        alive_seconds: i64,
+        /// Minimum retention the engine accepts, in seconds.
+        minimum: i64,
+    },
 }
 
 /// Configuration used to create an Xlog instance or open the global appender.
@@ -251,12 +305,7 @@ impl XlogConfig {
 /// and released when the last handle is dropped.
 #[derive(Clone)]
 pub struct Xlog {
-    inner: Arc<Inner>,
-}
-
-struct Inner {
-    backend: Arc<dyn backend::XlogBackend>,
-    name_prefix: String,
+    inner: Arc<backend::RustBackend>,
 }
 
 impl Xlog {
@@ -267,30 +316,36 @@ impl Xlog {
     /// - If a live instance exists with the same config, it is reused.
     /// - If a live instance exists with a different config, returns
     ///   [`XlogError::ConfigConflict`].
+    ///
+    /// The line layout is Mars. A reused instance keeps the layout from the
+    /// first successful init. The level is updated on every successful init.
     pub fn init(config: XlogConfig, level: LogLevel) -> Result<Self, XlogError> {
-        Self::new(config, level)
+        Self::init_with_layout(config, level, Layout::mars())
+    }
+
+    /// Initialize or reuse a named instance with an explicit line layout.
+    ///
+    /// Config equality does not include the layout. When the name is already
+    /// live with the same config, `layout` is dropped and the original layout
+    /// stays in place.
+    pub fn init_with_layout(
+        config: XlogConfig,
+        level: LogLevel,
+        layout: Layout,
+    ) -> Result<Self, XlogError> {
+        let inner = backend::provider().new_instance_with_layout(&config, level, layout)?;
+        Ok(Self { inner })
     }
 
     #[doc(hidden)]
     pub fn new(config: XlogConfig, level: LogLevel) -> Result<Self, XlogError> {
-        let backend = backend::provider().new_instance(&config, level)?;
-        Ok(Self {
-            inner: Arc::new(Inner {
-                backend,
-                name_prefix: config.name_prefix,
-            }),
-        })
+        Self::init(config, level)
     }
 
     /// Look up an existing instance by name prefix.
     pub fn get(name_prefix: &str) -> Option<Self> {
-        let backend = backend::provider().get_instance(name_prefix)?;
-        Some(Self {
-            inner: Arc::new(Inner {
-                backend,
-                name_prefix: name_prefix.to_string(),
-            }),
-        })
+        let inner = backend::provider().get_instance(name_prefix)?;
+        Some(Self { inner })
     }
 
     #[doc(hidden)]
@@ -323,49 +378,50 @@ impl Xlog {
         backend::provider().set_console_fun(fun);
     }
 
-    /// Returns the raw instance handle used by the underlying C++ library.
+    /// Returns the process-local instance id.
+    #[doc(hidden)]
     pub fn instance(&self) -> usize {
-        self.inner.backend.instance()
+        self.inner.instance()
     }
 
     /// Returns `true` if logs at `level` are enabled for this instance.
     pub fn is_enabled(&self, level: LogLevel) -> bool {
-        self.inner.backend.is_enabled(level)
+        self.inner.is_enabled(level)
     }
 
     /// Get the current log level for this instance.
     pub fn level(&self) -> LogLevel {
-        self.inner.backend.level()
+        self.inner.level()
     }
 
     /// Set the minimum log level for this instance.
     pub fn set_level(&self, level: LogLevel) {
-        self.inner.backend.set_level(level);
+        self.inner.set_level(level);
     }
 
     /// Switch between async and sync appender modes.
     pub fn set_appender_mode(&self, mode: AppenderMode) {
-        self.inner.backend.set_appender_mode(mode);
+        self.inner.set_appender_mode(mode);
     }
 
     /// Flush buffered logs for this instance.
     pub fn flush(&self, sync: bool) {
-        self.inner.backend.flush(sync);
+        self.inner.flush(sync);
     }
 
     /// Enable or disable console logging for this instance (platform dependent).
     pub fn set_console_log_open(&self, open: bool) {
-        self.inner.backend.set_console_log_open(open);
+        self.inner.set_console_log_open(open);
     }
 
     /// Set the max log file size in bytes for this instance (0 disables splitting).
     pub fn set_max_file_size(&self, max_bytes: i64) {
-        self.inner.backend.set_max_file_size(max_bytes);
+        self.inner.set_max_file_size(max_bytes);
     }
 
     /// Set the max log file age in seconds for this instance before deletion/rotation.
-    pub fn set_max_alive_time(&self, alive_seconds: i64) {
-        self.inner.backend.set_max_alive_time(alive_seconds);
+    pub fn set_max_alive_time(&self, alive_seconds: i64) -> Result<(), XlogError> {
+        self.inner.set_max_alive_time(alive_seconds)
     }
 
     /// Log a message with caller file/line captured via `#[track_caller]`.
@@ -388,6 +444,17 @@ impl Xlog {
             return;
         }
         self.write_with_meta(level, tag, "", "", 0, msg);
+    }
+
+    /// Log an already-built [`Event`].
+    ///
+    /// The event's timestamp is kept. `trace_log` is not set. Caller strings
+    /// only need to live until this call returns.
+    pub fn write_event(&self, event: &Event<'_>) {
+        if !self.is_enabled(event.level) {
+            return;
+        }
+        self.inner.emit(event, false);
     }
 
     /// Log with explicit metadata (file, function, line).
@@ -423,15 +490,8 @@ impl Xlog {
         if !self.is_enabled(level) {
             return;
         }
-        self.inner.backend.write_with_meta(
-            level,
-            tag.unwrap_or(&self.inner.name_prefix),
-            file,
-            func,
-            line,
-            msg,
-            raw_meta,
-        );
+        self.inner
+            .emit_category(level, tag, file, func, line, msg, raw_meta);
     }
 
     /// Write via the global/default appender with raw metadata.
@@ -566,12 +626,21 @@ macro_rules! xlog_error {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
 
+    use mars_xlog_core::compress::decompress_raw_zlib;
+    use mars_xlog_core::protocol::{
+        AppendMode, LogHeader, HEADER_LEN, MAGIC_END, MAGIC_SYNC_NO_CRYPT_ZLIB_START, TAILER_LEN,
+    };
     use tempfile::TempDir;
 
-    use super::{CompressMode, LogLevel, Xlog, XlogConfig, XlogError};
+    use super::{
+        AppenderMode, CompressMode, Event, Layout, LogLevel, Piece, RawLogMeta, WriteLine, Xlog,
+        XlogConfig, XlogError,
+    };
 
     static NEXT_PREFIX_ID: AtomicUsize = AtomicUsize::new(1);
     static APPENDER_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -638,5 +707,207 @@ mod tests {
         Xlog::appender_open(cfg1, LogLevel::Info).expect("open first");
         let err = Xlog::appender_open(cfg2, LogLevel::Info).expect_err("must reject conflict");
         assert!(matches!(err, XlogError::ConfigConflict { .. }));
+    }
+
+    fn decoded_log_text(dir: &Path) -> String {
+        let mut files: Vec<_> = fs::read_dir(dir)
+            .expect("read log dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("xlog"))
+            .collect();
+        files.sort();
+        assert!(
+            !files.is_empty(),
+            "expected an xlog file in {}",
+            dir.display()
+        );
+
+        let mut merged = String::new();
+        for file in files {
+            let bytes = fs::read(file).expect("read xlog");
+            let mut offset = 0usize;
+            while offset + HEADER_LEN + TAILER_LEN <= bytes.len() {
+                let Ok(header) = LogHeader::decode(&bytes[offset..offset + HEADER_LEN]) else {
+                    break;
+                };
+                let payload_len = header.len as usize;
+                let start = offset + HEADER_LEN;
+                let end = start + payload_len;
+                if end + TAILER_LEN > bytes.len() || bytes[end] != MAGIC_END {
+                    break;
+                }
+                let payload = &bytes[start..end];
+                let plain = if header.magic.mode() == AppendMode::Async {
+                    decompress_raw_zlib(payload).expect("zlib payload")
+                } else {
+                    payload.to_vec()
+                };
+                merged.push_str(std::str::from_utf8(&plain).expect("utf-8 plaintext"));
+                offset = end + TAILER_LEN;
+            }
+        }
+        merged
+    }
+
+    fn first_sync_payload(dir: &Path) -> (u8, String) {
+        let mut files: Vec<_> = fs::read_dir(dir)
+            .expect("read log dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("xlog"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "expected an xlog file");
+        let bytes = fs::read(&files[0]).expect("read xlog");
+        let header = LogHeader::decode(&bytes[..HEADER_LEN]).expect("header");
+        let payload_len = header.len as usize;
+        let start = HEADER_LEN;
+        let end = start + payload_len;
+        assert!(end < bytes.len(), "payload fits before end byte");
+        assert_eq!(bytes[end], MAGIC_END);
+        let text = String::from_utf8(bytes[start..end].to_vec()).expect("sync plaintext");
+        (u8::from(header.magic), text)
+    }
+
+    fn sync_config(dir: &Path, label: &str) -> XlogConfig {
+        XlogConfig::new(dir.display().to_string(), unique_prefix(label)).mode(AppenderMode::Sync)
+    }
+
+    #[test]
+    fn default_init_sync_payload_is_mars_line() {
+        let dir = TempDir::new().expect("tempdir");
+        let logger =
+            Xlog::init(sync_config(dir.path(), "mars-default"), LogLevel::Info).expect("init");
+        logger.log(LogLevel::Info, Some("tag"), "hello-mars");
+        logger.flush(true);
+
+        let (magic, text) = first_sync_payload(dir.path());
+        assert_eq!(magic, MAGIC_SYNC_NO_CRYPT_ZLIB_START);
+        assert!(text.starts_with("[I]["), "{text}");
+        assert!(text.contains("hello-mars"));
+    }
+
+    #[test]
+    fn pieces_layout_writes_message_only() {
+        let dir = TempDir::new().expect("tempdir");
+        let logger = Xlog::init_with_layout(
+            sync_config(dir.path(), "pieces"),
+            LogLevel::Info,
+            Layout::pieces([Piece::Message, Piece::Literal("\n")]),
+        )
+        .expect("init");
+        logger.log(LogLevel::Info, Some("tag"), "hello");
+        logger.flush(true);
+
+        let (magic, text) = first_sync_payload(dir.path());
+        assert_eq!(magic, MAGIC_SYNC_NO_CRYPT_ZLIB_START);
+        assert_eq!(text, "hello\n");
+    }
+
+    struct MessageOnly;
+
+    impl WriteLine for MessageOnly {
+        fn write_line(&self, out: &mut String, event: &Event<'_>) {
+            out.push_str(event.message);
+        }
+    }
+
+    #[test]
+    fn custom_layout_replaces_plaintext_only() {
+        let dir = TempDir::new().expect("tempdir");
+        let logger = Xlog::init_with_layout(
+            sync_config(dir.path(), "custom"),
+            LogLevel::Info,
+            Layout::custom(Arc::new(MessageOnly)),
+        )
+        .expect("init");
+        logger.write_event(&Event::new(LogLevel::Info, "tag", "custom-body"));
+        logger.flush(true);
+
+        let (magic, text) = first_sync_payload(dir.path());
+        assert_eq!(magic, MAGIC_SYNC_NO_CRYPT_ZLIB_START);
+        assert_eq!(text, "custom-body");
+    }
+
+    #[test]
+    fn reused_init_keeps_the_first_layout() {
+        let dir = TempDir::new().expect("tempdir");
+        let cfg = sync_config(dir.path(), "layout-reuse");
+        let first = Xlog::init_with_layout(
+            cfg.clone(),
+            LogLevel::Info,
+            Layout::pieces([Piece::Message, Piece::Literal("\n")]),
+        )
+        .expect("first");
+        let _second =
+            Xlog::init_with_layout(cfg, LogLevel::Debug, Layout::custom(Arc::new(MessageOnly)))
+                .expect("reuse");
+        assert_eq!(first.level(), LogLevel::Debug);
+        first.log(LogLevel::Info, Some("tag"), "kept");
+        first.flush(true);
+
+        let (_magic, text) = first_sync_payload(dir.path());
+        assert_eq!(text, "kept\n");
+    }
+
+    #[test]
+    fn write_event_drops_caller_string_before_flush() {
+        let sync_dir = TempDir::new().expect("sync dir");
+        let sync_logger = Xlog::init(sync_config(sync_dir.path(), "borrow-sync"), LogLevel::Info)
+            .expect("sync init");
+        {
+            let message = String::from("borrow-sync-unique");
+            let event = Event::new(LogLevel::Info, "tag", &message);
+            sync_logger.write_event(&event);
+        }
+        sync_logger.flush(true);
+        let (_magic, text) = first_sync_payload(sync_dir.path());
+        assert!(text.contains("borrow-sync-unique"), "{text}");
+
+        let async_dir = TempDir::new().expect("async dir");
+        let async_cfg = XlogConfig::new(
+            async_dir.path().display().to_string(),
+            unique_prefix("borrow-async"),
+        );
+        let async_logger = Xlog::init(async_cfg, LogLevel::Info).expect("async init");
+        {
+            let message = String::from("borrow-async-unique");
+            let event = Event::new(LogLevel::Info, "tag", &message);
+            async_logger.write_event(&event);
+        }
+        async_logger.flush(true);
+        let text = decoded_log_text(async_dir.path());
+        assert!(text.contains("borrow-async-unique"), "{text}");
+    }
+
+    #[test]
+    fn appender_write_uses_global_meta_rule() {
+        let _lock = appender_test_lock().lock().expect("lock poisoned");
+        let _guard = AppenderCloseGuard;
+        Xlog::appender_close();
+
+        let dir = TempDir::new().expect("tempdir");
+        let cfg = XlogConfig::new(
+            dir.path().display().to_string(),
+            unique_prefix("global-meta"),
+        )
+        .mode(AppenderMode::Sync);
+        Xlog::appender_open(cfg, LogLevel::Info).expect("open");
+        Xlog::appender_write_with_meta_raw(
+            LogLevel::Info,
+            Some("tag"),
+            "f.rs",
+            "func",
+            1,
+            "global-body",
+            RawLogMeta::new(321, -1, -1),
+        );
+        Xlog::flush_all(true);
+
+        let (magic, text) = first_sync_payload(dir.path());
+        assert_eq!(magic, MAGIC_SYNC_NO_CRYPT_ZLIB_START);
+        assert!(text.contains("321"), "{text}");
+        assert!(!text.contains(", -1"), "{text}");
     }
 }

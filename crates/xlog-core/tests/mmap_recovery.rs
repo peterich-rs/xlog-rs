@@ -1,18 +1,18 @@
 use std::fs;
 
 use mars_xlog_core::buffer::{PersistentBuffer, DEFAULT_BUFFER_BLOCK_LEN};
-use mars_xlog_core::file_manager::FileManager;
-use mars_xlog_core::oneshot::{oneshot_flush, FileIoAction};
+use mars_xlog_core::file_manager::{CacheDays, FileManager};
+use mars_xlog_core::oneshot::{oneshot_flush, OneshotOutcome};
 use mars_xlog_core::protocol::{
-    select_magic, AppendMode, CompressionKind, LogHeader, HEADER_LEN, MAGIC_END,
+    AppendMode, BlockMagic, CompressionKind, Hour, LogHeader, HEADER_LEN, MAGIC_END,
 };
 
 fn make_block(seq: u16, payload: &[u8]) -> Vec<u8> {
     let header = LogHeader {
-        magic: select_magic(CompressionKind::Zlib, AppendMode::Async, false),
+        magic: BlockMagic::new(CompressionKind::Zlib, AppendMode::Async, false),
         seq,
-        begin_hour: 10,
-        end_hour: 10,
+        begin_hour: Hour::try_from(10).unwrap(),
+        end_hour: Hour::try_from(10).unwrap(),
         len: payload.len() as u32,
         client_pubkey: [0; 64],
     };
@@ -46,7 +46,7 @@ fn parse_payloads(buf: &[u8]) -> Vec<String> {
 #[test]
 fn mmap_recovery_salvages_tailer_torn_block() {
     let dir = tempfile::tempdir().unwrap();
-    let manager = FileManager::new(dir.path().to_path_buf(), None, "demo".to_string(), 0).unwrap();
+    let manager = FileManager::new(dir.path(), None, "demo", CacheDays::ZERO).unwrap();
     let mmap_path = manager.mmap_path();
 
     let mut buffer =
@@ -74,7 +74,7 @@ fn mmap_recovery_salvages_tailer_torn_block() {
 #[test]
 fn oneshot_flush_recovers_cpp_pending_buffer() {
     let dir = tempfile::tempdir().unwrap();
-    let manager = FileManager::new(dir.path().to_path_buf(), None, "demo".to_string(), 0).unwrap();
+    let manager = FileManager::new(dir.path(), None, "demo", CacheDays::ZERO).unwrap();
 
     let mmap_path = manager.mmap_path();
     let full = make_block(7, b"pending");
@@ -83,7 +83,7 @@ fn oneshot_flush_recovers_cpp_pending_buffer() {
     fs::write(&mmap_path, raw).unwrap();
 
     let action = oneshot_flush(&manager, DEFAULT_BUFFER_BLOCK_LEN, 0);
-    assert_eq!(action, FileIoAction::Success);
+    assert!(matches!(action, Ok(OneshotOutcome::Success)));
     assert!(!mmap_path.exists());
 
     let mut xlogs: Vec<_> = fs::read_dir(dir.path())
@@ -109,8 +109,8 @@ fn oneshot_flush_recovers_cpp_pending_buffer() {
 #[test]
 fn oneshot_flush_returns_unnecessary_without_mmap() {
     let dir = tempfile::tempdir().unwrap();
-    let manager = FileManager::new(dir.path().to_path_buf(), None, "demo".to_string(), 0).unwrap();
+    let manager = FileManager::new(dir.path(), None, "demo", CacheDays::ZERO).unwrap();
 
     let action = oneshot_flush(&manager, DEFAULT_BUFFER_BLOCK_LEN, 0);
-    assert_eq!(action, FileIoAction::Unnecessary);
+    assert!(matches!(action, Ok(OneshotOutcome::Unnecessary)));
 }

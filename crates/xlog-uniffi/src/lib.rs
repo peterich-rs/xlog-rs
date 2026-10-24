@@ -241,7 +241,7 @@ impl Logger {
 
     /// Set max alive time in seconds.
     pub fn set_max_alive_time(&self, alive_seconds: i64) {
-        self.inner.set_max_alive_time(alive_seconds);
+        let _ = self.inner.set_max_alive_time(alive_seconds);
     }
 
     /// Log a message without file/function metadata.

@@ -370,7 +370,7 @@ pub extern "system" fn Java_com_tencent_mars_xlog_example_XlogBridge_nativeSetMa
     alive_seconds: jlong,
 ) {
     if let Some(logger) = get_logger(handle as i64) {
-        logger.set_max_alive_time(alive_seconds as i64);
+        let _ = logger.set_max_alive_time(alive_seconds as i64);
     }
 }
 

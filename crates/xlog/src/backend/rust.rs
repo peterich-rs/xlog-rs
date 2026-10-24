@@ -15,14 +15,12 @@ use mars_xlog_core::appender_engine::{
     AppenderEngine, AsyncFlushReason as EngineAsyncFlushReason, EngineMode,
 };
 use mars_xlog_core::buffer::{PersistentBuffer, DEFAULT_BUFFER_BLOCK_LEN};
-use mars_xlog_core::compress::{StreamCompressor, ZlibStreamCompressor, ZstdStreamCompressor};
-use mars_xlog_core::crypto::EcdhTeaCipher;
+use mars_xlog_core::compress::{ZlibLevel, ZstdLevel};
+use mars_xlog_core::crypto::Crypt;
 use mars_xlog_core::dump::{dump_to_file, memory_dump};
-use mars_xlog_core::file_manager::FileManager;
-use mars_xlog_core::formatter::format_record_parts_into;
-use mars_xlog_core::oneshot::{
-    oneshot_flush as core_oneshot_flush, FileIoAction as CoreFileIoAction,
-};
+use mars_xlog_core::file_manager::{CacheDays, FileManager};
+use mars_xlog_core::frame::FrameWriter;
+use mars_xlog_core::oneshot::{oneshot_flush as core_oneshot_flush, OneshotError, OneshotOutcome};
 use mars_xlog_core::platform_console::write_console_line;
 #[cfg(any(
     target_os = "ios",
@@ -31,10 +29,8 @@ use mars_xlog_core::platform_console::write_console_line;
     target_os = "watchos"
 ))]
 use mars_xlog_core::platform_console::{set_apple_console_fun, AppleConsoleFun};
-use mars_xlog_core::platform_tid::{current_tid, main_tid};
-use mars_xlog_core::protocol::{
-    select_magic, AppendMode, CompressionKind, LogHeader, SeqGenerator, HEADER_LEN,
-};
+use mars_xlog_core::platform_tid::current_tid;
+use mars_xlog_core::protocol::{CompressionKind, Hour, SeqGenerator, HEADER_LEN};
 use mars_xlog_core::record::LogLevel as CoreLogLevel;
 use mars_xlog_core::registry::InstanceRegistry;
 
@@ -45,7 +41,8 @@ use super::metrics::{
     AsyncPendingFinalizeReason, AsyncStageSample, AsyncWriteFrontProfile, SyncBuildStage,
     SyncStageSample, METRICS_ENABLED,
 };
-use super::{XlogBackend, XlogBackendProvider};
+use crate::event::Event;
+use crate::layout::{format_line, Layout};
 use crate::{
     AppenderMode, CompressMode, FileIoAction, LogLevel, RawLogMeta, XlogConfig, XlogError,
 };
@@ -58,19 +55,20 @@ use crate::{
 ))]
 use crate::ConsoleFun;
 
-pub(super) fn provider() -> &'static dyn XlogBackendProvider {
+pub(crate) fn provider() -> &'static RustBackendProvider {
     static PROVIDER: RustBackendProvider = RustBackendProvider;
     &PROVIDER
 }
 
-struct RustBackendProvider;
+pub(crate) struct RustBackendProvider;
 
-struct RustBackend {
+pub(crate) struct RustBackend {
     id: usize,
     config: XlogConfig,
+    layout: Layout,
     level: AtomicI32,
     console_open: AtomicBool,
-    cipher: EcdhTeaCipher,
+    cipher: Crypt,
     engine: Arc<AppenderEngine>,
     async_frontend: AsyncFrontend,
     async_state: Mutex<AsyncStateSlot>,
@@ -120,39 +118,8 @@ enum MetaResolveMode {
     Global,
 }
 
-enum AsyncCompressor {
-    Zlib(ZlibStreamCompressor),
-    Zstd(ZstdStreamCompressor),
-}
-
-impl AsyncCompressor {
-    fn compress_chunk(&mut self, input: &[u8], out: &mut Vec<u8>) -> bool {
-        match self {
-            AsyncCompressor::Zlib(c) => c.compress_chunk(input, out).is_ok(),
-            AsyncCompressor::Zstd(c) => c.compress_chunk(input, out).is_ok(),
-        }
-    }
-
-    fn finish(&mut self, out: &mut Vec<u8>) -> bool {
-        match self {
-            AsyncCompressor::Zlib(c) => c.flush(out).is_ok(),
-            AsyncCompressor::Zstd(c) => c.flush(out).is_ok(),
-        }
-    }
-}
-
-struct AsyncPendingState {
-    header: LogHeader,
-    payload_len: usize,
-    line_count: u64,
-    raw_input_bytes: u64,
-    compressor: AsyncCompressor,
-    crypt_tail: Vec<u8>,
-    flush_epoch: u64,
-}
-
 struct AsyncStateSlot {
-    pending: Option<AsyncPendingState>,
+    pending: Option<FrameWriter>,
     busy: bool,
 }
 
@@ -167,21 +134,21 @@ impl AsyncStateSlot {
 
 struct CheckedOutAsyncState<'a> {
     backend: &'a RustBackend,
-    pending: Option<AsyncPendingState>,
+    pending: Option<FrameWriter>,
     checkout_lock_ns: u64,
     checkout_wait_ns: u64,
 }
 
 impl CheckedOutAsyncState<'_> {
-    fn pending(&self) -> Option<&AsyncPendingState> {
+    fn pending(&self) -> Option<&FrameWriter> {
         self.pending.as_ref()
     }
 
-    fn pending_mut(&mut self) -> Option<&mut AsyncPendingState> {
+    fn pending_mut(&mut self) -> Option<&mut FrameWriter> {
         self.pending.as_mut()
     }
 
-    fn set_pending(&mut self, pending: Option<AsyncPendingState>) {
+    fn set_pending(&mut self, pending: Option<FrameWriter>) {
         self.pending = pending;
     }
 
@@ -208,109 +175,35 @@ impl Drop for CheckedOutAsyncState<'_> {
     }
 }
 
-impl AsyncPendingState {
-    #[allow(clippy::too_many_arguments)]
-    fn append_chunk(
-        &mut self,
-        chunk: &[u8],
-        compress_scratch: &mut Vec<u8>,
-        crypto_scratch: &mut Vec<u8>,
-        cipher: &EcdhTeaCipher,
-        engine: &AppenderEngine,
-        end_hour: u8,
-        force_flush: bool,
-    ) -> bool {
-        compress_scratch.clear();
-        if !self.compressor.compress_chunk(chunk, compress_scratch) {
-            return false;
-        }
-        let appended = self.append_encrypted(
-            compress_scratch,
-            crypto_scratch,
-            cipher,
-            engine,
-            end_hour,
-            force_flush,
-        );
-        if appended {
-            self.line_count = self.line_count.saturating_add(1);
-            self.raw_input_bytes = self.raw_input_bytes.saturating_add(chunk.len() as u64);
-        }
-        appended
-    }
+fn push_frame_line(
+    writer: &mut FrameWriter,
+    engine: &AppenderEngine,
+    chunk: &[u8],
+    encoded: &mut Vec<u8>,
+    end_hour: Hour,
+    force_flush: bool,
+) -> bool {
+    let Ok(truncate) = writer.push_line(chunk, end_hour, encoded) else {
+        return false;
+    };
+    engine
+        .write_async_parts(None, truncate, encoded, end_hour, false, force_flush)
+        .is_ok()
+}
 
-    fn finalize(
-        &mut self,
-        compress_scratch: &mut Vec<u8>,
-        crypto_scratch: &mut Vec<u8>,
-        cipher: &EcdhTeaCipher,
-        engine: &AppenderEngine,
-        end_hour: u8,
-        force_flush: bool,
-    ) -> bool {
-        compress_scratch.clear();
-        if !self.compressor.finish(compress_scratch) {
-            return false;
-        }
-        if !compress_scratch.is_empty()
-            && !self.append_encrypted(
-                compress_scratch,
-                crypto_scratch,
-                cipher,
-                engine,
-                end_hour,
-                force_flush,
-            )
-        {
-            return false;
-        }
-        engine.finalize_async_pending(end_hour, force_flush).is_ok()
-    }
-
-    fn append_encrypted(
-        &mut self,
-        input: &[u8],
-        crypto_scratch: &mut Vec<u8>,
-        cipher: &EcdhTeaCipher,
-        engine: &AppenderEngine,
-        end_hour: u8,
-        force_flush: bool,
-    ) -> bool {
-        if !cipher.enabled() {
-            if engine
-                .append_async_chunk(0, input, end_hour, force_flush)
-                .is_err()
-            {
-                return false;
-            }
-            self.payload_len = self.payload_len.saturating_add(input.len());
-            return true;
-        }
-        let previous_tail_len = self.crypt_tail.len();
-        crypto_scratch.clear();
-        crypto_scratch.extend_from_slice(&self.crypt_tail);
-        crypto_scratch.extend_from_slice(input);
-        let full_len = crypto_scratch.len() / 8 * 8;
-        if full_len > 0 {
-            cipher.encrypt_async_in_place(&mut crypto_scratch[..full_len]);
-        }
-
-        let next_payload_len = self
-            .payload_len
-            .saturating_sub(previous_tail_len)
-            .saturating_add(crypto_scratch.len());
-        if engine
-            .append_async_chunk(previous_tail_len, crypto_scratch, end_hour, force_flush)
-            .is_err()
-        {
-            return false;
-        }
-        self.crypt_tail.clear();
-        self.crypt_tail
-            .extend_from_slice(&crypto_scratch[full_len..]);
-        self.payload_len = next_payload_len;
-        true
-    }
+fn finish_frame(
+    writer: &mut FrameWriter,
+    engine: &AppenderEngine,
+    encoded: &mut Vec<u8>,
+    end_hour: Hour,
+    force_flush: bool,
+) -> bool {
+    let Ok(truncate) = writer.finish(end_hour, encoded) else {
+        return false;
+    };
+    engine
+        .write_async_parts(None, truncate, encoded, end_hour, true, force_flush)
+        .is_ok()
 }
 
 impl AsyncFlushControlReason {
@@ -337,23 +230,23 @@ fn profiler_reason_from_engine(reason: EngineAsyncFlushReason) -> AsyncPendingFi
     }
 }
 
-fn record_pending_block_profile(state: &AsyncPendingState, reason: AsyncPendingFinalizeReason) {
+fn record_pending_block_profile(state: &FrameWriter, reason: AsyncPendingFinalizeReason) {
     record_async_pending_block(
-        state.line_count,
-        state.raw_input_bytes,
-        state.payload_len as u64,
+        state.line_count(),
+        state.raw_input_bytes(),
+        state.payload_len() as u64,
         reason,
     );
 }
 
 fn discard_stale_pending_block(
-    pending: &mut Option<AsyncPendingState>,
+    pending: &mut Option<FrameWriter>,
     engine_epoch: u64,
     engine_reason: EngineAsyncFlushReason,
 ) {
     let stale = pending
         .as_ref()
-        .map(|state| state.flush_epoch != engine_epoch)
+        .map(|state| state.flush_epoch() != engine_epoch)
         .unwrap_or(false);
     if !stale {
         return;
@@ -368,7 +261,6 @@ struct HotPathScratch {
     line: String,
     block: Vec<u8>,
     compress: Vec<u8>,
-    crypto: Vec<u8>,
 }
 
 impl HotPathScratch {
@@ -377,7 +269,6 @@ impl HotPathScratch {
             line: String::with_capacity(16 * 1024),
             block: Vec::with_capacity(DEFAULT_BUFFER_BLOCK_LEN),
             compress: Vec::with_capacity(16 * 1024),
-            crypto: Vec::with_capacity(16 * 1024),
         }
     }
 }
@@ -453,7 +344,7 @@ fn current_async_line_pool_shard() -> usize {
 }
 
 impl AsyncFrontend {
-    fn new(engine: Arc<AppenderEngine>, config: XlogConfig, cipher: EcdhTeaCipher) -> Self {
+    fn new(engine: Arc<AppenderEngine>, config: XlogConfig, cipher: Crypt) -> Self {
         let (tx, rx) = sync_channel::<AsyncFrontendCommand>(ASYNC_FRONTEND_QUEUE_CAPACITY);
         let accepting = Arc::new(AtomicBool::new(true));
         let flush_queued = Arc::new(AtomicBool::new(false));
@@ -631,10 +522,10 @@ fn run_async_frontend_worker(
     line_pools: Arc<[ArrayQueue<String>]>,
     engine: Arc<AppenderEngine>,
     config: XlogConfig,
-    cipher: EcdhTeaCipher,
+    cipher: Crypt,
 ) {
     let capacity = engine.buffer_capacity();
-    let mut pending: Option<AsyncPendingState> = None;
+    let mut pending: Option<FrameWriter> = None;
     let mut compress_scratch = Vec::with_capacity(16 * 1024);
     let mut crypto_scratch = Vec::with_capacity(16 * 1024);
     let mut block_scratch = Vec::with_capacity(DEFAULT_BUFFER_BLOCK_LEN);
@@ -730,22 +621,15 @@ fn handle_async_frontend_control(
     cmd: AsyncFrontendCommand,
     flush_queued: &AtomicBool,
     engine: &AppenderEngine,
-    cipher: &EcdhTeaCipher,
-    pending: &mut Option<AsyncPendingState>,
+    _cipher: &Crypt,
+    pending: &mut Option<FrameWriter>,
     compress_scratch: &mut Vec<u8>,
-    crypto_scratch: &mut Vec<u8>,
+    _crypto_scratch: &mut Vec<u8>,
 ) -> bool {
     match cmd {
         AsyncFrontendCommand::Flush { sync, ack, reason } => {
             flush_queued.store(false, Ordering::Release);
-            worker_finalize_pending(
-                engine,
-                cipher,
-                pending,
-                compress_scratch,
-                crypto_scratch,
-                reason.profiler_reason(),
-            );
+            worker_finalize_pending(engine, pending, compress_scratch, reason.profiler_reason());
             let _ = engine.flush_with_reason(sync, reason.engine_reason());
             if METRICS_ENABLED {
                 record_async_flush_requeues(engine.take_async_flush_requeue_count());
@@ -759,10 +643,8 @@ fn handle_async_frontend_control(
             flush_queued.store(false, Ordering::Release);
             worker_finalize_pending(
                 engine,
-                cipher,
                 pending,
                 compress_scratch,
-                crypto_scratch,
                 AsyncPendingFinalizeReason::Stop,
             );
             let _ = engine.flush_with_reason(true, EngineAsyncFlushReason::Stop);
@@ -796,11 +678,11 @@ fn handle_async_frontend_write(
     cmd: &mut AsyncWriteCommand,
     engine: &AppenderEngine,
     config: &XlogConfig,
-    cipher: &EcdhTeaCipher,
+    cipher: &Crypt,
     capacity: usize,
-    pending: &mut Option<AsyncPendingState>,
+    pending: &mut Option<FrameWriter>,
     compress_scratch: &mut Vec<u8>,
-    crypto_scratch: &mut Vec<u8>,
+    _crypto_scratch: &mut Vec<u8>,
     block_scratch: &mut Vec<u8>,
 ) {
     let mut stage = AsyncBuildStage::default();
@@ -821,7 +703,7 @@ fn handle_async_frontend_write(
             cmd.line.as_str(),
             block_scratch,
         ) {
-            let _ = engine.write_block(block_scratch.as_slice(), cmd.force_flush);
+            let _ = engine.write_sealed(block_scratch.as_slice(), cmd.force_flush);
         }
         if let Some(begin) = append_begin {
             stage.append_ns = begin.elapsed().as_nanos() as u64;
@@ -849,20 +731,17 @@ fn handle_async_frontend_write(
     let (engine_epoch, engine_flush_reason) = engine.async_flush_state();
     discard_stale_pending_block(pending, engine_epoch, engine_flush_reason);
 
-    if pending.is_none() {
-        let Some(new_state) =
-            new_async_pending_state_for(config, cipher, cmd.now_hour, engine_epoch)
-        else {
-            return;
-        };
-        let begin_pending_begin = profile_enabled.then(Instant::now);
-        if engine.begin_async_pending(&new_state.header).is_err() {
-            return;
-        }
-        if let Some(begin) = begin_pending_begin {
+    let begin_pending_begin = profile_enabled.then(Instant::now);
+    if !ensure_async_open(pending, config, *cipher, engine, cmd.now_hour, engine_epoch) {
+        return;
+    }
+    if let Some(begin) = begin_pending_begin {
+        if pending
+            .as_ref()
+            .is_some_and(|writer| writer.line_count() == 0)
+        {
             stage.begin_pending_ns = begin.elapsed().as_nanos() as u64;
         }
-        *pending = Some(new_state);
     }
 
     let Some(state) = pending.as_mut() else {
@@ -871,7 +750,7 @@ fn handle_async_frontend_write(
 
     let threshold =
         capacity.saturating_mul(ASYNC_WARNING_THRESHOLD_NUM) / ASYNC_WARNING_THRESHOLD_DEN;
-    let current_len = HEADER_LEN + state.payload_len;
+    let current_len = HEADER_LEN + state.payload_len();
     let mut warning_line = None;
     if current_len >= threshold {
         warning_line = Some(format!(
@@ -880,15 +759,13 @@ fn handle_async_frontend_write(
     }
     let line = warning_line.as_deref().unwrap_or(cmd.line.as_str());
 
-    state.header.end_hour = cmd.now_hour;
     let append_begin = profile_enabled.then(Instant::now);
-    let appended = state.append_chunk(
+    let appended = push_frame_line(
+        state,
+        engine,
         line.as_bytes(),
         compress_scratch,
-        crypto_scratch,
-        cipher,
-        engine,
-        cmd.now_hour,
+        hour_from_clock(cmd.now_hour),
         cmd.force_flush,
     );
     if let Some(begin) = append_begin {
@@ -926,24 +803,15 @@ fn handle_async_frontend_write(
 
 fn worker_finalize_pending(
     engine: &AppenderEngine,
-    cipher: &EcdhTeaCipher,
-    pending: &mut Option<AsyncPendingState>,
-    compress_scratch: &mut Vec<u8>,
-    crypto_scratch: &mut Vec<u8>,
+    pending: &mut Option<FrameWriter>,
+    encoded: &mut Vec<u8>,
     reason: AsyncPendingFinalizeReason,
 ) {
     let Some(state) = pending.as_mut() else {
         return;
     };
-    let now_hour = local_hour_from_timestamp(std::time::SystemTime::now());
-    let finalized = state.finalize(
-        compress_scratch,
-        crypto_scratch,
-        cipher,
-        engine,
-        now_hour,
-        false,
-    );
+    let now_hour = hour_from_clock(local_hour_from_timestamp(std::time::SystemTime::now()));
+    let finalized = finish_frame(state, engine, encoded, now_hour, false);
     if finalized {
         record_pending_block_profile(state, reason);
     }
@@ -953,78 +821,73 @@ fn worker_finalize_pending(
     }
 }
 
-fn new_async_pending_state_for(
-    config: &XlogConfig,
-    cipher: &EcdhTeaCipher,
-    hour: u8,
-    flush_epoch: u64,
-) -> Option<AsyncPendingState> {
-    let compression_kind = match config.compress_mode {
-        CompressMode::Zlib => CompressionKind::Zlib,
-        CompressMode::Zstd => CompressionKind::Zstd,
-    };
-    let compressor = match config.compress_mode {
+fn new_async_writer(config: &XlogConfig, cipher: Crypt) -> Option<FrameWriter> {
+    match config.compress_mode {
         CompressMode::Zlib => {
-            AsyncCompressor::Zlib(ZlibStreamCompressor::new(config.compress_level))
+            let level = ZlibLevel::try_from(config.compress_level).ok()?;
+            Some(FrameWriter::async_zlib(level, cipher))
         }
         CompressMode::Zstd => {
-            AsyncCompressor::Zstd(ZstdStreamCompressor::new(config.compress_level).ok()?)
+            let level = ZstdLevel::try_from(config.compress_level).ok()?;
+            Some(FrameWriter::async_zstd(level, cipher))
         }
+    }
+}
+
+fn open_async_writer(
+    writer: &mut FrameWriter,
+    engine: &AppenderEngine,
+    hour: Hour,
+    flush_epoch: u64,
+) -> bool {
+    let seq = global_async_seq().next_async();
+    let Ok(header) = writer.open(hour, seq, flush_epoch) else {
+        return false;
     };
-    Some(AsyncPendingState {
-        header: LogHeader {
-            magic: select_magic(compression_kind, AppendMode::Async, cipher.enabled()),
-            seq: global_async_seq().next_async(),
-            begin_hour: hour,
-            end_hour: hour,
-            len: 0,
-            client_pubkey: if cipher.enabled() {
-                cipher.client_pubkey()
-            } else {
-                [0; 64]
-            },
-        },
-        payload_len: 0,
-        line_count: 0,
-        raw_input_bytes: 0,
-        compressor,
-        crypt_tail: Vec::with_capacity(8),
-        flush_epoch,
-    })
+    engine
+        .write_async_parts(Some(&header), 0, &[], hour, false, false)
+        .is_ok()
+}
+
+fn ensure_async_open(
+    pending: &mut Option<FrameWriter>,
+    config: &XlogConfig,
+    cipher: Crypt,
+    engine: &AppenderEngine,
+    hour: u8,
+    flush_epoch: u64,
+) -> bool {
+    if pending.as_ref().is_some_and(FrameWriter::is_open) {
+        return true;
+    }
+    let Some(mut writer) = new_async_writer(config, cipher) else {
+        return false;
+    };
+    if !open_async_writer(&mut writer, engine, hour_from_clock(hour), flush_epoch) {
+        return false;
+    }
+    *pending = Some(writer);
+    true
+}
+
+fn compression_family(config: &XlogConfig) -> CompressionKind {
+    CompressionKind::from(config.compress_mode)
+}
+
+fn hour_from_clock(hour: u8) -> Hour {
+    Hour::try_from(hour).expect("local clock hour is in 0..=23")
 }
 
 fn build_sync_block_from_formatted_line(
     config: &XlogConfig,
-    cipher: &EcdhTeaCipher,
+    cipher: &Crypt,
     hour: u8,
     line: &str,
     block: &mut Vec<u8>,
 ) -> bool {
-    let compression_kind = match config.compress_mode {
-        CompressMode::Zlib => CompressionKind::Zlib,
-        CompressMode::Zstd => CompressionKind::Zstd,
-    };
-    let Some(len) = u32::try_from(line.len()).ok() else {
-        return false;
-    };
-    let header = LogHeader {
-        magic: select_magic(compression_kind, AppendMode::Sync, cipher.enabled()),
-        seq: SeqGenerator::sync_seq(),
-        begin_hour: hour,
-        end_hour: hour,
-        len,
-        client_pubkey: if cipher.enabled() {
-            cipher.client_pubkey()
-        } else {
-            [0; 64]
-        },
-    };
-    block.clear();
-    block.reserve(HEADER_LEN + line.len() + 1);
-    block.extend_from_slice(&header.encode());
-    block.extend_from_slice(line.as_bytes());
-    block.push(0);
-    true
+    FrameWriter::sync(compression_family(config), *cipher)
+        .seal_sync_line(line.as_bytes(), hour_from_clock(hour), block)
+        .is_ok()
 }
 
 fn local_hour_from_timestamp(timestamp: SystemTime) -> u8 {
@@ -1058,6 +921,42 @@ fn registry() -> &'static InstanceRegistry<RustBackend> {
     REGISTRY.get_or_init(InstanceRegistry::new)
 }
 
+fn validate_compress_level(config: &XlogConfig) -> Result<(), XlogError> {
+    let level = config.compress_level;
+    let accepted = match config.compress_mode {
+        CompressMode::Zlib => ZlibLevel::try_from(level).is_ok(),
+        CompressMode::Zstd => ZstdLevel::try_from(level).is_ok(),
+    };
+    if accepted {
+        Ok(())
+    } else {
+        Err(XlogError::InvalidCompressLevel {
+            level,
+            mode: config.compress_mode,
+        })
+    }
+}
+
+fn paths_to_strings(paths: Vec<std::path::PathBuf>) -> Vec<String> {
+    paths
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn file_io_action_from_oneshot(result: Result<OneshotOutcome, OneshotError>) -> FileIoAction {
+    match result {
+        Ok(OneshotOutcome::Success) => FileIoAction::Success,
+        Ok(OneshotOutcome::Unnecessary) => FileIoAction::Unnecessary,
+        Err(OneshotError::Open(_)) => FileIoAction::OpenFailed,
+        Err(OneshotError::Read(_) | OneshotError::LengthMismatch { .. }) => {
+            FileIoAction::ReadFailed
+        }
+        Err(OneshotError::Write(_)) => FileIoAction::WriteFailed,
+        Err(OneshotError::Remove(_)) => FileIoAction::RemoveFailed,
+    }
+}
+
 fn global_async_seq() -> &'static SeqGenerator {
     static SEQ: OnceLock<SeqGenerator> = OnceLock::new();
     SEQ.get_or_init(SeqGenerator::default)
@@ -1065,23 +964,37 @@ fn global_async_seq() -> &'static SeqGenerator {
 
 impl RustBackend {
     fn new(config: XlogConfig, level: LogLevel) -> Result<Self, XlogError> {
+        Self::new_with_layout(config, level, Layout::mars())
+    }
+
+    fn new_with_layout(
+        config: XlogConfig,
+        level: LogLevel,
+        layout: Layout,
+    ) -> Result<Self, XlogError> {
         if config.log_dir.is_empty() || config.name_prefix.is_empty() {
             return Err(XlogError::InvalidConfig);
         }
 
         let cipher = match config.pub_key.as_deref() {
-            Some(key) if !key.is_empty() => EcdhTeaCipher::new(key).unwrap_or_else(|_| {
-                // Keep parity with C++: invalid pubkey falls back to no-crypt.
-                EcdhTeaCipher::disabled()
-            }),
-            _ => EcdhTeaCipher::disabled(),
+            Some(key) if !key.is_empty() => match Crypt::open(key) {
+                Ok(cipher) => cipher,
+                Err(_) => {
+                    // Keep parity with C++: invalid pubkey falls back to no-crypt.
+                    Crypt::off()
+                }
+            },
+            _ => Crypt::off(),
         };
+        let cache_days =
+            CacheDays::try_from(config.cache_days).map_err(|_| XlogError::InvalidCacheDays)?;
+        validate_compress_level(&config)?;
 
         let file_manager = FileManager::new(
-            config.log_dir.clone().into(),
-            config.cache_dir.clone().map(Into::into),
-            config.name_prefix.clone(),
-            config.cache_days,
+            &config.log_dir,
+            config.cache_dir.as_deref().map(std::path::PathBuf::from),
+            &config.name_prefix,
+            cache_days,
         )
         .map_err(|_| XlogError::InitFailed)?;
         let buffer = PersistentBuffer::open_with_capacity(
@@ -1097,8 +1010,7 @@ impl RustBackend {
             0,
             10 * 24 * 60 * 60,
         ));
-        let async_frontend =
-            AsyncFrontend::new(Arc::clone(&engine), config.clone(), cipher.clone());
+        let async_frontend = AsyncFrontend::new(Arc::clone(&engine), config.clone(), cipher);
         async_frontend.set_accepting(config.mode == AppenderMode::Async);
 
         Ok(Self {
@@ -1106,6 +1018,7 @@ impl RustBackend {
             console_open: AtomicBool::new(false),
             level: AtomicI32::new(level_to_i32(level)),
             config,
+            layout,
             cipher,
             engine,
             async_frontend,
@@ -1157,139 +1070,138 @@ impl RustBackend {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build_sync_block_into<'a>(
         &self,
         scratch: &'a mut HotPathScratch,
-        level: LogLevel,
-        tag: &str,
-        file: &str,
-        func: &str,
-        line: u32,
-        msg: &str,
-        pid: i64,
-        tid: i64,
-        maintid: i64,
-        timestamp: SystemTime,
+        event: &Event<'_>,
         profile: Option<&mut SyncBuildStage>,
     ) -> Option<&'a [u8]> {
         let mut profile = profile;
         let format_begin = profile.as_ref().map(|_| Instant::now());
-        let hour = local_hour_from_timestamp(timestamp);
-        self.format_record_line_into(
-            &mut scratch.line,
-            level,
-            tag,
-            file,
-            func,
-            line,
-            msg,
-            pid,
-            tid,
-            maintid,
-            timestamp,
-        );
+        let hour = local_hour_from_timestamp(event.timestamp);
+        format_line(&self.layout, &mut scratch.line, event);
         if let (Some(begin), Some(stage)) = (format_begin, profile.as_mut()) {
             stage.format_ns = begin.elapsed().as_nanos() as u64;
         }
 
         let block_begin = profile.as_ref().map(|_| Instant::now());
-        let compression_kind = match self.config.compress_mode {
-            CompressMode::Zlib => CompressionKind::Zlib,
-            CompressMode::Zstd => CompressionKind::Zstd,
-        };
-        let header = LogHeader {
-            magic: select_magic(compression_kind, AppendMode::Sync, self.cipher.enabled()),
-            seq: SeqGenerator::sync_seq(),
-            begin_hour: hour,
-            end_hour: hour,
-            len: u32::try_from(scratch.line.len()).ok()?,
-            client_pubkey: if self.cipher.enabled() {
-                self.cipher.client_pubkey()
-            } else {
-                [0; 64]
-            },
-        };
-
-        scratch.block.clear();
-        scratch.block.reserve(HEADER_LEN + scratch.line.len() + 1);
-        scratch.block.extend_from_slice(&header.encode());
-        scratch.block.extend_from_slice(scratch.line.as_bytes());
-        scratch.block.push(0);
+        if FrameWriter::sync(compression_family(&self.config), self.cipher)
+            .seal_sync_line(
+                scratch.line.as_bytes(),
+                hour_from_clock(hour),
+                &mut scratch.block,
+            )
+            .is_err()
+        {
+            return None;
+        }
         if let (Some(begin), Some(stage)) = (block_begin, profile.as_mut()) {
             stage.block_ns = begin.elapsed().as_nanos() as u64;
         }
         Some(scratch.block.as_slice())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn format_record_line_into(
+    fn resolve_record_meta(
         &self,
-        out: &mut String,
-        level: LogLevel,
-        tag: &str,
-        file: &str,
-        func: &str,
-        line: u32,
-        msg: &str,
-        pid: i64,
-        tid: i64,
-        maintid: i64,
-        timestamp: std::time::SystemTime,
-    ) {
-        format_record_parts_into(
-            out,
-            to_core_level(level),
-            tag,
-            file,
-            func,
-            line as i32,
-            timestamp,
-            pid,
-            tid,
-            maintid,
-            msg,
-        );
-    }
-
-    fn resolve_record_meta(&self, raw_meta: RawLogMeta, mode: MetaResolveMode) -> (i64, i64, i64) {
-        let runtime_pid = std::process::id() as i64;
-        let runtime_tid = current_tid();
-        let runtime_maintid = main_tid();
+        raw_meta: RawLogMeta,
+        mode: MetaResolveMode,
+    ) -> (Option<i64>, Option<i64>, Option<i64>) {
         match mode {
             // Category path (`XloggerWrite(instance_ptr != 0)`): C++ fills only
             // when all 3 fields are -1, otherwise keeps user-provided values.
             MetaResolveMode::Category => {
                 if raw_meta.pid == -1 && raw_meta.tid == -1 && raw_meta.maintid == -1 {
-                    (runtime_pid, runtime_tid, runtime_maintid)
+                    (None, None, None)
                 } else {
-                    (raw_meta.pid, raw_meta.tid, raw_meta.maintid)
+                    (
+                        Some(raw_meta.pid),
+                        Some(raw_meta.tid),
+                        Some(raw_meta.maintid),
+                    )
                 }
             }
             // Global path (`XloggerWrite(instance_ptr == 0)`): C++ fills each
             // field independently when that field equals -1.
             MetaResolveMode::Global => (
                 if raw_meta.pid == -1 {
-                    runtime_pid
+                    None
                 } else {
-                    raw_meta.pid
+                    Some(raw_meta.pid)
                 },
                 if raw_meta.tid == -1 {
-                    runtime_tid
+                    None
                 } else {
-                    raw_meta.tid
+                    Some(raw_meta.tid)
                 },
                 if raw_meta.maintid == -1 {
-                    runtime_maintid
+                    None
                 } else {
-                    raw_meta.maintid
+                    Some(raw_meta.maintid)
                 },
             ),
         }
     }
 
+    pub(crate) fn emit(&self, event: &Event<'_>, trace_log: bool) {
+        if !self.is_enabled(event.level) {
+            return;
+        }
+
+        #[cfg(target_os = "android")]
+        let trace_console_bypass = trace_log;
+        #[cfg(not(target_os = "android"))]
+        let trace_console_bypass = {
+            let _ = trace_log;
+            false
+        };
+
+        if self.console_open.load(Ordering::Relaxed) || trace_console_bypass {
+            write_console_line(
+                to_core_level(event.level),
+                event.tag,
+                event.file,
+                event.func,
+                event.line,
+                event.message,
+            );
+        }
+
+        if self.engine.mode() == EngineMode::Async {
+            self.write_async_line(event);
+            return;
+        }
+        self.write_sync_line(event);
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn write_with_meta_internal(
+    pub(crate) fn emit_category(
+        &self,
+        level: LogLevel,
+        tag: Option<&str>,
+        file: &str,
+        func: &str,
+        line: u32,
+        msg: &str,
+        raw_meta: RawLogMeta,
+    ) {
+        let (pid, tid, maintid) = self.resolve_record_meta(raw_meta, MetaResolveMode::Category);
+        let event = Event {
+            level,
+            tag: tag.unwrap_or(&self.config.name_prefix),
+            file,
+            func,
+            line,
+            message: msg,
+            pid,
+            tid,
+            maintid,
+            timestamp: SystemTime::now(),
+        };
+        self.emit(&event, raw_meta.trace_log);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_global(
         &self,
         level: LogLevel,
         tag: &str,
@@ -1298,51 +1210,36 @@ impl RustBackend {
         line: u32,
         msg: &str,
         raw_meta: RawLogMeta,
-        resolve_mode: MetaResolveMode,
     ) {
-        if !self.is_enabled(level) {
-            return;
-        }
+        let (pid, tid, maintid) = self.resolve_record_meta(raw_meta, MetaResolveMode::Global);
+        let event = Event {
+            level,
+            tag,
+            file,
+            func,
+            line,
+            message: msg,
+            pid,
+            tid,
+            maintid,
+            timestamp: SystemTime::now(),
+        };
+        self.emit(&event, raw_meta.trace_log);
+    }
 
-        #[cfg(target_os = "android")]
-        let trace_console_bypass = raw_meta.trace_log;
-        #[cfg(not(target_os = "android"))]
-        let trace_console_bypass = false;
-
-        if self.console_open.load(Ordering::Relaxed) || trace_console_bypass {
-            write_console_line(to_core_level(level), tag, file, func, line, msg);
-        }
-
-        let (pid, tid, maintid) = self.resolve_record_meta(raw_meta, resolve_mode);
-
-        if self.engine.mode() == EngineMode::Async {
-            self.write_async_line(level, tag, file, func, line, msg, pid, tid, maintid);
-            return;
-        }
-
+    fn write_sync_line(&self, event: &Event<'_>) {
         if METRICS_ENABLED {
             with_hot_path_scratch(|scratch| {
                 let total_begin = Instant::now();
                 let mut stage = SyncBuildStage::default();
-                let timestamp = SystemTime::now();
-                let Some(block) = self.build_sync_block_into(
-                    scratch,
-                    level,
-                    tag,
-                    file,
-                    func,
-                    line,
-                    msg,
-                    pid,
-                    tid,
-                    maintid,
-                    timestamp,
-                    Some(&mut stage),
-                ) else {
+                let Some(block) = self.build_sync_block_into(scratch, event, Some(&mut stage))
+                else {
                     return;
                 };
                 let engine_begin = Instant::now();
-                let _ = self.engine.write_block(block, level == LogLevel::Fatal);
+                let _ = self
+                    .engine
+                    .write_sealed(block, event.level == LogLevel::Fatal);
                 let engine_write_ns = engine_begin.elapsed().as_nanos() as u64;
                 record_sync_stage_sample(SyncStageSample {
                     total_ns: total_begin.elapsed().as_nanos() as u64,
@@ -1353,34 +1250,31 @@ impl RustBackend {
             });
         } else {
             with_hot_path_scratch(|scratch| {
-                let timestamp = SystemTime::now();
-                let Some(block) = self.build_sync_block_into(
-                    scratch, level, tag, file, func, line, msg, pid, tid, maintid, timestamp, None,
-                ) else {
+                let Some(block) = self.build_sync_block_into(scratch, event, None) else {
                     return;
                 };
-                let _ = self.engine.write_block(block, level == LogLevel::Fatal);
+                let _ = self
+                    .engine
+                    .write_sealed(block, event.level == LogLevel::Fatal);
             });
         }
     }
 
-    fn new_async_pending_state(&self, hour: u8, flush_epoch: u64) -> Option<AsyncPendingState> {
-        new_async_pending_state_for(&self.config, &self.cipher, hour, flush_epoch)
+    #[cfg(test)]
+    fn open_test_async_writer(&self, hour: u8, flush_epoch: u64) -> Option<FrameWriter> {
+        let mut writer = new_async_writer(&self.config, self.cipher)?;
+        if !open_async_writer(
+            &mut writer,
+            &self.engine,
+            hour_from_clock(hour),
+            flush_epoch,
+        ) {
+            return None;
+        }
+        Some(writer)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn write_async_line(
-        &self,
-        level: LogLevel,
-        tag: &str,
-        file: &str,
-        func: &str,
-        line: u32,
-        msg: &str,
-        pid: i64,
-        tid: i64,
-        maintid: i64,
-    ) {
+    fn write_async_line(&self, event: &Event<'_>) {
         #[cfg(test)]
         let force_inline = self
             .async_state
@@ -1392,29 +1286,16 @@ impl RustBackend {
         let force_inline = false;
 
         if force_inline || !self.async_frontend.accepting.load(Ordering::Acquire) {
-            self.write_async_line_inline(level, tag, file, func, line, msg, pid, tid, maintid);
+            self.write_async_line_inline(event);
             return;
         }
 
-        let timestamp = std::time::SystemTime::now();
-        let now_hour = local_hour_from_timestamp(timestamp);
+        let now_hour = local_hour_from_timestamp(event.timestamp);
         let profile_enabled = METRICS_ENABLED;
         let pool_shard = current_async_line_pool_shard();
         let mut line_buf = self.async_frontend.take_line_buffer(pool_shard);
         let format_begin = profile_enabled.then(Instant::now);
-        self.format_record_line_into(
-            &mut line_buf,
-            level,
-            tag,
-            file,
-            func,
-            line,
-            msg,
-            pid,
-            tid,
-            maintid,
-            timestamp,
-        );
+        format_line(&self.layout, &mut line_buf, event);
         let format_ns = format_begin
             .map(|begin| begin.elapsed().as_nanos() as u64)
             .unwrap_or(0);
@@ -1422,7 +1303,7 @@ impl RustBackend {
             line: line_buf,
             pool_shard,
             now_hour,
-            force_flush: level == LogLevel::Fatal,
+            force_flush: event.level == LogLevel::Fatal,
             profile: profile_enabled.then_some(AsyncWriteFrontProfile {
                 format_ns,
                 enqueue_ns: 0,
@@ -1432,24 +1313,12 @@ impl RustBackend {
         if let Err(cmd) = self.async_frontend.enqueue_write(cmd) {
             self.async_frontend
                 .recycle_line_buffer(cmd.pool_shard, cmd.line);
-            self.write_async_line_inline(level, tag, file, func, line, msg, pid, tid, maintid);
+            self.write_async_line_inline(event);
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn write_async_line_inline(
-        &self,
-        level: LogLevel,
-        tag: &str,
-        file: &str,
-        func: &str,
-        line: u32,
-        msg: &str,
-        pid: i64,
-        tid: i64,
-        maintid: i64,
-    ) {
-        let timestamp = std::time::SystemTime::now();
+    fn write_async_line_inline(&self, event: &Event<'_>) {
+        let timestamp = event.timestamp;
         let now_hour = local_hour_from_timestamp(timestamp);
         let (engine_epoch, engine_flush_reason) = self.engine.async_flush_state();
         let capacity = self.engine.buffer_capacity();
@@ -1469,19 +1338,7 @@ impl RustBackend {
                 } else {
                     None
                 };
-                self.format_record_line_into(
-                    &mut scratch.line,
-                    level,
-                    tag,
-                    file,
-                    func,
-                    line,
-                    msg,
-                    pid,
-                    tid,
-                    maintid,
-                    timestamp,
-                );
+                format_line(&self.layout, &mut scratch.line, event);
                 if let Some(begin) = format_begin {
                     stage.format_ns = begin.elapsed().as_nanos() as u64;
                 }
@@ -1502,23 +1359,28 @@ impl RustBackend {
                     engine_epoch,
                     engine_flush_reason,
                 );
-                if checked_out.pending().is_none() {
-                    let Some(new_state) = self.new_async_pending_state(now_hour, engine_epoch)
-                    else {
-                        return;
-                    };
-                    let begin_pending_begin = if profile_enabled {
-                        Some(Instant::now())
-                    } else {
-                        None
-                    };
-                    if self.engine.begin_async_pending(&new_state.header).is_err() {
-                        return;
-                    }
-                    if let Some(begin) = begin_pending_begin {
+                let begin_pending_begin = if profile_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                if !ensure_async_open(
+                    &mut checked_out.pending,
+                    &self.config,
+                    self.cipher,
+                    &self.engine,
+                    now_hour,
+                    engine_epoch,
+                ) {
+                    return;
+                }
+                if let Some(begin) = begin_pending_begin {
+                    if checked_out
+                        .pending()
+                        .is_some_and(|writer| writer.line_count() == 0)
+                    {
                         stage.begin_pending_ns = begin.elapsed().as_nanos() as u64;
                     }
-                    checked_out.set_pending(Some(new_state));
                 }
                 let Some(state) = checked_out.pending_mut() else {
                     return;
@@ -1526,7 +1388,7 @@ impl RustBackend {
 
                 let threshold = capacity.saturating_mul(ASYNC_WARNING_THRESHOLD_NUM)
                     / ASYNC_WARNING_THRESHOLD_DEN;
-                let current_len = HEADER_LEN + state.payload_len;
+                let current_len = HEADER_LEN + state.payload_len();
                 if current_len >= threshold {
                     scratch.line.clear();
                     let _ = writeln!(
@@ -1535,20 +1397,18 @@ impl RustBackend {
                     );
                 }
 
-                state.header.end_hour = now_hour;
                 let append_begin = if profile_enabled {
                     Some(Instant::now())
                 } else {
                     None
                 };
-                let appended = state.append_chunk(
+                let appended = push_frame_line(
+                    state,
+                    &self.engine,
                     scratch.line.as_bytes(),
                     &mut scratch.compress,
-                    &mut scratch.crypto,
-                    &self.cipher,
-                    &self.engine,
-                    now_hour,
-                    level == LogLevel::Fatal,
+                    hour_from_clock(now_hour),
+                    event.level == LogLevel::Fatal,
                 );
                 if let Some(begin) = append_begin {
                     stage.append_ns = begin.elapsed().as_nanos() as u64;
@@ -1592,12 +1452,11 @@ impl RustBackend {
             let Some(state) = checked_out.pending_mut() else {
                 return;
             };
-            let finalized = state.finalize(
-                &mut scratch.compress,
-                &mut scratch.crypto,
-                &self.cipher,
+            let finalized = finish_frame(
+                state,
                 &self.engine,
-                now_hour,
+                &mut scratch.compress,
+                hour_from_clock(now_hour),
                 false,
             );
             if finalized {
@@ -1615,22 +1474,27 @@ impl RustBackend {
     }
 
     fn make_logfile_name_impl(&self, timespan: i32, prefix: &str) -> Vec<String> {
-        self.engine.make_logfile_name(timespan, prefix)
+        paths_to_strings(self.engine.make_logfile_name(timespan, prefix))
     }
 
     fn filepaths_from_timespan_impl(&self, timespan: i32, prefix: &str) -> Vec<String> {
-        self.engine.filepaths_from_timespan(timespan, prefix)
+        paths_to_strings(self.engine.filepaths_from_timespan(timespan, prefix))
     }
 }
 
-impl XlogBackendProvider for RustBackendProvider {
-    fn new_instance(
+impl RustBackendProvider {
+    pub(crate) fn new_instance_with_layout(
         &self,
         config: &XlogConfig,
         level: LogLevel,
-    ) -> Result<Arc<dyn XlogBackend>, XlogError> {
+        layout: Layout,
+    ) -> Result<Arc<RustBackend>, XlogError> {
         let backend = registry().get_or_try_insert_with(&config.name_prefix, || {
-            Ok::<_, XlogError>(Arc::new(RustBackend::new(config.clone(), level)?))
+            Ok::<_, XlogError>(Arc::new(RustBackend::new_with_layout(
+                config.clone(),
+                level,
+                layout,
+            )?))
         })?;
         if backend.config != *config {
             return Err(XlogError::ConfigConflict {
@@ -1641,13 +1505,15 @@ impl XlogBackendProvider for RustBackendProvider {
         Ok(backend)
     }
 
-    fn get_instance(&self, name_prefix: &str) -> Option<Arc<dyn XlogBackend>> {
-        registry()
-            .get(name_prefix)
-            .map(|v| v as Arc<dyn XlogBackend>)
+    pub(crate) fn get_instance(&self, name_prefix: &str) -> Option<Arc<RustBackend>> {
+        registry().get(name_prefix)
     }
 
-    fn appender_open(&self, config: &XlogConfig, level: LogLevel) -> Result<(), XlogError> {
+    pub(crate) fn appender_open(
+        &self,
+        config: &XlogConfig,
+        level: LogLevel,
+    ) -> Result<(), XlogError> {
         if let Some(default) = registry().default_instance() {
             if default.config != *config {
                 return Err(XlogError::ConfigConflict {
@@ -1662,11 +1528,11 @@ impl XlogBackendProvider for RustBackendProvider {
         Ok(())
     }
 
-    fn appender_close(&self) {
+    pub(crate) fn appender_close(&self) {
         registry().clear_default();
     }
 
-    fn flush_all(&self, sync: bool) {
+    pub(crate) fn flush_all(&self, sync: bool) {
         let mut default_id = None;
         if let Some(default) = registry().default_instance() {
             default_id = Some(default.id);
@@ -1680,14 +1546,15 @@ impl XlogBackendProvider for RustBackendProvider {
         });
     }
 
-    fn global_is_enabled(&self, level: LogLevel) -> bool {
+    pub(crate) fn global_is_enabled(&self, level: LogLevel) -> bool {
         registry()
             .default_instance()
             .map(|b| b.is_enabled(level))
             .unwrap_or(false)
     }
 
-    fn write_global_with_meta(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_global_with_meta(
         &self,
         level: LogLevel,
         tag: &str,
@@ -1700,16 +1567,7 @@ impl XlogBackendProvider for RustBackendProvider {
         let Some(default) = registry().default_instance() else {
             return;
         };
-        default.write_with_meta_internal(
-            level,
-            tag,
-            file,
-            func,
-            line,
-            msg,
-            raw_meta,
-            MetaResolveMode::Global,
-        );
+        default.emit_global(level, tag, file, func, line, msg, raw_meta);
     }
 
     #[cfg(any(
@@ -1718,7 +1576,7 @@ impl XlogBackendProvider for RustBackendProvider {
         target_os = "tvos",
         target_os = "watchos"
     ))]
-    fn set_console_fun(&self, fun: ConsoleFun) {
+    pub(crate) fn set_console_fun(&self, fun: ConsoleFun) {
         let core_fun = match fun {
             ConsoleFun::Printf => AppleConsoleFun::Printf,
             ConsoleFun::NSLog => AppleConsoleFun::NsLog,
@@ -1727,42 +1585,46 @@ impl XlogBackendProvider for RustBackendProvider {
         set_apple_console_fun(core_fun);
     }
 
-    fn current_log_path(&self) -> Option<String> {
+    pub(crate) fn current_log_path(&self) -> Option<String> {
         registry()
             .default_instance()
-            .and_then(|b| b.engine.log_dir())
+            .map(|b| b.engine.log_dir().to_string_lossy().into_owned())
     }
 
-    fn current_log_cache_path(&self) -> Option<String> {
-        registry()
-            .default_instance()
-            .and_then(|b| b.engine.cache_dir())
+    pub(crate) fn current_log_cache_path(&self) -> Option<String> {
+        registry().default_instance().and_then(|b| {
+            b.engine
+                .cache_dir()
+                .map(|path| path.to_string_lossy().into_owned())
+        })
     }
 
-    fn filepaths_from_timespan(&self, timespan: i32, prefix: &str) -> Vec<String> {
+    pub(crate) fn filepaths_from_timespan(&self, timespan: i32, prefix: &str) -> Vec<String> {
         registry()
             .default_instance()
             .map(|b| b.filepaths_from_timespan_impl(timespan, prefix))
             .unwrap_or_default()
     }
 
-    fn make_logfile_name(&self, timespan: i32, prefix: &str) -> Vec<String> {
+    pub(crate) fn make_logfile_name(&self, timespan: i32, prefix: &str) -> Vec<String> {
         registry()
             .default_instance()
             .map(|b| b.make_logfile_name_impl(timespan, prefix))
             .unwrap_or_default()
     }
 
-    fn oneshot_flush(&self, config: &XlogConfig) -> Result<FileIoAction, XlogError> {
+    pub(crate) fn oneshot_flush(&self, config: &XlogConfig) -> Result<FileIoAction, XlogError> {
         if config.log_dir.is_empty() || config.name_prefix.is_empty() {
             return Err(XlogError::InvalidConfig);
         }
 
+        let cache_days =
+            CacheDays::try_from(config.cache_days).map_err(|_| XlogError::InvalidCacheDays)?;
         let file_manager = FileManager::new(
-            config.log_dir.clone().into(),
-            config.cache_dir.clone().map(Into::into),
-            config.name_prefix.clone(),
-            config.cache_days,
+            &config.log_dir,
+            config.cache_dir.as_deref().map(std::path::PathBuf::from),
+            &config.name_prefix,
+            cache_days,
         )
         .map_err(|_| XlogError::InitFailed)?;
 
@@ -1772,52 +1634,43 @@ impl XlogBackendProvider for RustBackendProvider {
             .map(|b| b.engine.max_file_size())
             .unwrap_or(0);
 
-        let action = core_oneshot_flush(&file_manager, DEFAULT_BUFFER_BLOCK_LEN, max_file_size);
-        Ok(match action {
-            CoreFileIoAction::None => FileIoAction::None,
-            CoreFileIoAction::Success => FileIoAction::Success,
-            CoreFileIoAction::Unnecessary => FileIoAction::Unnecessary,
-            CoreFileIoAction::OpenFailed => FileIoAction::OpenFailed,
-            CoreFileIoAction::ReadFailed => FileIoAction::ReadFailed,
-            CoreFileIoAction::WriteFailed => FileIoAction::WriteFailed,
-            CoreFileIoAction::CloseFailed => FileIoAction::CloseFailed,
-            CoreFileIoAction::RemoveFailed => FileIoAction::RemoveFailed,
-        })
+        Ok(file_io_action_from_oneshot(core_oneshot_flush(
+            &file_manager,
+            DEFAULT_BUFFER_BLOCK_LEN,
+            max_file_size,
+        )))
     }
 
-    fn dump(&self, buffer: &[u8]) -> String {
+    pub(crate) fn dump(&self, buffer: &[u8]) -> String {
         let Some(default) = registry().default_instance() else {
             return String::new();
         };
-        let Some(log_dir) = default.engine.log_dir() else {
-            return String::new();
-        };
-        dump_to_file(&log_dir, buffer)
+        dump_to_file(&default.engine.log_dir().to_string_lossy(), buffer)
     }
 
-    fn memory_dump(&self, buffer: &[u8]) -> String {
+    pub(crate) fn memory_dump(&self, buffer: &[u8]) -> String {
         memory_dump(buffer)
     }
 }
 
-impl XlogBackend for RustBackend {
-    fn instance(&self) -> usize {
+impl RustBackend {
+    pub(crate) fn instance(&self) -> usize {
         self.id
     }
 
-    fn is_enabled(&self, level: LogLevel) -> bool {
+    pub(crate) fn is_enabled(&self, level: LogLevel) -> bool {
         level_to_i32(level) >= self.level.load(Ordering::Relaxed)
     }
 
-    fn level(&self) -> LogLevel {
+    pub(crate) fn level(&self) -> LogLevel {
         i32_to_level(self.level.load(Ordering::Relaxed))
     }
 
-    fn set_level(&self, level: LogLevel) {
+    pub(crate) fn set_level(&self, level: LogLevel) {
         self.level.store(level_to_i32(level), Ordering::Relaxed);
     }
 
-    fn set_appender_mode(&self, mode: AppenderMode) {
+    pub(crate) fn set_appender_mode(&self, mode: AppenderMode) {
         let current = self.engine.mode();
         match (current, mode) {
             (EngineMode::Async, AppenderMode::Sync) => {
@@ -1840,7 +1693,7 @@ impl XlogBackend for RustBackend {
         }
     }
 
-    fn flush(&self, sync: bool) {
+    pub(crate) fn flush(&self, sync: bool) {
         let control_reason = take_async_flush_control_reason(sync);
         if self.engine.mode() == EngineMode::Async {
             if self.async_frontend.request_flush(sync, control_reason) {
@@ -1853,20 +1706,33 @@ impl XlogBackend for RustBackend {
             .flush_with_reason(sync, control_reason.engine_reason());
     }
 
-    fn set_console_log_open(&self, open: bool) {
+    pub(crate) fn set_console_log_open(&self, open: bool) {
         self.console_open.store(open, Ordering::Relaxed);
     }
 
-    fn set_max_file_size(&self, max_bytes: i64) {
+    pub(crate) fn set_max_file_size(&self, max_bytes: i64) {
         let v = max_bytes.max(0) as u64;
         self.engine.set_max_file_size(v);
     }
 
-    fn set_max_alive_time(&self, alive_seconds: i64) {
-        self.engine.set_max_alive_time(alive_seconds);
+    pub(crate) fn set_max_alive_time(&self, alive_seconds: i64) -> Result<(), XlogError> {
+        self.engine
+            .set_max_alive_time(alive_seconds)
+            .map_err(|err| match err {
+                mars_xlog_core::appender_engine::AppenderEngineError::AliveTimeTooSmall {
+                    alive_seconds,
+                    minimum,
+                } => XlogError::AliveTimeTooSmall {
+                    alive_seconds,
+                    minimum,
+                },
+                _ => XlogError::InitFailed,
+            })
     }
 
-    fn write_with_meta(
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_with_meta(
         &self,
         level: LogLevel,
         tag: &str,
@@ -1876,16 +1742,7 @@ impl XlogBackend for RustBackend {
         msg: &str,
         raw_meta: RawLogMeta,
     ) {
-        self.write_with_meta_internal(
-            level,
-            tag,
-            file,
-            func,
-            line,
-            msg,
-            raw_meta,
-            MetaResolveMode::Category,
-        );
+        self.emit_category(level, Some(tag), file, func, line, msg, raw_meta);
     }
 }
 
@@ -1920,22 +1777,29 @@ fn i32_to_level(v: i32) -> LogLevel {
 }
 
 fn to_core_level(level: LogLevel) -> CoreLogLevel {
-    match level {
-        LogLevel::Verbose => CoreLogLevel::Verbose,
-        LogLevel::Debug => CoreLogLevel::Debug,
-        LogLevel::Info => CoreLogLevel::Info,
-        LogLevel::Warn => CoreLogLevel::Warn,
-        LogLevel::Error => CoreLogLevel::Error,
-        LogLevel::Fatal => CoreLogLevel::Fatal,
-        LogLevel::None => CoreLogLevel::None,
+    CoreLogLevel::from(level)
+}
+
+impl From<AppenderMode> for EngineMode {
+    fn from(mode: AppenderMode) -> Self {
+        match mode {
+            AppenderMode::Async => EngineMode::Async,
+            AppenderMode::Sync => EngineMode::Sync,
+        }
+    }
+}
+
+impl From<CompressMode> for CompressionKind {
+    fn from(mode: CompressMode) -> Self {
+        match mode {
+            CompressMode::Zlib => CompressionKind::Zlib,
+            CompressMode::Zstd => CompressionKind::Zstd,
+        }
     }
 }
 
 fn appender_to_engine_mode(mode: AppenderMode) -> EngineMode {
-    match mode {
-        AppenderMode::Async => EngineMode::Async,
-        AppenderMode::Sync => EngineMode::Sync,
-    }
+    EngineMode::from(mode)
 }
 
 #[cfg(test)]
@@ -1945,15 +1809,15 @@ mod tests {
 
     use mars_xlog_core::buffer::DEFAULT_BUFFER_BLOCK_LEN;
     use mars_xlog_core::compress::{decompress_raw_zlib, decompress_zstd_frames};
-    use mars_xlog_core::crypto::{tea_decrypt_in_place, EcdhTeaCipher};
+    use mars_xlog_core::crypto::{tea_decrypt_in_place, Crypt, PrivateKey};
     use mars_xlog_core::protocol::{
-        LogHeader, HEADER_LEN, MAGIC_ASYNC_NO_CRYPT_ZLIB_START, MAGIC_ASYNC_NO_CRYPT_ZSTD_START,
-        MAGIC_ASYNC_ZLIB_START, MAGIC_ASYNC_ZSTD_START, MAGIC_END, MAGIC_SYNC_ZLIB_START,
-        TAILER_LEN,
+        AppendMode, BlockMagic, CompressionKind, LogHeader, HEADER_LEN, MAGIC_END,
+        MAGIC_SYNC_ZLIB_START, TAILER_LEN,
     };
 
+    use mars_xlog_core::platform_tid::main_tid;
+
     use super::RustBackend;
-    use crate::backend::XlogBackend;
     use crate::{AppenderMode, LogLevel, RawLogMeta, XlogConfig};
 
     const TEST_SERVER_PUBKEY_HEX: &str = concat!(
@@ -1965,27 +1829,19 @@ mod tests {
         0, 1,
     ];
 
-    fn bytes_to_hex(bytes: &[u8]) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for b in bytes {
-            out.push(HEX[(b >> 4) as usize] as char);
-            out.push(HEX[(b & 0x0f) as usize] as char);
-        }
-        out
-    }
-
     fn decrypt_async_payload(header: &LogHeader, payload: &[u8]) -> Vec<u8> {
         if header.client_pubkey == [0; 64] {
             return payload.to_vec();
         }
-        let client_pub_hex = bytes_to_hex(&header.client_pubkey);
-        let cipher =
-            EcdhTeaCipher::new_with_private_key(&client_pub_hex, TEST_SERVER_PRIVKEY_ONE).unwrap();
+        let cipher = Crypt::from_server_secret(
+            header.client_pubkey,
+            PrivateKey::try_from(TEST_SERVER_PRIVKEY_ONE).unwrap(),
+        )
+        .unwrap();
 
         let mut out = payload.to_vec();
         let block_end = out.len() / 8 * 8;
-        tea_decrypt_in_place(&mut out[..block_end], &cipher.tea_key_words());
+        tea_decrypt_in_place(&mut out[..block_end], &cipher.tea_key().unwrap());
         out
     }
 
@@ -2012,34 +1868,19 @@ mod tests {
     }
 
     fn decode_block_payload(header: &LogHeader, payload: &[u8]) -> Vec<u8> {
-        let is_async = matches!(
-            header.magic,
-            MAGIC_ASYNC_ZLIB_START
-                | MAGIC_ASYNC_NO_CRYPT_ZLIB_START
-                | MAGIC_ASYNC_ZSTD_START
-                | MAGIC_ASYNC_NO_CRYPT_ZSTD_START
-        );
-        if !is_async {
+        if header.magic.mode() != AppendMode::Async {
             return payload.to_vec();
         }
 
-        let raw = if matches!(
-            header.magic,
-            MAGIC_ASYNC_ZLIB_START | MAGIC_ASYNC_ZSTD_START
-        ) {
+        let raw = if header.magic.encrypted() {
             decrypt_async_payload(header, payload)
         } else {
             payload.to_vec()
         };
 
-        match header.magic {
-            MAGIC_ASYNC_ZLIB_START | MAGIC_ASYNC_NO_CRYPT_ZLIB_START => {
-                decompress_raw_zlib(&raw).unwrap()
-            }
-            MAGIC_ASYNC_ZSTD_START | MAGIC_ASYNC_NO_CRYPT_ZSTD_START => {
-                decompress_zstd_frames(&raw).unwrap()
-            }
-            _ => raw,
+        match header.magic.family() {
+            CompressionKind::Zlib => decompress_raw_zlib(&raw).unwrap(),
+            CompressionKind::Zstd => decompress_zstd_frames(&raw).unwrap(),
         }
     }
 
@@ -2120,27 +1961,23 @@ mod tests {
             .pub_key(TEST_SERVER_PUBKEY_HEX);
         let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
 
+        let event = crate::Event {
+            file: "main.rs",
+            func: "f",
+            line: 7,
+            pid: Some(std::process::id() as i64),
+            tid: Some(super::current_tid()),
+            maintid: Some(main_tid()),
+            ..crate::Event::new(LogLevel::Info, "tag", "plain-sync")
+        };
         let block = super::with_hot_path_scratch(|scratch| {
             backend
-                .build_sync_block_into(
-                    scratch,
-                    LogLevel::Info,
-                    "tag",
-                    "main.rs",
-                    "f",
-                    7,
-                    "plain-sync",
-                    std::process::id() as i64,
-                    super::current_tid(),
-                    super::main_tid(),
-                    std::time::SystemTime::now(),
-                    None,
-                )
+                .build_sync_block_into(scratch, &event, None)
                 .unwrap()
                 .to_vec()
         });
         let (header, payload) = parse_block_payload(&block);
-        assert_eq!(header.magic, MAGIC_SYNC_ZLIB_START);
+        assert_eq!(u8::from(header.magic), MAGIC_SYNC_ZLIB_START);
         assert_ne!(header.client_pubkey, [0; 64]);
 
         let line = std::str::from_utf8(payload).unwrap();
@@ -2158,29 +1995,25 @@ mod tests {
         let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-maintid")
             .mode(AppenderMode::Sync);
         let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
+        let event = crate::Event {
+            file: "main.rs",
+            func: "f",
+            line: 9,
+            pid: Some(std::process::id() as i64),
+            tid: Some(super::current_tid()),
+            maintid: Some(main_tid()),
+            ..crate::Event::new(LogLevel::Info, "tag", "maintid")
+        };
         let block = super::with_hot_path_scratch(|scratch| {
             backend
-                .build_sync_block_into(
-                    scratch,
-                    LogLevel::Info,
-                    "tag",
-                    "main.rs",
-                    "f",
-                    9,
-                    "maintid",
-                    std::process::id() as i64,
-                    super::current_tid(),
-                    super::main_tid(),
-                    std::time::SystemTime::now(),
-                    None,
-                )
+                .build_sync_block_into(scratch, &event, None)
                 .unwrap()
                 .to_vec()
         });
         let (_header, payload) = parse_block_payload(&block);
         let line = std::str::from_utf8(payload).unwrap();
 
-        if super::current_tid() == super::main_tid() {
+        if super::current_tid() == main_tid() {
             assert!(line.contains('*'));
         } else {
             assert!(!line.contains('*'));
@@ -2203,17 +2036,17 @@ mod tests {
 
         let (pid, tid, maintid) =
             backend.resolve_record_meta(RawLogMeta::default(), super::MetaResolveMode::Category);
-        assert_eq!(pid, std::process::id() as i64);
-        assert_eq!(tid, super::current_tid());
-        assert_eq!(maintid, super::main_tid());
+        assert_eq!(pid, None);
+        assert_eq!(tid, None);
+        assert_eq!(maintid, None);
 
         let (pid, tid, maintid) = backend.resolve_record_meta(
             RawLogMeta::new(123, -1, -1),
             super::MetaResolveMode::Category,
         );
-        assert_eq!(pid, 123);
-        assert_eq!(tid, -1);
-        assert_eq!(maintid, -1);
+        assert_eq!(pid, Some(123));
+        assert_eq!(tid, Some(-1));
+        assert_eq!(maintid, Some(-1));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2233,9 +2066,9 @@ mod tests {
 
         let (pid, tid, maintid) = backend
             .resolve_record_meta(RawLogMeta::new(321, -1, -1), super::MetaResolveMode::Global);
-        assert_eq!(pid, 321);
-        assert_eq!(tid, super::current_tid());
-        assert_eq!(maintid, super::main_tid());
+        assert_eq!(pid, Some(321));
+        assert_eq!(tid, None);
+        assert_eq!(maintid, None);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2375,7 +2208,7 @@ mod tests {
             .unwrap();
         let bytes = fs::read(xlog).unwrap();
         let (header, payload) = parse_block_payload(&bytes);
-        assert_eq!(header.magic, MAGIC_ASYNC_ZLIB_START);
+        assert_eq!(header.magic, BlockMagic::AsyncZlib { encrypted: true });
         let decrypted = decrypt_async_payload(&header, payload);
         let plain = decompress_raw_zlib(&decrypted).unwrap();
         let text = std::str::from_utf8(&plain).unwrap();
@@ -2425,7 +2258,7 @@ mod tests {
             .unwrap();
         let bytes = fs::read(xlog).unwrap();
         let (header, payload) = parse_block_payload(&bytes);
-        assert_eq!(header.magic, MAGIC_ASYNC_ZSTD_START);
+        assert_eq!(header.magic, BlockMagic::AsyncZstd { encrypted: true });
         let decrypted = decrypt_async_payload(&header, payload);
         let plain = decompress_zstd_frames(&decrypted).unwrap();
         let text = std::str::from_utf8(&plain).unwrap();
@@ -2498,23 +2331,21 @@ mod tests {
                 .async_state
                 .lock()
                 .expect("async state lock poisoned");
-            let mut state = backend.new_async_pending_state(1, engine_epoch).unwrap();
-            backend.engine.begin_async_pending(&state.header).unwrap();
-            state.payload_len = threshold.saturating_sub(HEADER_LEN);
+            let mut state = backend.open_test_async_writer(1, engine_epoch).unwrap();
+            state.set_payload_len(threshold.saturating_sub(HEADER_LEN));
             guard.pending = Some(state);
         }
 
-        backend.write_async_line(
-            LogLevel::Info,
-            "tag",
-            "watermark.rs",
-            "f",
-            10,
-            "ORIGINAL-LINE-SHOULD-BE-DROPPED",
-            std::process::id() as i64,
-            super::current_tid(),
-            super::main_tid(),
-        );
+        let event = crate::Event {
+            file: "watermark.rs",
+            func: "f",
+            line: 10,
+            pid: Some(std::process::id() as i64),
+            tid: Some(super::current_tid()),
+            maintid: Some(main_tid()),
+            ..crate::Event::new(LogLevel::Info, "tag", "ORIGINAL-LINE-SHOULD-BE-DROPPED")
+        };
+        backend.write_async_line(&event);
 
         let pending = backend.engine.async_buffer_snapshot().unwrap();
         let header = LogHeader::decode(&pending[..HEADER_LEN]).unwrap();

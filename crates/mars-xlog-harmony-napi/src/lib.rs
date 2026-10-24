@@ -247,7 +247,7 @@ impl Logger {
     /// Set max alive time in seconds.
     #[napi]
     pub fn set_max_alive_time(&self, alive_seconds: i64) {
-        self.backend.set_max_alive_time(alive_seconds);
+        let _ = self.backend.set_max_alive_time(alive_seconds);
     }
 
     /// Log a message with a tag.

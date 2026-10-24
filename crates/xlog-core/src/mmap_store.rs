@@ -75,6 +75,9 @@ impl MmapStore {
                 .map_err(|e| MmapStoreError::PreallocateFile(path.clone(), e))?;
         }
 
+        // SAFETY: `file` is open read/write and was resized to `capacity` above.
+        // The mapping lives in `Self` and is dropped with the file handle. No other
+        // mutable mapping of this file is created here.
         let mmap = unsafe {
             MmapMut::map_mut(&file).map_err(|e| MmapStoreError::MapFile(path.clone(), e))?
         };

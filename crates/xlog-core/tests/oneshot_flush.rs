@@ -1,18 +1,18 @@
 use std::fs;
 
 use mars_xlog_core::buffer::DEFAULT_BUFFER_BLOCK_LEN;
-use mars_xlog_core::file_manager::FileManager;
-use mars_xlog_core::oneshot::{oneshot_flush, FileIoAction};
+use mars_xlog_core::file_manager::{CacheDays, FileManager};
+use mars_xlog_core::oneshot::{oneshot_flush, OneshotError, OneshotOutcome};
 use mars_xlog_core::protocol::{
-    select_magic, AppendMode, CompressionKind, LogHeader, HEADER_LEN, MAGIC_END,
+    AppendMode, BlockMagic, CompressionKind, Hour, LogHeader, HEADER_LEN, MAGIC_END,
 };
 
 fn make_block(payload: &[u8]) -> Vec<u8> {
     let header = LogHeader {
-        magic: select_magic(CompressionKind::Zstd, AppendMode::Async, false),
+        magic: BlockMagic::new(CompressionKind::Zstd, AppendMode::Async, false),
         seq: 1,
-        begin_hour: 2,
-        end_hour: 2,
+        begin_hour: Hour::try_from(2).unwrap(),
+        end_hour: Hour::try_from(2).unwrap(),
         len: payload.len() as u32,
         client_pubkey: [0; 64],
     };
@@ -46,8 +46,7 @@ fn parse_payloads(buf: &[u8]) -> Vec<String> {
 #[test]
 fn oneshot_flush_writes_recovered_bytes_once() {
     let log_dir = tempfile::tempdir().unwrap();
-    let manager =
-        FileManager::new(log_dir.path().to_path_buf(), None, "oneshot".to_string(), 0).unwrap();
+    let manager = FileManager::new(log_dir.path(), None, "oneshot", CacheDays::ZERO).unwrap();
 
     let block = make_block(b"oneshot-regression");
     let mmap_path = manager.mmap_path();
@@ -55,14 +54,14 @@ fn oneshot_flush_writes_recovered_bytes_once() {
     raw[..block.len()].copy_from_slice(&block);
     fs::write(&mmap_path, &raw).unwrap();
 
-    assert_eq!(
+    assert!(matches!(
         oneshot_flush(&manager, DEFAULT_BUFFER_BLOCK_LEN, 0),
-        FileIoAction::Success
-    );
-    assert_eq!(
+        Ok(OneshotOutcome::Success)
+    ));
+    assert!(matches!(
         oneshot_flush(&manager, DEFAULT_BUFFER_BLOCK_LEN, 0),
-        FileIoAction::Unnecessary
-    );
+        Ok(OneshotOutcome::Unnecessary)
+    ));
 
     let files: Vec<_> = fs::read_dir(log_dir.path())
         .unwrap()
@@ -86,17 +85,16 @@ fn oneshot_flush_writes_recovered_bytes_once() {
 #[test]
 fn oneshot_flush_rejects_truncated_mmap_file() {
     let log_dir = tempfile::tempdir().unwrap();
-    let manager =
-        FileManager::new(log_dir.path().to_path_buf(), None, "oneshot".to_string(), 0).unwrap();
+    let manager = FileManager::new(log_dir.path(), None, "oneshot", CacheDays::ZERO).unwrap();
 
     let block = make_block(b"truncated-mmap");
     // Simulate crash-truncated mmap file: shorter than capacity but with valid leading block.
     fs::write(manager.mmap_path(), &block).unwrap();
 
-    assert_eq!(
+    assert!(matches!(
         oneshot_flush(&manager, DEFAULT_BUFFER_BLOCK_LEN, 0),
-        FileIoAction::ReadFailed
-    );
+        Err(OneshotError::LengthMismatch { .. })
+    ));
 
     let files: Vec<_> = fs::read_dir(log_dir.path())
         .unwrap()
@@ -110,15 +108,14 @@ fn oneshot_flush_rejects_truncated_mmap_file() {
 #[test]
 fn oneshot_flush_ignores_zero_filled_mmap() {
     let log_dir = tempfile::tempdir().unwrap();
-    let manager =
-        FileManager::new(log_dir.path().to_path_buf(), None, "oneshot".to_string(), 0).unwrap();
+    let manager = FileManager::new(log_dir.path(), None, "oneshot", CacheDays::ZERO).unwrap();
 
     fs::write(manager.mmap_path(), vec![0u8; DEFAULT_BUFFER_BLOCK_LEN]).unwrap();
 
-    assert_eq!(
+    assert!(matches!(
         oneshot_flush(&manager, DEFAULT_BUFFER_BLOCK_LEN, 0),
-        FileIoAction::Unnecessary
-    );
+        Ok(OneshotOutcome::Unnecessary)
+    ));
     assert!(manager.mmap_path().exists());
     let files: Vec<_> = fs::read_dir(log_dir.path())
         .unwrap()
@@ -132,17 +129,16 @@ fn oneshot_flush_ignores_zero_filled_mmap() {
 #[test]
 fn oneshot_flush_ignores_dirty_but_unrecoverable_mmap() {
     let log_dir = tempfile::tempdir().unwrap();
-    let manager =
-        FileManager::new(log_dir.path().to_path_buf(), None, "oneshot".to_string(), 0).unwrap();
+    let manager = FileManager::new(log_dir.path(), None, "oneshot", CacheDays::ZERO).unwrap();
 
     let mut raw = vec![0u8; DEFAULT_BUFFER_BLOCK_LEN];
     raw[..8].copy_from_slice(b"not-xlog");
     fs::write(manager.mmap_path(), &raw).unwrap();
 
-    assert_eq!(
+    assert!(matches!(
         oneshot_flush(&manager, DEFAULT_BUFFER_BLOCK_LEN, 0),
-        FileIoAction::Unnecessary
-    );
+        Ok(OneshotOutcome::Unnecessary)
+    ));
     assert!(manager.mmap_path().exists());
 
     let files: Vec<_> = fs::read_dir(log_dir.path())

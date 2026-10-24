@@ -487,14 +487,14 @@ pub fn validate_block(block: &[u8]) -> Result<(), BufferError> {
 #[cfg(test)]
 mod tests {
     use super::{recover_blocks, validate_block, BufferError, PersistentBuffer};
-    use crate::protocol::{select_magic, AppendMode, CompressionKind, LogHeader, MAGIC_END};
+    use crate::protocol::{AppendMode, BlockMagic, CompressionKind, Hour, LogHeader, MAGIC_END};
 
     fn make_block(payload: &[u8]) -> Vec<u8> {
         let header = LogHeader {
-            magic: select_magic(CompressionKind::Zlib, AppendMode::Async, false),
+            magic: BlockMagic::new(CompressionKind::Zlib, AppendMode::Async, false),
             seq: 1,
-            begin_hour: 1,
-            end_hour: 1,
+            begin_hour: Hour::try_from(1).unwrap(),
+            end_hour: Hour::try_from(1).unwrap(),
             len: payload.len() as u32,
             client_pubkey: [0; 64],
         };
@@ -615,10 +615,10 @@ mod tests {
         ));
 
         let bad_len_header = LogHeader {
-            magic: select_magic(CompressionKind::Zlib, AppendMode::Async, false),
+            magic: BlockMagic::new(CompressionKind::Zlib, AppendMode::Async, false),
             seq: 1,
-            begin_hour: 1,
-            end_hour: 1,
+            begin_hour: Hour::try_from(1).unwrap(),
+            end_hour: Hour::try_from(1).unwrap(),
             len: 6,
             client_pubkey: [0; 64],
         };

@@ -1,10 +1,37 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
 
-use crate::record::LogRecord;
+use crate::platform_tid::{current_tid, main_tid};
+use crate::record::{LogLevel, LogRecord};
+
+/// Borrowed fields for one Mars-formatted line.
+///
+/// This is the formatter input, not a log event callers construct.
+pub struct MarsFields<'a> {
+    /// Severity rendered as a single letter.
+    pub level: LogLevel,
+    /// Tag written as-is.
+    pub tag: &'a str,
+    /// Source path. Only the last path component is written.
+    pub file: &'a str,
+    /// Function name. An empty string stays empty.
+    pub func_name: &'a str,
+    /// Source line, printed as a signed integer.
+    pub line: i32,
+    /// Timestamp rendered by [`write_time`].
+    pub timestamp: SystemTime,
+    /// Process id. `None` is filled from the current process.
+    pub pid: Option<i64>,
+    /// Thread id. `None` is filled from the current thread.
+    pub tid: Option<i64>,
+    /// Main thread id. `None` is filled from the process main thread.
+    pub maintid: Option<i64>,
+    /// Message body. Truncation applies only inside [`write_mars_line`].
+    pub body: &'a str,
+}
 
 /// Keep parity with Mars formatter's body cap behavior.
 const MAX_LOG_BODY_BYTES: usize = 0xFFFF;
@@ -48,7 +75,12 @@ fn truncate_utf8_to_max_bytes(input: &str, max_bytes: usize) -> &str {
     &input[..end]
 }
 
-fn format_time_into(out: &mut String, ts: std::time::SystemTime) {
+/// Append the Mars timestamp for `timestamp` into `out`.
+///
+/// The same-second prefix is cached on the current thread. Times before the
+/// Unix epoch use the uncached fallback.
+pub fn write_time(out: &mut String, timestamp: SystemTime) {
+    let ts = timestamp;
     if let Ok(since_epoch) = ts.duration_since(UNIX_EPOCH) {
         let epoch_secs = since_epoch.as_secs();
         if epoch_secs <= i64::MAX as u64 {
@@ -122,6 +154,63 @@ pub fn format_record_into(out: &mut String, record: &LogRecord, body: &str) {
     );
 }
 
+fn resolve_id(id: Option<i64>, runtime: i64) -> i64 {
+    id.unwrap_or(runtime)
+}
+
+/// Resolve missing pid, tid, and main tid from the current process.
+///
+/// `None` means "fill from the runtime". `Some` is written as that integer,
+/// including `-1`.
+pub fn resolve_runtime_ids(
+    pid: Option<i64>,
+    tid: Option<i64>,
+    maintid: Option<i64>,
+) -> (i64, i64, i64) {
+    (
+        resolve_id(pid, std::process::id() as i64),
+        resolve_id(tid, current_tid()),
+        resolve_id(maintid, main_tid()),
+    )
+}
+
+/// Write one Mars-compatible log line into `out`, replacing its contents.
+pub fn write_mars_line(out: &mut String, fields: &MarsFields<'_>) {
+    out.clear();
+    let filename = extract_file_name(fields.file);
+    let (pid, tid, maintid) = resolve_runtime_ids(fields.pid, fields.tid, fields.maintid);
+    let tid_suffix = if tid == maintid { "*" } else { "" };
+    let func_name = if fields.func_name.is_empty() {
+        ""
+    } else {
+        fields.func_name
+    };
+
+    out.push('[');
+    out.push_str(fields.level.short());
+    out.push_str("][");
+    write_time(out, fields.timestamp);
+    let _ = write!(
+        out,
+        "][{pid}, {tid}{tid_suffix}][{}][{filename}:{line}, {func_name}][",
+        fields.tag,
+        line = fields.line,
+    );
+
+    let body_cap = LEGACY_STACK_BUFFER_BYTES
+        .saturating_sub(out.len())
+        .saturating_sub(LEGACY_BODY_RESERVED_BYTES)
+        .min(MAX_LOG_BODY_BYTES);
+    let body = truncate_utf8_to_max_bytes(fields.body, body_cap);
+    out.push_str(body);
+    if !out.ends_with('\n') && out.len() < LEGACY_STACK_BUFFER_BYTES {
+        out.push('\n');
+    }
+    if out.len() > LEGACY_STACK_BUFFER_BYTES {
+        out.truncate(truncate_utf8_to_max_bytes(out, LEGACY_STACK_BUFFER_BYTES).len());
+    }
+}
+
 /// Formats a record from its individual fields into the reusable output buffer.
 ///
 /// The output matches the legacy xlog single-line text formatter and truncates the
@@ -135,38 +224,26 @@ pub fn format_record_parts_into(
     func_name: &str,
     line: i32,
     timestamp: std::time::SystemTime,
-    pid: i64,
-    tid: i64,
-    maintid: i64,
+    pid: Option<i64>,
+    tid: Option<i64>,
+    maintid: Option<i64>,
     body: &str,
 ) {
-    out.clear();
-    let filename = extract_file_name(filename);
-    let tid_suffix = if tid == maintid { "*" } else { "" };
-    let func_name = if func_name.is_empty() { "" } else { func_name };
-
-    out.push('[');
-    out.push_str(level.short());
-    out.push_str("][");
-    format_time_into(out, timestamp);
-    let _ = write!(
+    write_mars_line(
         out,
-        "][{}, {}{}][{}][{}:{}, {}][",
-        pid, tid, tid_suffix, tag, filename, line, func_name
+        &MarsFields {
+            level,
+            tag,
+            file: filename,
+            func_name,
+            line,
+            timestamp,
+            pid,
+            tid,
+            maintid,
+            body,
+        },
     );
-
-    let body_cap = LEGACY_STACK_BUFFER_BYTES
-        .saturating_sub(out.len())
-        .saturating_sub(LEGACY_BODY_RESERVED_BYTES)
-        .min(MAX_LOG_BODY_BYTES);
-    let body = truncate_utf8_to_max_bytes(body, body_cap);
-    out.push_str(body);
-    if !out.ends_with('\n') && out.len() < LEGACY_STACK_BUFFER_BYTES {
-        out.push('\n');
-    }
-    if out.len() > LEGACY_STACK_BUFFER_BYTES {
-        out.truncate(truncate_utf8_to_max_bytes(out, LEGACY_STACK_BUFFER_BYTES).len());
-    }
 }
 
 /// Reproduce C++ `formater.cc` output layout as one text line.
@@ -183,7 +260,9 @@ mod tests {
     use chrono::{DateTime, Datelike, Local, Timelike};
 
     use super::format_record;
-    use super::format_time_into;
+    use super::write_mars_line;
+    use super::write_time;
+    use super::MarsFields;
     use crate::record::{LogLevel, LogRecord};
 
     fn format_time_reference(ts: SystemTime) -> String {
@@ -211,9 +290,9 @@ mod tests {
             func_name: "module::f".to_string(),
             line: 42,
             timestamp: UNIX_EPOCH + Duration::from_secs(1_700_000_000) + Duration::from_millis(123),
-            pid: 12,
-            tid: 34,
-            maintid: 34,
+            pid: Some(12),
+            tid: Some(34),
+            maintid: Some(34),
         };
 
         let line = format_record(&record, "msg");
@@ -239,11 +318,11 @@ mod tests {
         let after_epoch =
             UNIX_EPOCH + Duration::from_secs(1_700_000_000) + Duration::from_millis(123);
         let mut actual = String::new();
-        format_time_into(&mut actual, after_epoch);
+        write_time(&mut actual, after_epoch);
         assert_eq!(actual, format_time_reference(after_epoch));
 
         let mut actual_next = String::new();
-        format_time_into(&mut actual_next, after_epoch + Duration::from_millis(2));
+        write_time(&mut actual_next, after_epoch + Duration::from_millis(2));
         assert_eq!(
             actual_next,
             format_time_reference(after_epoch + Duration::from_millis(2))
@@ -251,7 +330,7 @@ mod tests {
 
         if let Some(before_epoch) = UNIX_EPOCH.checked_sub(Duration::from_secs(2)) {
             let mut before_actual = String::new();
-            format_time_into(
+            write_time(
                 &mut before_actual,
                 before_epoch + Duration::from_millis(456),
             );
@@ -260,5 +339,52 @@ mod tests {
                 format_time_reference(before_epoch + Duration::from_millis(456))
             );
         }
+    }
+
+    #[test]
+    fn mars_line_matches_legacy_segments() {
+        let timestamp =
+            UNIX_EPOCH + Duration::from_secs(1_700_000_000) + Duration::from_millis(123);
+        let mut time = String::new();
+        write_time(&mut time, timestamp);
+        let mut out = String::new();
+        write_mars_line(
+            &mut out,
+            &MarsFields {
+                level: LogLevel::Error,
+                tag: "core",
+                file: "/a/b/c.rs",
+                func_name: "module::f",
+                line: 42,
+                timestamp,
+                pid: Some(12),
+                tid: Some(34),
+                maintid: Some(34),
+                body: "msg",
+            },
+        );
+        assert_eq!(
+            out,
+            format!("[E][{time}][12, 34*][core][c.rs:42, module::f][msg\n")
+        );
+
+        let huge = "好".repeat(40_000);
+        write_mars_line(
+            &mut out,
+            &MarsFields {
+                level: LogLevel::Info,
+                tag: "core",
+                file: "c.rs",
+                func_name: "",
+                line: 1,
+                timestamp,
+                pid: Some(1),
+                tid: Some(1),
+                maintid: Some(1),
+                body: &huge,
+            },
+        );
+        assert!(out.len() <= super::LEGACY_STACK_BUFFER_BYTES);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
     }
 }

@@ -9,18 +9,22 @@ use mars_xlog_core::appender_engine::{
     AppenderEngine, AppenderEngineError, AsyncFlushReason, EngineMode,
 };
 use mars_xlog_core::buffer::{PersistentBuffer, DEFAULT_BUFFER_BLOCK_LEN};
-use mars_xlog_core::file_manager::FileManager;
+use mars_xlog_core::file_manager::{CacheDays, FileManager};
 use mars_xlog_core::protocol::{
-    select_magic, AppendMode, CompressionKind, LogHeader, HEADER_LEN, MAGIC_END,
+    AppendMode, BlockMagic, CompressionKind, Hour, LogHeader, HEADER_LEN, MAGIC_END,
 };
+
+fn hour(value: u8) -> Hour {
+    Hour::try_from(value).unwrap()
+}
 
 fn make_block(seq: u16, payload: &str) -> Vec<u8> {
     let bytes = payload.as_bytes();
     let header = LogHeader {
-        magic: select_magic(CompressionKind::Zlib, AppendMode::Async, false),
+        magic: BlockMagic::new(CompressionKind::Zlib, AppendMode::Async, false),
         seq,
-        begin_hour: 1,
-        end_hour: 1,
+        begin_hour: hour(1),
+        end_hour: hour(1),
         len: bytes.len() as u32,
         client_pubkey: [0; 64],
     };
@@ -53,10 +57,10 @@ fn parse_payloads(buf: &[u8]) -> Vec<String> {
 
 fn make_pending_header(seq: u16) -> LogHeader {
     LogHeader {
-        magic: select_magic(CompressionKind::Zlib, AppendMode::Async, false),
+        magic: BlockMagic::new(CompressionKind::Zlib, AppendMode::Async, false),
         seq,
-        begin_hour: 1,
-        end_hour: 1,
+        begin_hour: hour(1),
+        end_hour: hour(1),
         len: 0,
         client_pubkey: [0; 64],
     }
@@ -81,14 +85,14 @@ fn merged_xlog_bytes(dir: &std::path::Path) -> Vec<u8> {
 #[test]
 fn async_flush_sync_ack_persists_data() {
     let dir = tempfile::tempdir().unwrap();
-    let manager = FileManager::new(dir.path().to_path_buf(), None, "ack".to_string(), 0).unwrap();
+    let manager = FileManager::new(dir.path(), None, "ack", CacheDays::ZERO).unwrap();
     let buffer =
         PersistentBuffer::open_with_capacity(manager.mmap_path(), DEFAULT_BUFFER_BLOCK_LEN)
             .unwrap();
     let engine = AppenderEngine::new(manager, buffer, EngineMode::Async, 0, 10 * 24 * 60 * 60);
 
-    engine.write_block(&make_block(1, "A"), false).unwrap();
-    engine.write_block(&make_block(2, "B"), false).unwrap();
+    engine.write_sealed(&make_block(1, "A"), false).unwrap();
+    engine.write_sealed(&make_block(2, "B"), false).unwrap();
     engine.flush(true).unwrap();
 
     let mut paths: Vec<_> = fs::read_dir(dir.path())
@@ -107,8 +111,7 @@ fn async_flush_sync_ack_persists_data() {
 #[test]
 fn startup_drains_recovered_mmap_bytes_to_logfile() {
     let dir = tempfile::tempdir().unwrap();
-    let manager =
-        FileManager::new(dir.path().to_path_buf(), None, "startup".to_string(), 0).unwrap();
+    let manager = FileManager::new(dir.path(), None, "startup", CacheDays::ZERO).unwrap();
     let mmap_path = manager.mmap_path();
 
     {
@@ -140,8 +143,7 @@ fn startup_drains_recovered_mmap_bytes_to_logfile() {
 #[test]
 fn concurrent_async_writes_keep_all_messages() {
     let dir = tempfile::tempdir().unwrap();
-    let manager =
-        FileManager::new(dir.path().to_path_buf(), None, "concurrent".to_string(), 0).unwrap();
+    let manager = FileManager::new(dir.path(), None, "concurrent", CacheDays::ZERO).unwrap();
     let buffer =
         PersistentBuffer::open_with_capacity(manager.mmap_path(), DEFAULT_BUFFER_BLOCK_LEN)
             .unwrap();
@@ -163,7 +165,7 @@ fn concurrent_async_writes_keep_all_messages() {
                 let payload = format!("T{t:02}-{i:03}");
                 let seq = 1 + t * per_thread + i;
                 engine
-                    .write_block(&make_block(seq, &payload), false)
+                    .write_sealed(&make_block(seq, &payload), false)
                     .unwrap();
             }
         }));
@@ -190,8 +192,7 @@ fn concurrent_async_writes_keep_all_messages() {
 #[test]
 fn async_timeout_flushes_pending_block_without_explicit_flush() {
     let dir = tempfile::tempdir().unwrap();
-    let manager =
-        FileManager::new(dir.path().to_path_buf(), None, "timeout".to_string(), 0).unwrap();
+    let manager = FileManager::new(dir.path(), None, "timeout", CacheDays::ZERO).unwrap();
     let buffer =
         PersistentBuffer::open_with_capacity(manager.mmap_path(), DEFAULT_BUFFER_BLOCK_LEN)
             .unwrap();
@@ -204,10 +205,15 @@ fn async_timeout_flushes_pending_block_without_explicit_flush() {
         Duration::from_millis(120),
     );
 
-    let block = make_block(1, "TIMEOUT-FLUSH");
-    let pending_without_tailer = &block[..block.len() - 1];
     engine
-        .write_async_pending(pending_without_tailer, false)
+        .write_async_parts(
+            Some(&make_pending_header(1)),
+            0,
+            b"TIMEOUT-FLUSH",
+            hour(1),
+            false,
+            false,
+        )
         .unwrap();
 
     thread::sleep(Duration::from_millis(360));
@@ -228,8 +234,7 @@ fn async_timeout_flushes_pending_block_without_explicit_flush() {
 #[test]
 fn startup_recovers_pending_block_without_tailer() {
     let dir = tempfile::tempdir().unwrap();
-    let manager =
-        FileManager::new(dir.path().to_path_buf(), None, "restart".to_string(), 0).unwrap();
+    let manager = FileManager::new(dir.path(), None, "restart", CacheDays::ZERO).unwrap();
     let mmap_path = manager.mmap_path();
 
     {
@@ -273,8 +278,8 @@ fn flush_sync_keeps_cache_file_without_move() {
     let manager = FileManager::new(
         log_dir.clone(),
         Some(cache_dir.clone()),
-        "flushsync".to_string(),
-        1,
+        "flushsync",
+        CacheDays::try_from(1).unwrap(),
     )
     .unwrap();
     let mmap_path = manager.mmap_path();
@@ -295,7 +300,7 @@ fn flush_sync_keeps_cache_file_without_move() {
         PersistentBuffer::open_with_capacity(&mmap_path, DEFAULT_BUFFER_BLOCK_LEN).unwrap();
     let engine = AppenderEngine::new(manager, buffer, EngineMode::Async, 0, 10 * 24 * 60 * 60);
     let block = make_block(11, "SYNC-FLUSH");
-    engine.write_block(&block, false).unwrap();
+    engine.write_sealed(&block, false).unwrap();
     engine.flush(true).unwrap();
 
     assert!(cache_path.exists());
@@ -308,14 +313,14 @@ fn flush_sync_keeps_cache_file_without_move() {
 #[test]
 fn set_mode_async_to_sync_flushes_pending_data() {
     let dir = tempfile::tempdir().unwrap();
-    let manager = FileManager::new(dir.path().to_path_buf(), None, "mode".to_string(), 0).unwrap();
+    let manager = FileManager::new(dir.path(), None, "mode", CacheDays::ZERO).unwrap();
     let buffer =
         PersistentBuffer::open_with_capacity(manager.mmap_path(), DEFAULT_BUFFER_BLOCK_LEN)
             .unwrap();
     let engine = AppenderEngine::new(manager, buffer, EngineMode::Async, 0, 10 * 24 * 60 * 60);
 
     engine
-        .write_block(&make_block(1, "MODE-SWITCH"), false)
+        .write_sealed(&make_block(1, "MODE-SWITCH"), false)
         .unwrap();
     engine.set_mode(EngineMode::Sync).unwrap();
 
@@ -327,17 +332,28 @@ fn set_mode_async_to_sync_flushes_pending_data() {
 #[test]
 fn pending_block_chunk_rewrite_persists_final_payload() {
     let dir = tempfile::tempdir().unwrap();
-    let manager =
-        FileManager::new(dir.path().to_path_buf(), None, "pending".to_string(), 0).unwrap();
+    let manager = FileManager::new(dir.path(), None, "pending", CacheDays::ZERO).unwrap();
     let buffer =
         PersistentBuffer::open_with_capacity(manager.mmap_path(), DEFAULT_BUFFER_BLOCK_LEN)
             .unwrap();
     let engine = AppenderEngine::new(manager, buffer, EngineMode::Async, 0, 10 * 24 * 60 * 60);
 
-    engine.begin_async_pending(&make_pending_header(7)).unwrap();
-    engine.append_async_chunk(0, b"abcd", 1, false).unwrap();
-    engine.append_async_chunk(2, b"XY", 1, false).unwrap();
-    engine.finalize_async_pending(1, false).unwrap();
+    engine
+        .write_async_parts(
+            Some(&make_pending_header(7)),
+            0,
+            b"abcd",
+            hour(1),
+            false,
+            false,
+        )
+        .unwrap();
+    engine
+        .write_async_parts(None, 2, b"XY", hour(1), false, false)
+        .unwrap();
+    engine
+        .write_async_parts(None, 0, b"", hour(1), true, false)
+        .unwrap();
     engine.flush(true).unwrap();
 
     let payloads = parse_payloads(&merged_xlog_bytes(dir.path()));
@@ -347,26 +363,25 @@ fn pending_block_chunk_rewrite_persists_final_payload() {
 #[test]
 fn sync_mode_rejects_async_pending_apis() {
     let dir = tempfile::tempdir().unwrap();
-    let manager = FileManager::new(dir.path().to_path_buf(), None, "sync".to_string(), 0).unwrap();
+    let manager = FileManager::new(dir.path(), None, "sync", CacheDays::ZERO).unwrap();
     let buffer =
         PersistentBuffer::open_with_capacity(manager.mmap_path(), DEFAULT_BUFFER_BLOCK_LEN)
             .unwrap();
     let engine = AppenderEngine::new(manager, buffer, EngineMode::Sync, 0, 10 * 24 * 60 * 60);
 
     assert!(matches!(
-        engine.begin_async_pending(&make_pending_header(3)),
+        engine.write_async_parts(
+            Some(&make_pending_header(3)),
+            0,
+            b"abc",
+            hour(1),
+            false,
+            false
+        ),
         Err(AppenderEngineError::InvalidMode)
     ));
     assert!(matches!(
-        engine.append_async_chunk(0, b"abc", 1, false),
-        Err(AppenderEngineError::InvalidMode)
-    ));
-    assert!(matches!(
-        engine.finalize_async_pending(1, false),
-        Err(AppenderEngineError::InvalidMode)
-    ));
-    assert!(matches!(
-        engine.write_async_pending(b"pending-bytes", false),
+        engine.write_async_parts(None, 0, b"", hour(1), true, false),
         Err(AppenderEngineError::InvalidMode)
     ));
 }
@@ -374,8 +389,7 @@ fn sync_mode_rejects_async_pending_apis() {
 #[test]
 fn flush_with_reason_updates_async_flush_state() {
     let dir = tempfile::tempdir().unwrap();
-    let manager =
-        FileManager::new(dir.path().to_path_buf(), None, "reason".to_string(), 0).unwrap();
+    let manager = FileManager::new(dir.path(), None, "reason", CacheDays::ZERO).unwrap();
     let buffer =
         PersistentBuffer::open_with_capacity(manager.mmap_path(), DEFAULT_BUFFER_BLOCK_LEN)
             .unwrap();
@@ -383,7 +397,7 @@ fn flush_with_reason_updates_async_flush_state() {
 
     let epoch_before = engine.async_flush_epoch();
     engine
-        .write_block(&make_block(1, "FLUSH-REASON"), false)
+        .write_sealed(&make_block(1, "FLUSH-REASON"), false)
         .unwrap();
     engine
         .flush_with_reason(true, AsyncFlushReason::Explicit)
@@ -397,17 +411,22 @@ fn flush_with_reason_updates_async_flush_state() {
 #[test]
 fn async_buffer_snapshot_and_stats_reflect_pending_bytes() {
     let dir = tempfile::tempdir().unwrap();
-    let manager =
-        FileManager::new(dir.path().to_path_buf(), None, "snapshot".to_string(), 0).unwrap();
+    let manager = FileManager::new(dir.path(), None, "snapshot", CacheDays::ZERO).unwrap();
     let buffer =
         PersistentBuffer::open_with_capacity(manager.mmap_path(), DEFAULT_BUFFER_BLOCK_LEN)
             .unwrap();
     let engine = AppenderEngine::new(manager, buffer, EngineMode::Async, 0, 10 * 24 * 60 * 60);
 
     engine
-        .begin_async_pending(&make_pending_header(12))
+        .write_async_parts(
+            Some(&make_pending_header(12)),
+            0,
+            b"xyz",
+            hour(5),
+            false,
+            false,
+        )
         .unwrap();
-    engine.append_async_chunk(0, b"xyz", 5, false).unwrap();
 
     let (used, capacity) = engine.async_buffer_stats().unwrap();
     assert_eq!(capacity, DEFAULT_BUFFER_BLOCK_LEN);
@@ -417,7 +436,7 @@ fn async_buffer_snapshot_and_stats_reflect_pending_bytes() {
     assert_eq!(snapshot.len(), used);
     let header = LogHeader::decode(&snapshot[..HEADER_LEN]).unwrap();
     assert_eq!(header.seq, 12);
-    assert_eq!(header.end_hour, 5);
+    assert_eq!(header.end_hour, hour(5));
     assert_eq!(header.len, 3);
     assert_eq!(&snapshot[HEADER_LEN..], b"xyz");
 
@@ -427,7 +446,7 @@ fn async_buffer_snapshot_and_stats_reflect_pending_bytes() {
 #[test]
 fn sync_mode_hides_async_buffer_observability_apis() {
     let dir = tempfile::tempdir().unwrap();
-    let manager = FileManager::new(dir.path().to_path_buf(), None, "sync".to_string(), 0).unwrap();
+    let manager = FileManager::new(dir.path(), None, "sync", CacheDays::ZERO).unwrap();
     let buffer =
         PersistentBuffer::open_with_capacity(manager.mmap_path(), DEFAULT_BUFFER_BLOCK_LEN)
             .unwrap();

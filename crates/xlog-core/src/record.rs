@@ -49,12 +49,12 @@ pub struct LogRecord {
     pub line: i32,
     /// Timestamp associated with the record.
     pub timestamp: SystemTime,
-    /// Process id override, or `-1` to fill at runtime.
-    pub pid: i64,
-    /// Thread id override, or `-1` to fill at runtime.
-    pub tid: i64,
-    /// Main thread id override, or `-1` to fill at runtime.
-    pub maintid: i64,
+    /// Process id override. `None` is filled with the runtime pid at format time.
+    pub pid: Option<i64>,
+    /// Thread id override. `None` is filled with the runtime tid at format time.
+    pub tid: Option<i64>,
+    /// Main thread id override. `None` is filled with the runtime main tid at format time.
+    pub maintid: Option<i64>,
 }
 
 impl Default for LogRecord {
@@ -66,9 +66,9 @@ impl Default for LogRecord {
             func_name: String::new(),
             line: 0,
             timestamp: UNIX_EPOCH,
-            pid: -1,
-            tid: -1,
-            maintid: -1,
+            pid: None,
+            tid: None,
+            maintid: None,
         }
     }
 }
@@ -109,8 +109,8 @@ mod tests {
         assert_eq!(record.level, LogLevel::Warn);
         assert_eq!(record.tag, "core");
         assert!(record.timestamp.duration_since(UNIX_EPOCH).is_ok());
-        assert_eq!(record.pid, -1);
-        assert_eq!(record.tid, -1);
-        assert_eq!(record.maintid, -1);
+        assert_eq!(record.pid, None);
+        assert_eq!(record.tid, None);
+        assert_eq!(record.maintid, None);
     }
 }

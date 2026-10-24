@@ -6,6 +6,11 @@
 //! primitives.
 
 mod active_append;
+
+pub use appender_engine::AppenderEngine;
+pub use decoder::decode_xlog;
+pub use frame::FrameWriter;
+pub use protocol::BlockMagic;
 /// Append engine, flush control, and async pending-block primitives.
 pub mod appender_engine;
 /// Persistent mmap-backed buffer and recovery helpers.
@@ -28,6 +33,8 @@ mod file_runtime;
 mod file_target;
 /// Line formatter used by the Rust runtime path.
 pub mod formatter;
+/// Sync and async frame encoding.
+pub mod frame;
 mod metrics;
 /// Thin mmap storage wrapper used by persistent buffers.
 pub mod mmap_store;

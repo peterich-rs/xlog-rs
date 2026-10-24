@@ -1,44 +1,76 @@
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::SecretKey;
 
-use mars_xlog_core::crypto::{tea_decrypt_in_place, EcdhTeaCipher};
+use mars_xlog_core::crypto::{tea_decrypt_in_place, Crypt, PrivateKey};
 use mars_xlog_core::protocol::{
-    magic_start_is_valid, select_magic, update_end_hour_in_place, update_log_len_in_place,
-    AppendMode, CompressionKind, LogHeader, SeqGenerator, HEADER_LEN,
+    magic_start_is_valid, update_end_hour_in_place, update_log_len_in_place, AppendMode,
+    BlockMagic, CompressionKind, Hour, LogHeader, SeqGenerator, HEADER_LEN,
 };
 
 #[test]
 fn magic_selection_matches_cpp_constants() {
     assert_eq!(
-        select_magic(CompressionKind::Zlib, AppendMode::Sync, true),
+        u8::from(BlockMagic::new(
+            CompressionKind::Zlib,
+            AppendMode::Sync,
+            true
+        )),
         0x06
     );
     assert_eq!(
-        select_magic(CompressionKind::Zlib, AppendMode::Async, true),
+        u8::from(BlockMagic::new(
+            CompressionKind::Zlib,
+            AppendMode::Async,
+            true
+        )),
         0x07
     );
     assert_eq!(
-        select_magic(CompressionKind::Zlib, AppendMode::Sync, false),
+        u8::from(BlockMagic::new(
+            CompressionKind::Zlib,
+            AppendMode::Sync,
+            false
+        )),
         0x08
     );
     assert_eq!(
-        select_magic(CompressionKind::Zlib, AppendMode::Async, false),
+        u8::from(BlockMagic::new(
+            CompressionKind::Zlib,
+            AppendMode::Async,
+            false
+        )),
         0x09
     );
     assert_eq!(
-        select_magic(CompressionKind::Zstd, AppendMode::Sync, true),
+        u8::from(BlockMagic::new(
+            CompressionKind::Zstd,
+            AppendMode::Sync,
+            true
+        )),
         0x0A
     );
     assert_eq!(
-        select_magic(CompressionKind::Zstd, AppendMode::Sync, false),
+        u8::from(BlockMagic::new(
+            CompressionKind::Zstd,
+            AppendMode::Sync,
+            false
+        )),
         0x0B
     );
     assert_eq!(
-        select_magic(CompressionKind::Zstd, AppendMode::Async, true),
+        u8::from(BlockMagic::new(
+            CompressionKind::Zstd,
+            AppendMode::Async,
+            true
+        )),
         0x0C
     );
     assert_eq!(
-        select_magic(CompressionKind::Zstd, AppendMode::Async, false),
+        u8::from(BlockMagic::new(
+            CompressionKind::Zstd,
+            AppendMode::Async,
+            false
+        )),
         0x0D
     );
 
@@ -56,10 +88,10 @@ fn header_roundtrip_and_mutation() {
     }
 
     let header = LogHeader {
-        magic: 0x0C,
+        magic: BlockMagic::try_from(0x0C).unwrap(),
         seq: 7,
-        begin_hour: 11,
-        end_hour: 11,
+        begin_hour: Hour::try_from(11).unwrap(),
+        end_hour: Hour::try_from(11).unwrap(),
         len: 1024,
         client_pubkey: pubkey,
     };
@@ -71,10 +103,10 @@ fn header_roundtrip_and_mutation() {
     update_end_hour_in_place(&mut encoded, 12).unwrap();
 
     let decoded = LogHeader::decode(&encoded).unwrap();
-    assert_eq!(decoded.magic, 0x0C);
+    assert_eq!(u8::from(decoded.magic), 0x0C);
     assert_eq!(decoded.seq, 7);
-    assert_eq!(decoded.begin_hour, 11);
-    assert_eq!(decoded.end_hour, 12);
+    assert_eq!(u8::from(decoded.begin_hour), 11);
+    assert_eq!(u8::from(decoded.end_hour), 12);
     assert_eq!(decoded.len, 1036);
     assert_eq!(decoded.client_pubkey, pubkey);
 }
@@ -101,22 +133,22 @@ fn ecdh_tea_derivation_matches_on_both_sides() {
     let a_point = a_secret.public_key().to_encoded_point(false);
     let a_pub_hex = hex::encode(&a_point.as_bytes()[1..65]);
 
-    let a_cipher = EcdhTeaCipher::new_with_private_key(&b_pub_hex, a_priv).unwrap();
-    let b_cipher = EcdhTeaCipher::new_with_private_key(&a_pub_hex, b_priv).unwrap();
+    let a_cipher =
+        Crypt::from_client_secret(&b_pub_hex, PrivateKey::try_from(a_priv).unwrap()).unwrap();
+    let b_cipher =
+        Crypt::from_client_secret(&a_pub_hex, PrivateKey::try_from(b_priv).unwrap()).unwrap();
 
-    assert!(a_cipher.enabled());
-    assert!(b_cipher.enabled());
-    assert_eq!(a_cipher.tea_key_words(), b_cipher.tea_key_words());
+    assert!(a_cipher.tea_key().is_some());
+    assert!(b_cipher.tea_key().is_some());
+    assert_eq!(a_cipher.tea_key(), b_cipher.tea_key());
 
     let plain = b"abcdefghijklmnopqrstuvwxyz";
-    let encrypted = a_cipher.encrypt_async(plain);
+    let mut encrypted = plain.to_vec();
+    a_cipher.encrypt_async_in_place(&mut encrypted);
     assert_eq!(&encrypted[24..], &plain[24..]);
 
     let mut decrypted = encrypted.clone();
     let block_end = decrypted.len() / 8 * 8;
-    tea_decrypt_in_place(&mut decrypted[..block_end], &b_cipher.tea_key_words());
+    tea_decrypt_in_place(&mut decrypted[..block_end], &b_cipher.tea_key().unwrap());
     assert_eq!(&decrypted[..], plain);
-
-    let sync_out = a_cipher.encrypt_sync(plain);
-    assert_eq!(&sync_out[..], plain);
 }

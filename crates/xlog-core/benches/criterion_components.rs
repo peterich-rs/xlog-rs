@@ -4,10 +4,10 @@ use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
 use mars_xlog_core::compress::{
-    decompress_raw_zlib, decompress_zstd_frames, StreamCompressor, ZlibStreamCompressor,
-    ZstdChunkCompressor, ZstdStreamCompressor,
+    decompress_raw_zlib, decompress_zstd_frames, ZlibLevel, ZlibStreamCompressor,
+    ZstdChunkCompressor, ZstdLevel, ZstdStreamCompressor,
 };
-use mars_xlog_core::crypto::{tea_encrypt_in_place, EcdhTeaCipher};
+use mars_xlog_core::crypto::{tea_encrypt_in_place, Crypt, PrivateKey};
 use mars_xlog_core::formatter::format_record_parts_into;
 use mars_xlog_core::record::LogLevel;
 
@@ -83,9 +83,9 @@ fn bench_formatter(c: &mut Criterion) {
                         black_box("formatter_bench"),
                         42,
                         fixed_ts(),
-                        100,
-                        200,
-                        200,
+                        Some(100),
+                        Some(200),
+                        Some(200),
                         black_box(message.as_str()),
                     );
                     black_box(out.len())
@@ -129,16 +129,16 @@ fn bench_compression(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     (
-                        ZlibStreamCompressor::new(6),
+                        ZlibStreamCompressor::new(ZlibLevel::try_from(6).unwrap()),
                         Vec::with_capacity(size),
                         payload.clone(),
                     )
                 },
                 |(mut compressor, mut out, input)| {
                     compressor
-                        .compress_chunk(black_box(input.as_slice()), &mut out)
+                        .write_plain(black_box(input.as_slice()), &mut out)
                         .expect("zlib compress");
-                    compressor.flush(&mut out).expect("zlib flush");
+                    compressor.finish_into(&mut out).expect("zlib flush");
                     black_box(out.len());
                 },
                 BatchSize::SmallInput,
@@ -149,16 +149,17 @@ fn bench_compression(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     (
-                        ZstdStreamCompressor::new(3).expect("zstd stream init"),
+                        ZstdStreamCompressor::new(ZstdLevel::try_from(3).unwrap())
+                            .expect("zstd stream init"),
                         Vec::with_capacity(size),
                         payload.clone(),
                     )
                 },
                 |(mut compressor, mut out, input)| {
                     compressor
-                        .compress_chunk(black_box(input.as_slice()), &mut out)
+                        .write_plain(black_box(input.as_slice()), &mut out)
                         .expect("zstd stream compress");
-                    compressor.flush(&mut out).expect("zstd stream flush");
+                    compressor.finish_into(&mut out).expect("zstd stream flush");
                     black_box(out.len());
                 },
                 BatchSize::SmallInput,
@@ -169,16 +170,16 @@ fn bench_compression(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     (
-                        ZstdChunkCompressor::new(3),
+                        ZstdChunkCompressor::new(ZstdLevel::try_from(3).unwrap()),
                         Vec::with_capacity(size),
                         payload.clone(),
                     )
                 },
                 |(mut compressor, mut out, input)| {
                     compressor
-                        .compress_chunk(black_box(input.as_slice()), &mut out)
+                        .write_plain(black_box(input.as_slice()), &mut out)
                         .expect("zstd chunk compress");
-                    compressor.flush(&mut out).expect("zstd chunk flush");
+                    compressor.finish_into(&mut out).expect("zstd chunk flush");
                     black_box(out.len());
                 },
                 BatchSize::SmallInput,
@@ -277,9 +278,9 @@ fn zstd_chunk_decode_fixture(size: usize) -> DecodeFixture {
 
 fn bench_crypto(c: &mut Criterion) {
     let mut group = c.benchmark_group("core_crypto");
-    let cipher =
-        EcdhTeaCipher::new_with_private_key(SAMPLE_PUBKEY, [7u8; 32]).expect("cipher init");
-    let key = cipher.tea_key_words();
+    let cipher = Crypt::from_client_secret(SAMPLE_PUBKEY, PrivateKey::try_from([7u8; 32]).unwrap())
+        .expect("cipher init");
+    let key = cipher.tea_key().unwrap();
     for size in [96usize, 256, 1024] {
         let aligned = (size / 8).max(1) * 8;
         let payload = make_binary_payload(aligned, 0x1234_5678);

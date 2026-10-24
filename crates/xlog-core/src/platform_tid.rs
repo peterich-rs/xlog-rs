@@ -10,6 +10,8 @@ use std::sync::OnceLock;
 pub fn current_tid() -> i64 {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
+        // SAFETY: `SYS_gettid` takes no pointer arguments and returns the caller
+        // thread id. The result is only used as an integer metadata value.
         unsafe { libc::syscall(libc::SYS_gettid) as i64 }
     }
 
@@ -21,6 +23,8 @@ pub fn current_tid() -> i64 {
     ))]
     {
         let mut tid: u64 = 0;
+        // SAFETY: `tid` is a valid `u64` out-pointer. A null thread argument asks
+        // for the calling thread. The function writes only that integer.
         unsafe {
             libc::pthread_threadid_np(0, &mut tid);
         }

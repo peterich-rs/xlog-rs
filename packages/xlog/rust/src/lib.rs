@@ -10,9 +10,7 @@ use std::time::{Instant, UNIX_EPOCH};
 use mars_xlog::{AppenderMode, CompressMode, LogLevel, Xlog, XlogConfig};
 use mars_xlog_core::compress::{decompress_raw_zlib, decompress_zstd_frames};
 use mars_xlog_core::protocol::{
-    LogHeader, HEADER_LEN, MAGIC_ASYNC_NO_CRYPT_ZLIB_START, MAGIC_ASYNC_NO_CRYPT_ZSTD_START,
-    MAGIC_ASYNC_ZLIB_START, MAGIC_ASYNC_ZSTD_START, MAGIC_END, MAGIC_SYNC_ZLIB_START,
-    MAGIC_SYNC_ZSTD_START, TAILER_LEN,
+    AppendMode, CompressionKind, LogHeader, HEADER_LEN, MAGIC_END, TAILER_LEN,
 };
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde::{Deserialize, Serialize};
@@ -306,21 +304,20 @@ fn parse_blocks(bytes: &[u8]) -> Vec<(LogHeader, Vec<u8>)> {
 }
 
 fn decode_block_payload(header: &LogHeader, payload: &[u8]) -> Result<Vec<u8>, String> {
-    match header.magic {
-        MAGIC_ASYNC_NO_CRYPT_ZLIB_START => {
-            decompress_raw_zlib(payload).map_err(|err| err.to_string())
-        }
-        MAGIC_ASYNC_NO_CRYPT_ZSTD_START => {
-            decompress_zstd_frames(payload).map_err(|err| err.to_string())
-        }
-        MAGIC_ASYNC_ZLIB_START
-        | MAGIC_ASYNC_ZSTD_START
-        | MAGIC_SYNC_ZLIB_START
-        | MAGIC_SYNC_ZSTD_START => Err(format!(
+    if header.magic.encrypted() {
+        return Err(format!(
             "encrypted block seq={} len={} cannot be decoded without the private key",
             header.seq, header.len
-        )),
-        _ => Ok(payload.to_vec()),
+        ));
+    }
+    match (header.magic.mode(), header.magic.family()) {
+        (AppendMode::Async, CompressionKind::Zlib) => {
+            decompress_raw_zlib(payload).map_err(|err| err.to_string())
+        }
+        (AppendMode::Async, CompressionKind::Zstd) => {
+            decompress_zstd_frames(payload).map_err(|err| err.to_string())
+        }
+        (AppendMode::Sync, _) => Ok(payload.to_vec()),
     }
 }
 
@@ -491,7 +488,7 @@ pub extern "C" fn mxl_logger_new(config_json: *const c_char, level: i32) -> *mut
             logger.set_max_file_size(max_bytes);
         }
         if let Some(alive_seconds) = dto.max_alive_time_seconds {
-            logger.set_max_alive_time(alive_seconds);
+            let _ = logger.set_max_alive_time(alive_seconds);
         }
 
         Ok(Box::into_raw(Box::new(LoggerState {
@@ -563,7 +560,7 @@ pub extern "C" fn mxl_logger_set_max_alive_time(
 ) -> bool {
     wrap_bool(|| {
         let state = logger_state(handle)?;
-        state.logger.set_max_alive_time(alive_seconds);
+        let _ = state.logger.set_max_alive_time(alive_seconds);
         Ok(())
     })
 }

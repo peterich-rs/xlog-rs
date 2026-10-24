@@ -6,10 +6,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use filetime::{set_file_mtime, FileTime};
 use mars_xlog_core::compress::{
-    decompress_raw_zlib, decompress_zstd_frames, StreamCompressor, ZlibStreamCompressor,
-    ZstdChunkCompressor, ZstdStreamCompressor,
+    decompress_raw_zlib, decompress_zstd_frames, CompressError, ZlibLevel, ZlibStreamCompressor,
+    ZstdChunkCompressor, ZstdLevel, ZstdStreamCompressor,
 };
-use mars_xlog_core::crypto::{tea_encrypt_in_place, EcdhTeaCipher};
+use mars_xlog_core::crypto::{tea_encrypt_in_place, Crypt, PrivateKey};
+use mars_xlog_core::file_manager::CacheDays;
 use mars_xlog_core::file_manager::FileManager;
 use mars_xlog_core::formatter::{format_record, format_record_parts_into};
 use mars_xlog_core::record::{LogLevel, LogRecord};
@@ -194,37 +195,38 @@ fn run_compress(opts: &Options) -> Result<(), String> {
         "zlib_stream_l6",
         opts,
         payload.as_slice(),
-        ZlibStreamCompressor::new(6),
+        ZlibStreamCompressor::new(ZlibLevel::try_from(6).unwrap()),
         decompress_raw_zlib,
     )?;
     bench_stream_compressor(
         "zlib_stream_l9",
         opts,
         payload.as_slice(),
-        ZlibStreamCompressor::new(9),
+        ZlibStreamCompressor::new(ZlibLevel::try_from(9).unwrap()),
         decompress_raw_zlib,
     )?;
     bench_stream_compressor(
         "zstd_stream_l3",
         opts,
         payload.as_slice(),
-        ZstdStreamCompressor::new(3).map_err(|e| format!("zstd stream init: {e}"))?,
+        ZstdStreamCompressor::new(ZstdLevel::try_from(3).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("zstd stream init: {e}"))?,
         decompress_zstd_frames,
     )?;
     bench_stream_compressor(
         "zstd_chunk_l3",
         opts,
         payload.as_slice(),
-        ZstdChunkCompressor::new(3),
+        ZstdChunkCompressor::new(ZstdLevel::try_from(3).map_err(|e| e.to_string())?),
         decompress_zstd_frames,
     )?;
     Ok(())
 }
 
 fn run_crypto(opts: &Options) -> Result<(), String> {
-    let cipher = EcdhTeaCipher::new_with_private_key(SAMPLE_PUBKEY, [7u8; 32])
+    let cipher = Crypt::from_client_secret(SAMPLE_PUBKEY, PrivateKey::try_from([7u8; 32]).unwrap())
         .map_err(|e| format!("build cipher failed: {e}"))?;
-    let key = cipher.tea_key_words();
+    let key = cipher.tea_key().unwrap();
     let aligned = (opts.payload_size / 8).max(1) * 8;
     let mut block = make_payload(aligned, 0x1234_5678_9ABC_DEF0);
     let input_bytes = aligned.saturating_mul(opts.iterations);
@@ -257,8 +259,11 @@ fn run_crypto(opts: &Options) -> Result<(), String> {
         if private_key[30] == 0 && private_key[31] == 0 {
             private_key[31] = 1;
         }
-        let derived = EcdhTeaCipher::new_with_private_key(SAMPLE_PUBKEY, private_key)
-            .map_err(|e| format!("ecdh derive failed at iteration {idx}: {e}"))?;
+        let derived = Crypt::from_client_secret(
+            SAMPLE_PUBKEY,
+            PrivateKey::try_from(private_key).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("ecdh derive failed at iteration {idx}: {e}"))?;
         sink = sink.wrapping_add(derived.client_pubkey()[0] as u64);
     }
     black_box(sink);
@@ -291,9 +296,9 @@ fn run_formatter(opts: &Options) -> Result<(), String> {
         func_name: "bench::emit".to_string(),
         line: 42,
         timestamp: std::time::SystemTime::now(),
-        pid: 1001,
-        tid: 1002,
-        maintid: 1001,
+        pid: Some(1001),
+        tid: Some(1002),
+        maintid: Some(1001),
     };
 
     let mut sink = 0usize;
@@ -335,9 +340,9 @@ fn run_formatter(opts: &Options) -> Result<(), String> {
             "bench::emit",
             42,
             std::time::SystemTime::now(),
-            1001,
-            1002,
-            1001,
+            Some(1001),
+            Some(1002),
+            Some(1001),
             &payload,
         );
         sink_reuse = sink_reuse.wrapping_add(out.len());
@@ -430,6 +435,41 @@ fn run_io(opts: &Options) -> Result<(), String> {
     Ok(())
 }
 
+trait ChunkCompressor {
+    fn write_plain(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), CompressError>;
+    fn finish_into(&mut self, output: &mut Vec<u8>) -> Result<(), CompressError>;
+}
+
+impl ChunkCompressor for ZlibStreamCompressor {
+    fn write_plain(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), CompressError> {
+        ZlibStreamCompressor::write_plain(self, input, output)
+    }
+
+    fn finish_into(&mut self, output: &mut Vec<u8>) -> Result<(), CompressError> {
+        ZlibStreamCompressor::finish_into(self, output)
+    }
+}
+
+impl ChunkCompressor for ZstdStreamCompressor {
+    fn write_plain(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), CompressError> {
+        ZstdStreamCompressor::write_plain(self, input, output)
+    }
+
+    fn finish_into(&mut self, output: &mut Vec<u8>) -> Result<(), CompressError> {
+        ZstdStreamCompressor::finish_into(self, output)
+    }
+}
+
+impl ChunkCompressor for ZstdChunkCompressor {
+    fn write_plain(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), CompressError> {
+        ZstdChunkCompressor::write_plain(self, input, output)
+    }
+
+    fn finish_into(&mut self, output: &mut Vec<u8>) -> Result<(), CompressError> {
+        ZstdChunkCompressor::finish_into(self, output)
+    }
+}
+
 fn bench_stream_compressor<C, D>(
     variant: &str,
     opts: &Options,
@@ -438,19 +478,19 @@ fn bench_stream_compressor<C, D>(
     decode: D,
 ) -> Result<(), String>
 where
-    C: StreamCompressor,
-    D: Fn(&[u8]) -> Result<Vec<u8>, mars_xlog_core::compress::CompressError>,
+    C: ChunkCompressor,
+    D: Fn(&[u8]) -> Result<Vec<u8>, CompressError>,
 {
     let input_bytes = payload.len().saturating_mul(opts.iterations);
     let mut compressed = Vec::with_capacity(input_bytes / 2 + 1);
     let (start, start_res) = begin_measurement();
     for _ in 0..opts.iterations {
         compressor
-            .compress_chunk(black_box(payload), &mut compressed)
+            .write_plain(black_box(payload), &mut compressed)
             .map_err(|e| format!("{variant} compress chunk failed: {e}"))?;
     }
     compressor
-        .flush(&mut compressed)
+        .finish_into(&mut compressed)
         .map_err(|e| format!("{variant} flush failed: {e}"))?;
     let (elapsed_ms, resources) = end_measurement(start, start_res);
     black_box(&compressed);
@@ -503,8 +543,8 @@ fn bench_append_path_variant(
     let manager = FileManager::new(
         log_dir.clone(),
         cache_dir.clone(),
-        "bench".to_string(),
-        cache_days,
+        "bench",
+        CacheDays::try_from(cache_days).map_err(|e| e.to_string())?,
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
@@ -549,8 +589,8 @@ fn bench_move_old_cache_files_variant(opts: &Options, payload: &[u8]) -> Result<
     let manager = FileManager::new(
         log_dir.clone(),
         Some(cache_dir.clone()),
-        "bench".to_string(),
-        0,
+        "bench",
+        CacheDays::ZERO,
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
@@ -600,8 +640,8 @@ fn bench_move_old_cache_files_only_variant(opts: &Options, payload: &[u8]) -> Re
     let manager = FileManager::new(
         log_dir.clone(),
         Some(cache_dir.clone()),
-        "bench".to_string(),
-        0,
+        "bench",
+        CacheDays::ZERO,
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
@@ -657,8 +697,8 @@ fn bench_flush_append_only_variant(opts: &Options, payload: &[u8]) -> Result<(),
     let manager = FileManager::new(
         log_dir.clone(),
         Some(cache_dir.clone()),
-        "bench".to_string(),
-        1,
+        "bench",
+        CacheDays::try_from(1).unwrap(),
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
@@ -707,8 +747,8 @@ fn bench_flush_sweep_only_variant(opts: &Options, payload: &[u8]) -> Result<(), 
     let manager = FileManager::new(
         log_dir.clone(),
         Some(cache_dir.clone()),
-        "bench".to_string(),
-        1,
+        "bench",
+        CacheDays::try_from(1).unwrap(),
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
@@ -762,8 +802,8 @@ fn bench_flush_via_delete_expired_variant(opts: &Options, payload: &[u8]) -> Res
     let manager = FileManager::new(
         log_dir.clone(),
         Some(cache_dir.clone()),
-        "bench".to_string(),
-        1,
+        "bench",
+        CacheDays::try_from(1).unwrap(),
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
@@ -814,8 +854,8 @@ fn bench_delete_expired_scan_only_variant(opts: &Options, payload: &[u8]) -> Res
     let manager = FileManager::new(
         log_dir.clone(),
         Some(cache_dir.clone()),
-        "bench".to_string(),
-        1,
+        "bench",
+        CacheDays::try_from(1).unwrap(),
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
@@ -874,8 +914,8 @@ fn bench_delete_expired_files_variant(opts: &Options, payload: &[u8]) -> Result<
     let manager = FileManager::new(
         log_dir.clone(),
         Some(cache_dir.clone()),
-        "bench".to_string(),
-        1,
+        "bench",
+        CacheDays::try_from(1).unwrap(),
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 

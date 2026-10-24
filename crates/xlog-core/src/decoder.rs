@@ -1,5 +1,7 @@
+use std::io::Write;
+
 use crate::compress::{decompress_raw_zlib, decompress_zstd_frames, CompressError};
-use crate::crypto::{tea_decrypt_in_place, CryptoError, EcdhTeaCipher};
+use crate::crypto::{tea_decrypt_in_place, Crypt, CryptoError, PrivateKey};
 use crate::protocol::{
     MAGIC_ASYNC_NO_CRYPT_ZLIB_START, MAGIC_ASYNC_NO_CRYPT_ZSTD_START, MAGIC_ASYNC_ZLIB_START,
     MAGIC_ASYNC_ZSTD_START, MAGIC_END, MAGIC_SYNC_NO_CRYPT_ZLIB_START,
@@ -86,6 +88,9 @@ pub enum DecodeError {
     /// ECDH/TEA setup failed.
     #[error(transparent)]
     Crypto(CryptoError),
+    /// Writing decoded bytes failed.
+    #[error("write decoded output failed")]
+    Write(#[source] std::io::Error),
 }
 
 impl From<CryptoError> for DecodeError {
@@ -109,7 +114,7 @@ struct BlockHeader {
 /// Decodes `input` into `output` using the supplied options.
 pub fn decode_xlog(
     input: &[u8],
-    output: &mut Vec<u8>,
+    output: &mut impl Write,
     opts: &DecodeOptions,
 ) -> Result<DecodeSummary, DecodeError> {
     let Some(mut offset) = find_log_start(input, 2) else {
@@ -117,6 +122,7 @@ pub fn decode_xlog(
     };
 
     let mut blocks = 0usize;
+    let mut written = 0usize;
     let mut last_seq = 0u16;
 
     loop {
@@ -128,9 +134,11 @@ pub fn decode_xlog(
             let Some(fix_pos) = find_log_start(&input[offset..], 1) else {
                 break;
             };
-            output.extend_from_slice(
-                format!("[F]decode_log_file.py decode error len={fix_pos}\n").as_bytes(),
-            );
+            write_diagnostic(
+                output,
+                &mut written,
+                format_args!("[F]decode_log_file.py decode error len={fix_pos}\n"),
+            )?;
             offset += fix_pos;
         }
 
@@ -154,14 +162,15 @@ pub fn decode_xlog(
             && last_seq != 0
             && header.seq != last_seq.wrapping_add(1)
         {
-            output.extend_from_slice(
-                format!(
+            write_diagnostic(
+                output,
+                &mut written,
+                format_args!(
                     "[F]decode_log_file.py log seq:{}-{} is missing\n",
                     last_seq.wrapping_add(1),
                     header.seq.wrapping_sub(1)
-                )
-                .as_bytes(),
-            );
+                ),
+            )?;
         }
         if header.seq != 0 {
             last_seq = header.seq;
@@ -169,7 +178,7 @@ pub fn decode_xlog(
 
         let payload = &input[payload_start..payload_end];
         let decoded = decode_payload(&header, payload, opts)?;
-        output.extend_from_slice(&decoded);
+        write_bytes(output, &mut written, &decoded)?;
         blocks += 1;
         offset = payload_end + 1;
     }
@@ -180,8 +189,27 @@ pub fn decode_xlog(
 
     Ok(DecodeSummary {
         blocks,
-        output_bytes: output.len(),
+        output_bytes: written,
     })
+}
+
+fn write_bytes(
+    output: &mut impl Write,
+    written: &mut usize,
+    bytes: &[u8],
+) -> Result<(), DecodeError> {
+    output.write_all(bytes).map_err(DecodeError::Write)?;
+    *written = written.saturating_add(bytes.len());
+    Ok(())
+}
+
+fn write_diagnostic(
+    output: &mut impl Write,
+    written: &mut usize,
+    args: std::fmt::Arguments<'_>,
+) -> Result<(), DecodeError> {
+    let text = args.to_string();
+    write_bytes(output, written, text.as_bytes())
 }
 
 /// Parses a 64-hex-character private key into raw bytes.
@@ -192,9 +220,12 @@ pub fn parse_private_key_hex(private_key_hex: &str) -> Result<[u8; 32], DecodeEr
         return Err(DecodeError::InvalidPrivateKeyLength);
     }
 
-    let mut out = [0u8; 32];
-    hex::decode_to_slice(trimmed, &mut out)?;
-    Ok(out)
+    match trimmed.parse::<PrivateKey>() {
+        Ok(key) => Ok(key.bytes()),
+        Err(CryptoError::InvalidPrivateKeyLength) => Err(DecodeError::InvalidPrivateKeyLength),
+        Err(CryptoError::InvalidPrivateKeyHex(err)) => Err(DecodeError::InvalidPrivateKeyHex(err)),
+        Err(other) => Err(DecodeError::from(other)),
+    }
 }
 
 fn decode_payload(
@@ -221,11 +252,14 @@ fn decode_payload(
         | MAGIC_SYNC_NO_CRYPT_ZSTD_START => Ok(payload.to_vec()),
         MAGIC_ASYNC_ZLIB_START | MAGIC_ASYNC_ZSTD_START => {
             let private_key = opts.private_key.ok_or(DecodeError::MissingPrivateKey)?;
-            let cipher =
-                EcdhTeaCipher::new_with_server_private_key(header.client_pubkey, private_key)?;
+            let cipher = Crypt::from_server_secret(
+                header.client_pubkey,
+                PrivateKey::try_from(private_key)?,
+            )?;
             let mut decoded = payload.to_vec();
             let block_end = decoded.len() / 8 * 8;
-            tea_decrypt_in_place(&mut decoded[..block_end], &cipher.tea_key_words());
+            let key = cipher.tea_key().ok_or(DecodeError::InvalidKeyMaterial)?;
+            tea_decrypt_in_place(&mut decoded[..block_end], &key);
             match header.magic {
                 MAGIC_ASYNC_ZLIB_START => Ok(decompress_raw_zlib(&decoded)?),
                 MAGIC_ASYNC_ZSTD_START => Ok(decompress_zstd_frames(&decoded)?),

@@ -21,6 +21,42 @@ use crate::file_target::resolve_append_target;
 use crate::metrics::record_file_append;
 const CACHE_AVAILABLE_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Non-negative number of days a cache file may stay in the cache directory.
+pub struct CacheDays(u32);
+
+impl CacheDays {
+    /// Zero days. Cache files are not retained by age.
+    pub const ZERO: Self = Self(0);
+
+    /// Return the day count.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl TryFrom<i32> for CacheDays {
+    type Error = FileManagerError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        u32::try_from(value)
+            .map(Self)
+            .map_err(|_| FileManagerError::InvalidCacheDays)
+    }
+}
+
+impl From<CacheDays> for i32 {
+    fn from(value: CacheDays) -> Self {
+        i32::try_from(value.0).expect("cache days constructed from i32 fit in i32")
+    }
+}
+
+impl From<CacheDays> for i64 {
+    fn from(value: CacheDays) -> Self {
+        i64::from(value.0)
+    }
+}
+
 #[derive(Debug, Error)]
 /// Errors produced while selecting log targets or mutating log/cache files.
 pub enum FileManagerError {
@@ -30,6 +66,9 @@ pub enum FileManagerError {
     /// The configured log file prefix was empty.
     #[error("name_prefix must be non-empty")]
     EmptyNamePrefix,
+    /// `cache_days` was negative.
+    #[error("cache_days must be non-negative")]
+    InvalidCacheDays,
     /// Creating a required directory failed.
     #[error("create directory failed for {0}: {1}")]
     CreateDir(PathBuf, #[source] std::io::Error),
@@ -68,7 +107,7 @@ pub struct FileManager {
     log_dir: PathBuf,
     cache_dir: Option<PathBuf>,
     name_prefix: String,
-    cache_days: i32,
+    cache_days: CacheDays,
     runtime: Arc<Mutex<RuntimeState>>,
     _lock_files: Arc<Vec<File>>,
 }
@@ -80,11 +119,13 @@ impl FileManager {
 
     /// Creates a file manager for the given log and optional cache directories.
     pub fn new(
-        log_dir: PathBuf,
+        log_dir: impl AsRef<Path>,
         cache_dir: Option<PathBuf>,
-        name_prefix: String,
-        cache_days: i32,
+        name_prefix: impl AsRef<str>,
+        cache_days: CacheDays,
     ) -> Result<Self, FileManagerError> {
+        let log_dir = log_dir.as_ref().to_path_buf();
+        let name_prefix = name_prefix.as_ref().to_string();
         if log_dir.as_os_str().is_empty() {
             return Err(FileManagerError::EmptyLogDir);
         }
@@ -139,7 +180,7 @@ impl FileManager {
     }
 
     /// Returns the number of days a cache file may remain before being moved.
-    pub fn cache_days(&self) -> i32 {
+    pub fn cache_days(&self) -> CacheDays {
         self.cache_days
     }
 
@@ -150,7 +191,7 @@ impl FileManager {
     }
 
     /// Lists existing log files for the given day offset and prefix.
-    pub fn filepaths_from_timespan(&self, timespan: i32, prefix: &str) -> Vec<String> {
+    pub fn filepaths_from_timespan(&self, timespan: i32, prefix: &str) -> Vec<PathBuf> {
         let file_prefix = make_date_prefix(prefix, timespan);
 
         let mut out = Vec::new();
@@ -171,12 +212,12 @@ impl FileManager {
         timespan: i32,
         prefix: &str,
         max_file_size: u64,
-    ) -> Vec<String> {
+    ) -> Vec<PathBuf> {
         let now = Local::now() - ChronoDuration::days(timespan as i64);
         let log_path = self.make_path_for_time(now, &self.log_dir, prefix, max_file_size);
 
         if self.cache_dir.is_none() {
-            return vec![log_path.to_string_lossy().to_string()];
+            return vec![log_path];
         }
 
         let cache_dir = self.cache_dir.as_ref().expect("checked is_some");
@@ -184,13 +225,13 @@ impl FileManager {
 
         let mut out = Vec::new();
         if log_path.exists() {
-            out.push(log_path.to_string_lossy().to_string());
+            out.push(log_path.clone());
         }
         if cache_path.exists() {
-            out.push(cache_path.to_string_lossy().to_string());
+            out.push(cache_path);
         }
         if out.is_empty() {
-            out.push(log_path.to_string_lossy().to_string());
+            out.push(log_path);
         }
         out
     }
@@ -265,7 +306,7 @@ impl FileManager {
             log_dir: &self.log_dir,
             cache_dir: self.cache_dir.as_deref(),
             name_prefix: &self.name_prefix,
-            cache_days: self.cache_days,
+            cache_days: i32::from(self.cache_days),
         })? {
             self.mark_runtime_path_removed(&path);
         }
@@ -289,7 +330,7 @@ impl FileManager {
         self.flush_active_file_if_needed()
     }
 
-    fn list_existing_files(&self, dir: &Path, file_prefix: &str) -> Vec<String> {
+    fn list_existing_files(&self, dir: &Path, file_prefix: &str) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let Ok(entries) = fs::read_dir(dir) else {
             return out;
@@ -303,7 +344,7 @@ impl FileManager {
                 continue;
             };
             if name.starts_with(file_prefix) && name.ends_with(LOG_EXT_WITH_DOT) {
-                out.push(path.to_string_lossy().to_string());
+                out.push(path);
             }
         }
         out
@@ -377,7 +418,7 @@ impl FileManager {
         let Some(cache_dir) = &self.cache_dir else {
             return false;
         };
-        if self.cache_days <= 0 {
+        if self.cache_days.get() == 0 {
             return false;
         }
 
@@ -800,7 +841,7 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, SystemTime};
 
-    use super::{ActiveAppendFile, FileManager};
+    use super::{ActiveAppendFile, CacheDays, FileManager};
     use crate::file_naming::{build_path_for_index, day_key};
     use crate::file_runtime::AppendTargetCache;
     use chrono::{Datelike, Local};
@@ -814,8 +855,8 @@ mod tests {
         let manager = FileManager::new(
             log_dir.clone(),
             Some(cache_dir.clone()),
-            "demo".to_string(),
-            1,
+            "demo",
+            CacheDays::try_from(1).unwrap(),
         )
         .unwrap();
 
@@ -839,7 +880,7 @@ mod tests {
     fn keep_open_flushes_buffer_when_closed() {
         let root = tempfile::tempdir().unwrap();
         let log_dir = root.path().join("log");
-        let manager = FileManager::new(log_dir.clone(), None, "demo".to_string(), 0).unwrap();
+        let manager = FileManager::new(log_dir.clone(), None, "demo", CacheDays::ZERO).unwrap();
 
         manager.append_log_bytes(b"aaaa", 0, false, true).unwrap();
         manager.append_log_bytes(b"bbbb", 0, false, true).unwrap();
@@ -858,7 +899,7 @@ mod tests {
     fn close_after_write_still_rotates_by_size() {
         let root = tempfile::tempdir().unwrap();
         let log_dir = root.path().join("log");
-        let manager = FileManager::new(log_dir.clone(), None, "demo".to_string(), 0).unwrap();
+        let manager = FileManager::new(log_dir.clone(), None, "demo", CacheDays::ZERO).unwrap();
 
         manager.append_log_bytes(b"aaaa", 1, false, false).unwrap();
         manager.append_log_bytes(b"bbbb", 1, false, false).unwrap();
@@ -876,7 +917,7 @@ mod tests {
     fn append_log_slices_writes_segments_in_order() {
         let root = tempfile::tempdir().unwrap();
         let log_dir = root.path().join("log");
-        let manager = FileManager::new(log_dir.clone(), None, "demo".to_string(), 0).unwrap();
+        let manager = FileManager::new(log_dir.clone(), None, "demo", CacheDays::ZERO).unwrap();
 
         manager
             .append_log_slices(&[b"hello", b"-", b"world"], 0, false, false)
@@ -894,7 +935,7 @@ mod tests {
     fn cached_target_advances_to_next_split_file_without_rescan() {
         let root = tempfile::tempdir().unwrap();
         let log_dir = root.path().join("log");
-        let manager = FileManager::new(log_dir.clone(), None, "demo".to_string(), 0).unwrap();
+        let manager = FileManager::new(log_dir.clone(), None, "demo", CacheDays::ZERO).unwrap();
 
         manager.append_log_bytes(b"aaaa", 1, false, false).unwrap();
 
@@ -918,8 +959,8 @@ mod tests {
         let manager = FileManager::new(
             log_dir.clone(),
             Some(cache_dir.clone()),
-            "demo".to_string(),
-            1,
+            "demo",
+            CacheDays::try_from(1).unwrap(),
         )
         .unwrap();
 
@@ -985,8 +1026,8 @@ mod tests {
         let manager = FileManager::new(
             log_dir.clone(),
             Some(cache_dir.clone()),
-            "demo".to_string(),
-            0,
+            "demo",
+            CacheDays::ZERO,
         )
         .unwrap();
 
@@ -1012,7 +1053,7 @@ mod tests {
     fn append_recreates_missing_parent_dir_on_open() {
         let root = tempfile::tempdir().unwrap();
         let log_dir = root.path().join("log");
-        let manager = FileManager::new(log_dir.clone(), None, "demo".to_string(), 0).unwrap();
+        let manager = FileManager::new(log_dir.clone(), None, "demo", CacheDays::ZERO).unwrap();
 
         std::fs::remove_dir_all(&log_dir).unwrap();
         manager.append_log_bytes(b"hello", 0, false, false).unwrap();
@@ -1034,8 +1075,8 @@ mod tests {
         let manager = FileManager::new(
             log_dir.clone(),
             Some(cache_dir.clone()),
-            "demo".to_string(),
-            1,
+            "demo",
+            CacheDays::try_from(1).unwrap(),
         )
         .unwrap();
 
@@ -1073,8 +1114,8 @@ mod tests {
         let manager = FileManager::new(
             log_dir.clone(),
             Some(cache_dir.clone()),
-            "demo".to_string(),
-            1,
+            "demo",
+            CacheDays::try_from(1).unwrap(),
         )
         .unwrap();
 
@@ -1121,14 +1162,14 @@ mod tests {
                 .ok()
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from);
-            let res = FileManager::new(dir.into(), cache_dir, prefix, 0);
+            let res = FileManager::new(PathBuf::from(dir), cache_dir, prefix, CacheDays::ZERO);
             assert!(res.is_err());
             return;
         }
 
         let root = tempfile::tempdir().unwrap();
         let prefix = "locktest".to_string();
-        let _first = FileManager::new(root.path().to_path_buf(), None, prefix.clone(), 0).unwrap();
+        let _first = FileManager::new(root.path(), None, prefix.clone(), CacheDays::ZERO).unwrap();
 
         let exe = env::current_exe().unwrap();
         let status = Command::new(exe)
@@ -1153,7 +1194,7 @@ mod tests {
                 .ok()
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from);
-            let res = FileManager::new(dir.into(), cache_dir, prefix, 0);
+            let res = FileManager::new(PathBuf::from(dir), cache_dir, prefix, CacheDays::ZERO);
             assert!(res.is_err());
             return;
         }
@@ -1167,7 +1208,7 @@ mod tests {
             log_dir_a.clone(),
             Some(cache_dir.clone()),
             prefix.clone(),
-            0,
+            CacheDays::ZERO,
         )
         .unwrap();
 

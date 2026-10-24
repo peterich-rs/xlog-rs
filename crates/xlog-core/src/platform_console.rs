@@ -112,6 +112,8 @@ pub fn write_console_line(
                 let c_file = to_console_cstring(file_name);
                 let c_func = to_console_cstring(func_name);
                 let c_msg = to_console_cstring(msg);
+                // SAFETY: the Apple shim functions take a valid C string built
+                // above and a log level integer. They do not retain the pointer.
                 unsafe {
                     xlog_core_apple_console_oslog(
                         apple_level(level),
@@ -127,6 +129,8 @@ pub fn write_console_line(
             if mode == AppleConsoleFun::NsLog as u8 {
                 let text = format_basic_console_line(level, tag, file_name, func_name, line, msg);
                 let c_line = to_console_cstring(&text);
+                // SAFETY: the Apple shim functions take a valid C string built
+                // above and a log level integer. They do not retain the pointer.
                 unsafe {
                     xlog_core_apple_console_nslog(c_line.as_ptr());
                 }
