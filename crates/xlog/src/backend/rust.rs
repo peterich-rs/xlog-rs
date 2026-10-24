@@ -527,7 +527,6 @@ fn run_async_frontend_worker(
     let capacity = engine.buffer_capacity();
     let mut pending: Option<FrameWriter> = None;
     let mut compress_scratch = Vec::with_capacity(16 * 1024);
-    let mut crypto_scratch = Vec::with_capacity(16 * 1024);
     let mut block_scratch = Vec::with_capacity(DEFAULT_BUFFER_BLOCK_LEN);
 
     loop {
@@ -549,7 +548,6 @@ fn run_async_frontend_worker(
                     capacity,
                     &mut pending,
                     &mut compress_scratch,
-                    &mut crypto_scratch,
                     &mut block_scratch,
                 );
                 recycle_line_buffer_to_pool(line_pools.as_ref(), cmd.pool_shard, cmd.line);
@@ -569,7 +567,6 @@ fn run_async_frontend_worker(
                                 capacity,
                                 &mut pending,
                                 &mut compress_scratch,
-                                &mut crypto_scratch,
                                 &mut block_scratch,
                             );
                             recycle_line_buffer_to_pool(
@@ -594,7 +591,6 @@ fn run_async_frontend_worker(
                         &cipher,
                         &mut pending,
                         &mut compress_scratch,
-                        &mut crypto_scratch,
                     ) {
                         break;
                     }
@@ -608,7 +604,6 @@ fn run_async_frontend_worker(
                     &cipher,
                     &mut pending,
                     &mut compress_scratch,
-                    &mut crypto_scratch,
                 ) {
                     break;
                 }
@@ -624,7 +619,6 @@ fn handle_async_frontend_control(
     _cipher: &Crypt,
     pending: &mut Option<FrameWriter>,
     compress_scratch: &mut Vec<u8>,
-    _crypto_scratch: &mut Vec<u8>,
 ) -> bool {
     match cmd {
         AsyncFrontendCommand::Flush { sync, ack, reason } => {
@@ -682,7 +676,6 @@ fn handle_async_frontend_write(
     capacity: usize,
     pending: &mut Option<FrameWriter>,
     compress_scratch: &mut Vec<u8>,
-    _crypto_scratch: &mut Vec<u8>,
     block_scratch: &mut Vec<u8>,
 ) {
     let mut stage = AsyncBuildStage::default();

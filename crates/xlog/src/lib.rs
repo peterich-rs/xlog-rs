@@ -907,7 +907,9 @@ mod tests {
 
         let (magic, text) = first_sync_payload(dir.path());
         assert_eq!(magic, MAGIC_SYNC_NO_CRYPT_ZLIB_START);
-        assert!(text.contains("321"), "{text}");
-        assert!(!text.contains(", -1"), "{text}");
+        let tid = mars_xlog_core::platform_tid::current_tid();
+        let main = mars_xlog_core::platform_tid::main_tid();
+        let suffix = if tid == main { "*" } else { "" };
+        assert!(text.contains(&format!("[321, {tid}{suffix}]")), "{text}");
     }
 }

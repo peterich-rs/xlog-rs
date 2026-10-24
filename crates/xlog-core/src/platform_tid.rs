@@ -81,7 +81,16 @@ pub fn main_tid() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_tid, main_tid};
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos"
+    ))]
+    use super::current_tid;
+    use super::main_tid;
 
     #[test]
     fn main_tid_is_stable_across_calls() {
