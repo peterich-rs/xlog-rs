@@ -115,7 +115,9 @@ pub enum Crypt {
     Off,
     /// TEA key derived from secp256k1 ECDH. `Debug` omits the key.
     Tea {
+        /// Four TEA key words derived from the ECDH shared secret.
         key: [u32; 4],
+        /// Uncompressed client public key written into the block header.
         client_pubkey: [u8; 64],
     },
 }

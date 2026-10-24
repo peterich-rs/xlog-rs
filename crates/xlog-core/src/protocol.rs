@@ -88,13 +88,25 @@ impl From<Hour> for u8 {
 /// the encrypted async variants run TEA.
 pub enum BlockMagic {
     /// Sync zlib magic. Payload is plaintext.
-    SyncZlib { encrypted: bool },
+    SyncZlib {
+        /// Whether the header key slot is filled. The payload stays plaintext.
+        encrypted: bool,
+    },
     /// Sync zstd magic. Payload is plaintext.
-    SyncZstd { encrypted: bool },
+    SyncZstd {
+        /// Whether the header key slot is filled. The payload stays plaintext.
+        encrypted: bool,
+    },
     /// Async zlib magic. Payload is a raw deflate stream, optionally TEA-encrypted.
-    AsyncZlib { encrypted: bool },
+    AsyncZlib {
+        /// Whether the async payload is TEA-encrypted.
+        encrypted: bool,
+    },
     /// Async zstd magic. Payload is a zstd stream, optionally TEA-encrypted.
-    AsyncZstd { encrypted: bool },
+    AsyncZstd {
+        /// Whether the async payload is TEA-encrypted.
+        encrypted: bool,
+    },
 }
 
 impl BlockMagic {
