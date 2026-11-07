@@ -101,10 +101,7 @@ impl Journal {
         }
         fs::rename(&tmp, &self.path).map_err(|e| ExtensibleError::storage(&self.path, e))?;
         if let Some(dir) = self.path.parent() {
-            let dir_file = File::open(dir).map_err(|e| ExtensibleError::storage(dir, e))?;
-            dir_file
-                .sync_all()
-                .map_err(|e| ExtensibleError::storage(dir, e))?;
+            super::catalog::sync_dir(dir)?;
         }
         Ok(())
     }

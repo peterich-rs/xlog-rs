@@ -306,8 +306,22 @@ fn read_to_string(path: &Path) -> Result<String, ExtensibleError> {
     Ok(buf)
 }
 
-fn sync_dir(dir: &Path) -> Result<(), ExtensibleError> {
-    let file = File::open(dir).map_err(|e| ExtensibleError::storage(dir, e))?;
-    file.sync_all()
-        .map_err(|e| ExtensibleError::storage(dir, e))
+/// Make a directory entry durable after a rename.
+///
+/// Windows rejects `sync_all` on a directory handle with `ERROR_ACCESS_DENIED`,
+/// and it has no equivalent of an fsync on a directory. The file bytes are
+/// already synced before the rename, so the directory entry is left to the
+/// operating system there.
+pub(crate) fn sync_dir(dir: &Path) -> Result<(), ExtensibleError> {
+    #[cfg(not(windows))]
+    {
+        let file = File::open(dir).map_err(|e| ExtensibleError::storage(dir, e))?;
+        file.sync_all()
+            .map_err(|e| ExtensibleError::storage(dir, e))?;
+    }
+    #[cfg(windows)]
+    {
+        let _ = dir;
+    }
+    Ok(())
 }
