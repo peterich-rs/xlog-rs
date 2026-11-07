@@ -120,7 +120,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          - macos-14
+          - macos-15
           - windows-latest
 
     runs-on: ${{ matrix.os }}
