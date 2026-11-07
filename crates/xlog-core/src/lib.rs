@@ -23,6 +23,8 @@ pub mod crypto;
 pub mod decoder;
 /// Human-readable dump utilities for log buffers.
 pub mod dump;
+/// Opt-in extensible storage path: catalog, journal, naming, and content formats.
+pub mod extensible;
 mod file_maintenance;
 /// File lifecycle, cache movement, and active log append helpers.
 pub mod file_manager;

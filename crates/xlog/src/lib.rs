@@ -24,11 +24,15 @@ use std::sync::Arc;
 
 mod backend;
 mod event;
+#[cfg(feature = "rust-backend")]
+mod extensible;
 mod layout;
 #[cfg(feature = "tracing")]
 mod tracing_layer;
 
 pub use event::Event;
+#[cfg(feature = "rust-backend")]
+pub use extensible::{ContentFormat, ExtensibleLog, ExtensibleLogBuilder, NameStyle, Rotate};
 pub use layout::{Layout, Piece, WriteLine};
 
 #[cfg(feature = "tracing")]
@@ -51,6 +55,21 @@ pub enum LogLevel {
     Fatal,
     /// Logging disabled.
     None,
+}
+
+impl LogLevel {
+    /// Short name used by the extensible formats.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Verbose => "verbose",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+            Self::Fatal => "fatal",
+            Self::None => "none",
+        }
+    }
 }
 
 #[cfg(feature = "rust-backend")]
@@ -638,8 +657,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        AppenderMode, CompressMode, Event, Layout, LogLevel, Piece, RawLogMeta, WriteLine, Xlog,
-        XlogConfig, XlogError,
+        AppenderMode, CompressMode, ContentFormat, Event, ExtensibleLogBuilder, Layout, LogLevel,
+        NameStyle, Piece, RawLogMeta, WriteLine, Xlog, XlogConfig, XlogError,
     };
 
     static NEXT_PREFIX_ID: AtomicUsize = AtomicUsize::new(1);
@@ -911,5 +930,37 @@ mod tests {
         let main = mars_xlog_core::platform_tid::main_tid();
         let suffix = if tid == main { "*" } else { "" };
         assert!(text.contains(&format!("[321, {tid}{suffix}]")), "{text}");
+    }
+
+    #[test]
+    fn extensible_jsonl_uses_its_own_directory_and_survives_reopen() {
+        let dir = TempDir::new().expect("tempdir");
+        let logger = ExtensibleLogBuilder::new(dir.path(), "app")
+            .format(ContentFormat::JsonLines)
+            .naming(NameStyle::FileId)
+            .open(Layout::mars())
+            .expect("open");
+        logger
+            .log(LogLevel::Info, "net", "hello \"world\"")
+            .expect("log");
+        let names = logger.file_names().expect("names");
+        assert_eq!(names.len(), 1);
+        assert!(
+            names[0].starts_with("app_") && names[0].ends_with(".log"),
+            "{names:?}"
+        );
+        drop(logger);
+
+        let text = fs::read_to_string(dir.path().join(&names[0])).expect("read");
+        assert!(text.contains("\\\"world\\\""), "{text}");
+        assert!(!text.contains("\u{0}"), "{text}");
+
+        let reopened = ExtensibleLogBuilder::new(dir.path(), "app")
+            .open(Layout::mars())
+            .expect("reopen");
+        reopened.log(LogLevel::Warn, "net", "again").expect("log");
+        let report = reopened.maintain().expect("maintain");
+        assert!(report.deleted.is_empty());
+        assert!(report.unowned.is_empty());
     }
 }

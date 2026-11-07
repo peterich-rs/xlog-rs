@@ -41,11 +41,7 @@ pub(crate) fn build_path_for_index(
 pub(crate) fn file_index_from_path(path: &Path, prefix: &str) -> Option<i64> {
     let name = path.file_name()?.to_str()?;
     let base = name.strip_suffix(LOG_EXT_WITH_DOT)?;
-    let prefix_part = format!("{prefix}_");
-    if !name.starts_with(&prefix_part) {
-        return None;
-    }
-    let rest = &base[prefix_part.len() + 8..];
+    let rest = base.strip_prefix(prefix)?.strip_prefix('_')?.get(8..)?;
     if rest.is_empty() {
         Some(0)
     } else {
@@ -74,6 +70,56 @@ mod tests {
             "demo_20260316_3.xlog"
         );
         assert_eq!(file_index_from_path(&path, "demo"), Some(3));
+    }
+
+    #[test]
+    fn file_index_from_path_rejects_short_names() {
+        for name in [
+            "demo_.xlog",
+            "demo_1.xlog",
+            "demo_2026031.xlog",
+            "demo_日.xlog",
+        ] {
+            assert_eq!(
+                file_index_from_path(std::path::Path::new(name), "demo"),
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_index_from_path_rejects_non_boundary_date_slices() {
+        for name in [
+            "demo_1234567日志.xlog",
+            "demo_123456日志.xlog",
+            "demo_日日日.xlog",
+        ] {
+            assert_eq!(
+                file_index_from_path(std::path::Path::new(name), "demo"),
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_index_from_path_preserves_existing_name_patterns() {
+        for (name, prefix, expected) in [
+            ("demo_20260316.xlog", "demo", Some(0)),
+            ("demo_20260316_1.xlog", "demo", Some(1)),
+            ("日志_20260316_3.xlog", "日志", Some(3)),
+            ("demo_part_20260316_42.xlog", "demo_part", Some(42)),
+            ("other_20260316.xlog", "demo", None),
+            ("demo_20260316.log", "demo", None),
+            ("demo_20260316_bad.xlog", "demo", None),
+        ] {
+            assert_eq!(
+                file_index_from_path(std::path::Path::new(name), prefix),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     #[test]
